@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LLM Extraction Output (draft v0.1)",
+  "description": "청크 적재 시 LLM 1회 호출로 추출하는 Topic/Decision/ActionItem 후보. 출처: MVP 구현 계획 3-3절 노드 속성. 아직 필드 미확정 — chunking 담당(도윤)이 확정.",
+  "type": "object",
+  "required": ["chunk_id", "topics", "decisions", "action_items"],
+  "properties": {
+    "chunk_id": { "type": "string" },
+    "topics": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["topic_id", "name"],
+        "properties": {
+          "topic_id": { "type": "string" },
+          "name": { "type": "string" },
+          "aliases": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "decisions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["decision_id", "statement", "date"],
+        "properties": {
+          "decision_id": { "type": "string" },
+          "statement": { "type": "string" },
+          "date": { "type": "string", "format": "date" },
+          "supersedes": { "type": "string", "description": "이전 decision_id (있는 경우)" }
+        }
+      }
+    },
+    "action_items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["item_id", "task"],
+        "properties": {
+          "item_id": { "type": "string" },
+          "task": { "type": "string" },
+          "assignee": { "type": "string" },
+          "due": { "type": "string", "format": "date" }
+        }
+      }
+    }
+  }
+}

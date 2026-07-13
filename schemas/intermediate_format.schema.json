@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "STT Intermediate Format (draft v0.1)",
+  "description": "1-pass/2-pass STT 공통 중간 포맷. 출처: MVP 구현 계획 3-1절. 첫 주에 4인 확정 필요.",
+  "type": "object",
+  "required": ["project_id", "meeting_id", "date", "pass", "segments"],
+  "properties": {
+    "project_id": { "type": "string" },
+    "meeting_id": { "type": "string" },
+    "date": { "type": "string", "format": "date" },
+    "pass": { "type": "string", "enum": ["raw", "refined"] },
+    "segments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "speaker", "start", "end", "text_raw"],
+        "properties": {
+          "id": { "type": "integer" },
+          "speaker": { "type": "string" },
+          "start": { "type": "number" },
+          "end": { "type": "number" },
+          "text_raw": { "type": "string" },
+          "text_refined": { "type": "string" },
+          "corrections": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "from": { "type": "string" },
+                "to": { "type": "string" },
+                "source_doc": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
