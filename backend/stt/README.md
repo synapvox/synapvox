@@ -52,10 +52,12 @@
 | Whisper + roster-hint 키워드 주입 | 57.01% | 메타데이터만으론 실제 오인식 단어를 못 잡아 오히려 소폭 악화 — "메타데이터 ≠ 키워드 RAG"의 근거 |
 | **CLOVA Speech (ADR-005 경로)** | **40.66%** | 전문용어 정확 인식, 반복 루프 없음, 화자 7명 정확 검출 — ADR-005가 관리형 API를 택한 근거가 실측으로 확인됨 |
 | CLOVA + `refine_transcript.py` (사전자료 없이 정제만) | 39.01% | 사전자료 없이도 문맥 다듬기만으로 소폭 개선 |
+| CLOVA + `boostings` 도메인 키워드(2026-07-14) | 41.49% | 파라미터 자체는 `/recognizer/upload`에서 정상 동작 확인(에러 없음) — 다만 boost한 단어("추가경정예산안")를 CLOVA가 이미 boosting 없이도 맞히고 있어서 개선 효과는 못 봄(오히려 소폭 상승, 호출 간 노이즈 범위). "동작 확인"과 "효과 입증"은 별개 — 아래 알려진 제약 참고 |
 
 ### 알려진 제약 (다음 사람이 이어받을 때 참고)
 
 - **실제 회의자료(PPT/PDF) 기반 키워드 주입·정제는 미검증** — 위 결과는 전부 국회 회의록(자료 없음) 기준. `build_prompt(material_text=...)`/`refine_transcript(material_text=...)`가 실제로 도메인 용어 정확도를 끌어올리는지는 자료 있는 케이스로 별도 검증 필요(PRD §9 수용 기준의 일부가 여기 해당).
+- **`stt_clova.py`의 `boostings` 연동, 효과 미입증** — `transcribe_with_materials()`가 `keyword_prompt.build_prompt()` 결과를 CLOVA `boostings` 파라미터에 주입하도록 구현됨(NCP 문서는 `/recognizer/object-storage`에서만 이 필드를 명시하지만, 우리가 쓰는 `/recognizer/upload`도 라이브 호출로 정상 수락 확인). 다만 실제 WER 개선 효과는 아직 못 봤음 — CLOVA가 현재도 오인식하는 실제 도메인 용어가 있는 테스트 케이스가 있어야 제대로 검증 가능(위 "실제 회의자료 미검증" 항목과 같은 근본 원인).
 - **긴 오디오(1시간 이상) 미검증** — 위 수치는 15분 분량 기준. 같은 전체회의의 1부(1시간46분50초)는 아직 CLOVA로 실행 안 함.
 - **pgvector 리트리버 없음(의도적)** — `refine_transcript()`는 지금 "가진 컨텍스트 전부"를 프롬프트에 넣는 방식. pgvector가 생기면 이 부분만 교체, 함수 시그니처(`material_text`, `past_meeting_texts`)는 안 바뀜.
 - **pyannote 직접 구현은 ADR-005 위반이지만 의도적 예외** — 비용 때문에 로컬 검증 단계에서만 유지, 운영 전환 시 CLOVA(또는 동급 관리형 API)로 전환 예정.
