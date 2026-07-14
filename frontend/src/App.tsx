@@ -98,7 +98,122 @@ const sourceItems: SourceItem[] = [
 ];
 const sourceTabs = ['전체', '녹음본', '자료'] as const;
 const sourceSortOptions = ['최신순', '오래된순', '글자순', '종류순'] as const;
-const graphNodes = [
+
+// ── Graphiti 백엔드 연결 ─────────────────────────────────────────────
+// 프론트 그래프를 실제 Graphiti API(/graph)에서 받아 그린다. 기본은 배포된
+// Render Graphiti 서버(CORS 개방). VITE_API_BASE 로 다른 백엔드로 교체 가능.
+type GraphNode = {
+  id: string; type: 'session' | 'concept'; label: string;
+  detail?: string; seq?: number; x: number; y: number; r?: number;
+};
+type GraphLink = { from: string; to: string; rel: string; label: string };
+type RawNode = { id: string; type: string; label?: string; meta?: { seq?: number; summary?: string; stoplist?: boolean } };
+type RawEdge = { src: string; dst: string; rel_type: string; concept_id?: string; concept_label?: string | null; weight?: number };
+
+const API_BASE = (import.meta.env.VITE_API_BASE ?? 'https://synapvox-graphiti.onrender.com').replace(/\/$/, '');
+const API_KEY = import.meta.env.VITE_API_KEY ?? 'demo-bio';
+
+const REL_LABEL: Record<string, string> = {
+  SESSION_MENTIONS_CONCEPT: '근거',
+  CONCEPT_CO_OCCURS_WITH: '동시출현',
+  NEXT_SESSION: '다음 세션',
+  CONTINUES: '연속',
+  EXPANDS: '확장',
+};
+
+// id → [0,1) 결정적 지터(스폰 시 겹침 방지)
+function hashUnit(s: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i += 1) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return ((h >>> 0) % 1000) / 1000;
+}
+
+// /graph 응답 → 프론트 GraphNode/GraphLink 매핑 + 좌표 부여
+function mapGraph(raw: { nodes?: RawNode[]; edges?: RawEdge[] }): { nodes: GraphNode[]; links: GraphLink[] } {
+  const rawNodes = raw.nodes ?? [];
+  const rawEdges = raw.edges ?? [];
+  const ids = new Set(rawNodes.map((r) => r.id));
+  const deg: Record<string, number> = {};
+  rawEdges.forEach((e) => { deg[e.src] = (deg[e.src] ?? 0) + 1; deg[e.dst] = (deg[e.dst] ?? 0) + 1; });
+  const nodes: GraphNode[] = rawNodes.map((r) => {
+    const meta = r.meta ?? {};
+    const isSession = r.type === 'session';
+    const summary = typeof meta.summary === 'string' ? meta.summary.split('\n')[0] : '';
+    return {
+      id: r.id,
+      type: isSession ? 'session' : 'concept',
+      label: r.label || r.id,
+      seq: meta.seq,
+      detail: isSession
+        ? (meta.seq != null ? `세션 ${meta.seq}` : '세션')
+        : (summary.length > 44 ? `${summary.slice(0, 43)}…` : summary),
+      r: isSession ? undefined : Math.min(7 + (deg[r.id] ?? 0) * 0.7, 16),
+      x: 0,
+      y: 0,
+    };
+  });
+  const links: GraphLink[] = rawEdges
+    .filter((e) => ids.has(e.src) && ids.has(e.dst))
+    .map((e) => ({ from: e.src, to: e.dst, rel: e.rel_type, label: REL_LABEL[e.rel_type] ?? '' }));
+  layoutGraph(nodes, links);
+  return { nodes, links };
+}
+
+// 세션=가로 한 줄, 개념=자신을 언급한 세션들 평균 아래(다리 개념은 세션 사이) + 반발 완화
+function layoutGraph(nodes: GraphNode[], links: GraphLink[]): void {
+  const W = 960;
+  const cy = 280;
+  const sessions = nodes.filter((n) => n.type === 'session').sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+  const sN = Math.max(1, sessions.length - 1);
+  const sessX: Record<string, number> = {};
+  sessions.forEach((s, i) => { s.x = W * (0.12 + 0.76 * (i / sN)); s.y = cy; sessX[s.id] = s.x; });
+  const mentioners: Record<string, number[]> = {};
+  links.forEach((l) => {
+    if (l.rel === 'SESSION_MENTIONS_CONCEPT' && sessX[l.from] != null) {
+      (mentioners[l.to] ??= []).push(sessX[l.from]);
+    }
+  });
+  nodes.filter((n) => n.type === 'concept').forEach((n) => {
+    const xs = mentioners[n.id] ?? [];
+    const baseX = xs.length ? xs.reduce((sum, x) => sum + x, 0) / xs.length : W / 2;
+    // 세션 아래 밴드에 자기 세션(다리는 세션들 평균) x 근처로 촘촘히 군집.
+    const ang = hashUnit(n.id) * Math.PI * 2;
+    const rad = 45 + hashUnit(`${n.id}r`) * 95;
+    n.x = clamp(baseX + Math.cos(ang) * rad * 0.6, 40, W - 40);
+    n.y = clamp(cy + 60 + Math.abs(Math.sin(ang)) * rad, 40, 555);
+  });
+  const count = nodes.length;
+  const ax = nodes.map((n) => n.x);   // 앵커 = 초기 군집 위치
+  const ay = nodes.map((n) => n.y);
+  const vx = new Array<number>(count).fill(0);
+  const vy = new Array<number>(count).fill(0);
+  for (let it = 0; it < 60; it += 1) {
+    for (let i = 0; i < count; i += 1) {
+      if (nodes[i].type === 'session') continue;
+      let fx = (ax[i] - nodes[i].x) * 0.08;   // 앵커 스프링(자기 군집으로 복귀 → 가장자리 쏠림 방지)
+      let fy = (ay[i] - nodes[i].y) * 0.08;
+      for (let j = 0; j < count; j += 1) {
+        if (i === j) continue;
+        const dx = nodes[i].x - nodes[j].x;
+        const dy = nodes[i].y - nodes[j].y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 === 0 || d2 > 2600) continue;   // 근접(≈51px 이내) 겹침만 밀어냄
+        const f = 340 / d2;
+        fx += dx * f;
+        fy += dy * f;
+      }
+      vx[i] = (vx[i] + fx) * 0.8;
+      vy[i] = (vy[i] + fy) * 0.8;
+    }
+    for (let i = 0; i < count; i += 1) {
+      if (nodes[i].type === 'session') continue;
+      nodes[i].x = clamp(nodes[i].x + Math.max(-6, Math.min(6, vx[i])), 40, W - 40);
+      nodes[i].y = clamp(nodes[i].y + Math.max(-6, Math.min(6, vy[i])), 40, 570);
+    }
+  }
+}
+
+const initialGraphNodes: GraphNode[] = [
   { id: 'S1', type: 'session', label: 'MVP 범위 확정', detail: '오늘 10:00 · 48분', seq: 1, x: 160, y: 280 },
   { id: 'S2', type: 'session', label: 'STT 2-pass 설계', detail: '어제 16:30 · 36분', seq: 2, x: 470, y: 230 },
   { id: 'S3', type: 'session', label: 'GraphRAG 검색 UX', detail: '7월 10일 · 41분', seq: 3, x: 780, y: 280 },
@@ -109,7 +224,7 @@ const graphNodes = [
   { id: 'C5', type: 'concept', label: 'AI 검색', detail: 'GraphRAG 질의', x: 620, y: 420, r: 19 },
 ];
 
-const graphLinks = [
+const initialGraphLinks: GraphLink[] = [
   { from: 'S1', to: 'C1', rel: 'SESSION_MENTIONS_CONCEPT', label: '근거' },
   { from: 'S1', to: 'C4', rel: 'SESSION_MENTIONS_CONCEPT', label: '근거' },
   { from: 'S2', to: 'C2', rel: 'SESSION_MENTIONS_CONCEPT', label: '근거' },
@@ -124,7 +239,6 @@ const graphLinks = [
   { from: 'S2', to: 'S3', rel: 'EXPANDS', label: '확장' },
 ];
 
-const getGraphNode = (id: string) => graphNodes.find((node) => node.id === id);
 const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
 const graphRelationClass: Record<string, 'mentions' | 'cooccur' | 'next' | 'continues' | 'expands'> = {
   SESSION_MENTIONS_CONCEPT: 'mentions',
@@ -175,12 +289,15 @@ function App() {
   const [graphViewport, setGraphViewport] = useState({ x: 0, y: 0, scale: 1 });
   const [graphFilter, setGraphFilter] = useState({
     mentions: true,
-    cooccur: true,
+    cooccur: false,   // 개념-개념 동시출현 엣지는 밀도가 높아 기본 off(필터로 켤 수 있음)
     next: true,
     semantic: true,
     sessionsOnly: false,
   });
   const [selectedGraphNodeId, setSelectedGraphNodeId] = useState<string | null>('S1');
+  const [graphNodes, setGraphNodes] = useState<GraphNode[]>(initialGraphNodes);
+  const [graphLinks, setGraphLinks] = useState<GraphLink[]>(initialGraphLinks);
+  const getGraphNode = (id: string) => graphNodes.find((node) => node.id === id);
   const [graphDragStart, setGraphDragStart] = useState<{
     pointerId: number;
     x: number;
@@ -192,6 +309,29 @@ function App() {
   const recordingStreamRef = useRef<MediaStream | null>(null);
   const recordingChunksRef = useRef<Blob[]>([]);
   const isClosingRecordingRef = useRef(false);
+
+  // 마운트 시 실제 Graphiti 그래프(/graph)를 불러와 목 데이터를 대체한다.
+  // 실패(백엔드 미가동 등) 시엔 기존 목 데이터를 그대로 유지해 화면이 비지 않게 한다.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`${API_BASE}/graph`, { headers: { 'X-API-Key': API_KEY } });
+        if (!res.ok) throw new Error(String(res.status));
+        const { nodes, links } = mapGraph(await res.json());
+        if (cancelled || nodes.length === 0) return;
+        setGraphNodes(nodes);
+        setGraphLinks(links);
+        const firstSession = nodes.find((node) => node.type === 'session');
+        setSelectedGraphNodeId(firstSession ? firstSession.id : null);
+        setGraphFocusNodeIds(firstSession ? [firstSession.id] : []);
+      } catch {
+        // 목 데이터 유지
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
   const activeProject = activeProjectIndex === null ? null : projects[activeProjectIndex];
   const focusedGraphNodeIds = new Set(graphFocusNodeIds);
   const visibleSourceItems = sourceItems
@@ -1146,7 +1286,10 @@ function App() {
                             ) : (
                               <>
                                 <circle r={node.r} />
-                                <text textAnchor="middle" y={(node.r ?? 14) + 16}>{node.label}</text>
+                                {/* 고차수(다리) 개념 + 선택 노드만 라벨 → 라벨 겹침 방지 */}
+                                {((node.r ?? 0) >= 11 || selectedGraphNodeId === node.id) && (
+                                  <text textAnchor="middle" y={(node.r ?? 14) + 16}>{node.label}</text>
+                                )}
                               </>
                             )}
                           </g>
