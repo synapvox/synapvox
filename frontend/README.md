@@ -13,8 +13,18 @@
 - 인터랙티브 그래프 탐색 UX
 - 북마크 클릭 시 오디오 구간 재생 연동
 
-## 구조 (초안 — 프레임워크/빌드 도구 미정)
-- `src/graph-view/` — 그래프 렌더링 컴포넌트 (vis.js/Cytoscape.js)
+## 스택
+Vite + React 19 + TypeScript. 그래프 렌더링 라이브러리(vis.js/Cytoscape.js)는 아직 미설치 — `graph-view/`에 붙일 때 결정.
+
+## 구조
+- `src/graph-view/` — 그래프 렌더링 컴포넌트 (현재 placeholder)
+- `src/App.tsx` — 엔트리 (Vite 기본 템플릿, 교체 예정)
 - `public/`
 
-React/Vite 등 구체적 스택은 아직 미정 — 정하는 대로 `package.json` 추가.
+## 실행
+```
+cd frontend
+npm install
+npm run dev      # http://localhost:5173
+npm run build
+```
