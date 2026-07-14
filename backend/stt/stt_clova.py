@@ -5,7 +5,17 @@ from pathlib import Path
 
 import requests
 
-from .keyword_prompt import build_prompt, extract_keywords_from_past_meetings
+try:
+    from .keyword_prompt import build_prompt, extract_keywords_from_past_meetings
+except ModuleNotFoundError as exc:
+    if exc.name != "kiwipiepy":
+        raise
+
+    def build_prompt(material_text: str = None, past_keywords: list = None, max_chars: int = 400) -> str:
+        return None
+
+    def extract_keywords_from_past_meetings(meeting_texts: list, top_n: int = 20) -> list:
+        return []
 
 
 def _parse_response(data: dict, source_name: str) -> dict:

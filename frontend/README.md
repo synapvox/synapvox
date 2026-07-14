@@ -1,24 +1,25 @@
-# frontend — 회의 간 관계 그래프 시각화 UI
+# frontend — SynapVox 웹 UI
 
 담당: 도원
 
-문서상 "Neo4j Bloom 또는 vis.js/Cytoscape.js 임베드" — JS 라이브러리 사용이 전제라 Python 백엔드(`backend/`)와 분리된 별도 앱으로 둔다.
+녹음본, 자료, 전사문, 그래프 뷰, AI 대화를 한 프로젝트 화면에서 다루는 React 프론트엔드입니다.
 
-## Baseline
-- `backend/integration`의 API에서 회의/토픽/그래프 서브그래프를 받아 렌더링
-- 회의 노드 클릭 → 요약·참여 Topic·결정 표시
-- Topic 클릭 → 관련 회의 타임라인 표시
+## 현재 흐름
+- 홈에서 프로젝트를 만들고 프로젝트별 녹음본·자료를 관리
+- 프로젝트 안에서 소스 카드, 그래프 뷰, AI 대화를 한 화면에 배치
+- 웹 녹음 또는 녹음된 파일 업로드 후 `/api/stt/transcribe`로 전사 요청
+- 전사 결과를 화자별 음성 기록으로 매핑하고 녹음본 상세 화면에서 확인·편집·복사
 
-## 고도화
-- 인터랙티브 그래프 탐색 UX
-- 북마크 클릭 시 오디오 구간 재생 연동
+## 연동
+- 개발 서버의 `/api` 요청은 `http://127.0.0.1:8000` 백엔드로 프록시합니다.
+- 프로젝트 자료와 녹음본 참고 파일은 전사 요청 시 함께 전송할 수 있습니다.
 
 ## 스택
-Vite + React 19 + TypeScript. 그래프 렌더링 라이브러리(vis.js/Cytoscape.js)는 아직 미설치 — `graph-view/`에 붙일 때 결정.
+Vite + React 19 + TypeScript
 
 ## 구조
-- `src/graph-view/` — 그래프 렌더링 컴포넌트 (현재 placeholder)
-- `src/App.tsx` — 엔트리 (Vite 기본 템플릿, 교체 예정)
+- `src/App.tsx` — 주요 화면과 상태 관리
+- `src/App.css` — 화면 레이아웃과 인터랙션 스타일
 - `public/`
 
 ## 실행
