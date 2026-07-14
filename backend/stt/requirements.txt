@@ -1,0 +1,7 @@
+# stt 모듈 의존성
+python-pptx
+faster-whisper
+pyannote.audio
+kiwipiepy
+requests
+openai

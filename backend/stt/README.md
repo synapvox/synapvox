@@ -15,3 +15,48 @@
 
 ## 소유 스키마
 중간 포맷 JSON — 이 모듈이 출력하는 계약. 변경 시 B/C/D에 공지 후 반영.
+
+---
+
+## 구현 (v1.0 — feat/stt-pipeline-and-intermediate-format)
+
+기능정의서.pdf/PRD.pdf/ADR.pdf/TDD.pdf(2026-07-13, v1.0 MVP)를 정본으로 구현. **두 STT 경로 모두 존재하며
+동일한 중간 포맷으로 수렴**(`merge()`/`wrap_segments()`) — chunking/graphrag는 이 스키마 하나만 알면 됨.
+
+### 정식 경로 (ADR-005 정합 — 운영 대상)
+
+| 파일 | 역할 |
+| --- | --- |
+| `ppt_extractor.py` | PPTX 슬라이드 텍스트+노트 추출 |
+| `keyword_prompt.py` | 키워드 3요소 스코어링(자료 내 빈도 + 과거 빈도·최근성 + 일반 사전 대비 특이도) → STT 프롬프트 |
+| `stt_clova.py` | **ADR-005 정합 경로** — CLOVA Speech 관리형 API, 전사+화자분리 한 번의 호출로 완료 |
+| `stt_normalizer.py` | `wrap_segments()`(CLOVA 등 이미 화자분리된 소스 → 중간 포맷)/`validate()`. **`merge()`는 아래 로컬 검증 전용 도구**(같은 파일에 있지만 용도가 다름) |
+| `refine_transcript.py` | Stage 2: OpenAI(gpt-4o) 기반 RAG 정제. pgvector 없어 지금은 컨텍스트 전량 투입(아래 알려진 제약 참고) |
+| `wer.py` | WER 계산(Levenshtein 기반 단어 단위) — Step 0 품질 검증용 |
+
+### 로컬 검증 전용 (ADR-005의 의도적·임시 예외 — `synapvox_Local`에서 계속 실험, 운영 미사용)
+
+| 파일 | 역할 |
+| --- | --- |
+| `stt_whisper.py` | faster-whisper 전사 (`transcribe`/`transcribe_with_materials`) — 비용 절감 목적의 로컬 검증 경로 (CLAUDE.md 참고) |
+| `diarize_pyannote.py` | pyannote.audio 화자분리 — 위와 같은 이유로 로컬 검증 한정 |
+| `stt_normalizer.merge()` | Whisper 세그먼트 + pyannote 화자분리 결과를 겹침 매칭으로 합침 — 위 두 파일과만 짝지어 쓰이는 글루 코드, 관리형 API 경로에선 불필요 |
+
+운영 전환 시 이 그룹 전체(Whisper+pyannote+`merge()`)가 걷어내질 수 있는 부품 — 새 기능을 여기에 추가로 투자하지 말 것.
+
+### 실제 데이터 검증 결과 (2026-04-02 보건복지위원회 전체회의, 15분02초, 화자 7명)
+
+| 경로 | WER | 비고 |
+| --- | --- | --- |
+| Whisper 베이스라인 | 54.69% | 반복 루프(hallucination) 버그 있음, "추가경정예산안"→"추가경영예산안" 오인식 |
+| Whisper + roster-hint 키워드 주입 | 57.01% | 메타데이터만으론 실제 오인식 단어를 못 잡아 오히려 소폭 악화 — "메타데이터 ≠ 키워드 RAG"의 근거 |
+| **CLOVA Speech (ADR-005 경로)** | **40.66%** | 전문용어 정확 인식, 반복 루프 없음, 화자 7명 정확 검출 — ADR-005가 관리형 API를 택한 근거가 실측으로 확인됨 |
+| CLOVA + `refine_transcript.py` (사전자료 없이 정제만) | 39.01% | 사전자료 없이도 문맥 다듬기만으로 소폭 개선 |
+
+### 알려진 제약 (다음 사람이 이어받을 때 참고)
+
+- **실제 회의자료(PPT/PDF) 기반 키워드 주입·정제는 미검증** — 위 결과는 전부 국회 회의록(자료 없음) 기준. `build_prompt(material_text=...)`/`refine_transcript(material_text=...)`가 실제로 도메인 용어 정확도를 끌어올리는지는 자료 있는 케이스로 별도 검증 필요(PRD §9 수용 기준의 일부가 여기 해당).
+- **긴 오디오(1시간 이상) 미검증** — 위 수치는 15분 분량 기준. 같은 전체회의의 1부(1시간46분50초)는 아직 CLOVA로 실행 안 함.
+- **pgvector 리트리버 없음(의도적)** — `refine_transcript()`는 지금 "가진 컨텍스트 전부"를 프롬프트에 넣는 방식. pgvector가 생기면 이 부분만 교체, 함수 시그니처(`material_text`, `past_meeting_texts`)는 안 바뀜.
+- **pyannote 직접 구현은 ADR-005 위반이지만 의도적 예외** — 비용 때문에 로컬 검증 단계에서만 유지, 운영 전환 시 CLOVA(또는 동급 관리형 API)로 전환 예정.
+- 로컬 스트리밍(마이크 실시간 캡처)은 미구현 — 현재 아키텍처는 녹음 완료 파일 입력을 전제(TDD 6단계 파이프라인 참고), Baseline의 "스트리밍 전사"는 배치 파일을 세그먼트 단위로 순차 출력하는 것을 가리킴. 실시간 캡처가 필요하면 스코프 재확인 필요.
