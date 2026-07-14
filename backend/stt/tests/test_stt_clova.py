@@ -3,7 +3,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))  # repo root
 
-from backend.stt.stt_clova import _parse_response
+from backend.stt.stt_clova import _build_params, _parse_response
 
 
 def test_parse_response_converts_ms_to_seconds_and_extracts_speaker_label():
@@ -39,3 +39,17 @@ def test_parse_response_defaults_speaker_when_missing():
     result = _parse_response(data, "x.m4a")
 
     assert result["segments"][0]["speaker"] == "UNKNOWN"
+
+
+def test_build_params_without_boost_keywords_omits_boostings():
+    params = _build_params("ko-KR")
+
+    assert "boostings" not in params
+    assert params["language"] == "ko-KR"
+    assert params["diarization"] == {"enable": True}
+
+
+def test_build_params_with_boost_keywords_adds_boostings_entry():
+    params = _build_params("ko-KR", boost_keywords="추가경정예산안, 그냥드림", boost_weight="7")
+
+    assert params["boostings"] == [{"words": "추가경정예산안, 그냥드림", "weight": "7"}]
