@@ -834,6 +834,17 @@ function App() {
     window.history.pushState({ view: 'home' }, '', window.location.pathname);
   };
 
+  const openAdminHome = () => {
+    setIsProfileOpen(false);
+    setIsAdminOpen(true);
+    setIsHelpOpen(false);
+    setIsSettingsOpen(false);
+    setIsAccountMenuOpen(false);
+    setActiveProjectIndex(null);
+    setAdminSection('개요');
+    window.history.pushState({ view: 'admin' }, '', window.location.pathname);
+  };
+
   const openProfile = () => {
     setIsProfileOpen(true);
     setIsAdminOpen(false);
@@ -1729,8 +1740,8 @@ function App() {
                     </button>
                   ))}
                 </nav>
-                <button className="admin-home-button" type="button" onClick={openProjectHome}>
-                  홈으로
+                <button className="admin-home-button" type="button" onClick={openAdminHome}>
+                  운영 홈
                 </button>
               </aside>
 
