@@ -48,7 +48,8 @@
 - `GsvxClient` — gsvx HTTP 클라이언트
   - `.ingest_text(text, title, project)` — `POST /ingest-text` 1회 호출 (원시 계약)
   - `.ingest_transcript(im, project)` — 중간포맷 → 변환·분할 → 적재
-  - `.ingest_document(path, project)` / `.ingest_document_text(text, title, project)` — 자료 → 적재
+  - `.ingest_document(path, project, meeting_id)` / `.ingest_document_text(text, title, project, meeting_id)` — 자료 → 적재
+    (`meeting_id` 주면 특정 회의에 스코프, 생략하면 프로젝트 전역 자료)
 - `GsvxError(status_code, detail)` — gsvx 오류 (연결 실패면 `status_code=None`)
 - CLI: `python -m backend.integration.gsvx_connector 파일... --project P01`
 
@@ -57,7 +58,7 @@
 | | `POST /ingest-stt` | `POST /ingest-doc` |
 |---|---|---|
 | **바디** | 중간포맷 JSON 통째로 | multipart `file` (pdf/pptx/docx/md/txt) |
-| **헤더** | `X-Project-Id`(→ gsvx project), `X-API-Key`(→ gsvx로 전달, 없으면 서버 환경변수) | 동일 |
+| **헤더** | `X-Project-Id`(→ gsvx project), `X-API-Key`(→ gsvx로 전달, 없으면 서버 환경변수) | 동일 + `X-Meeting-Id`(선택, → 세션 제목에 붙어 특정 회의에 딸린 자료로 스코프. 미지정 시 프로젝트 전역 자료) |
 | **성공 200** | `{chunks_ingested, concepts_total, concepts_new, relations_new, sessions}` | 동일 |
 | **입력 오류** | `400` — 스키마 위반 필드를 detail로 (예: `missing key: source`) | `415` — 텍스트 추출 실패/미지원 형식 |
 | **gsvx 오류** | gsvx의 4xx를 그대로 전파: `401`(키), `413`(50,000자 초과), `429`(rate limit) | 동일 |
