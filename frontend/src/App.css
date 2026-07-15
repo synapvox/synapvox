@@ -1062,6 +1062,27 @@ button {
   gap: 7px;
 }
 
+.record-reference-summary {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(244, 239, 225, 0.58);
+  display: grid;
+  gap: 2px;
+  padding: 10px 12px;
+}
+
+.record-reference-summary strong {
+  color: var(--ink);
+  font-size: 0.86rem;
+}
+
+.record-reference-summary p {
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
 .record-attached-list span {
   min-width: 0;
   border: 1px solid var(--line);
@@ -3741,6 +3762,18 @@ h3 {
   display: grid;
   gap: 8px;
   padding: 14px 16px 10px;
+}
+
+.project-material-action {
+  display: grid;
+  gap: 5px;
+}
+
+.project-material-action p {
+  color: var(--muted);
+  font-size: 0.72rem;
+  line-height: 1.35;
+  padding: 0 10px;
 }
 
 .source-primary-button,

@@ -15,10 +15,3 @@ const hasSupabaseConfig = (
 export const supabase = hasSupabaseConfig
   ? createClient(supabaseUrl, supabaseAnonKey)
   : null;
-
-export const requireSupabase = () => {
-  if (supabase === null) {
-    throw new Error('로그인 설정을 확인하고 있습니다. 잠시 후 다시 시도해주세요.');
-  }
-  return supabase;
-};

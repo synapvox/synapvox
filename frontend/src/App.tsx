@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent, type WheelEvent } from 'react';
 import './App.css';
-import { requireSupabase, supabase } from './supabaseClient';
+import { supabase } from './supabaseClient';
 import type { Session } from '@supabase/supabase-js';
 
 type Project = {
@@ -23,10 +23,16 @@ type SourceItem = {
   category: string;
   meta: string;
   updatedOrder: number;
+  materialScope?: 'project' | 'recording';
   audioUrl?: string;
   durationLabel?: string;
   attachedMaterials?: SourceItem[];
   mediaKind?: 'audio' | 'video';
+};
+
+type ProjectMaterialFile = {
+  source: SourceItem;
+  file: File;
 };
 
 type IntermediateSegment = {
@@ -66,9 +72,54 @@ type AuthUser = {
   role: string;
 };
 
+type BackendAuthResponse = {
+  user: AuthUser;
+  session?: {
+    token?: string;
+    expiresAt?: string;
+  };
+};
+
 const PROJECTS_STORAGE_KEY = 'synapvox-projects';
 const WORKSPACES_STORAGE_KEY = 'synapvox-project-workspaces';
+const BACKEND_AUTH_STORAGE_KEY = 'synapvox-backend-auth';
 const scopedStorageKey = (baseKey: string, userId: string | null) => `${baseKey}:${userId ?? 'guest'}`;
+
+const isAuthUser = (value: unknown): value is AuthUser => {
+  if (value === null || typeof value !== 'object') return false;
+  const candidate = value as Record<string, unknown>;
+  return typeof candidate.id === 'string'
+    && typeof candidate.email === 'string'
+    && typeof candidate.name === 'string'
+    && typeof candidate.role === 'string';
+};
+
+const loadStoredBackendAuth = (): BackendAuthResponse | null => {
+  try {
+    const raw = window.localStorage.getItem(BACKEND_AUTH_STORAGE_KEY);
+    if (raw === null) return null;
+    const parsed = JSON.parse(raw) as { user?: unknown; session?: BackendAuthResponse['session'] };
+    return isAuthUser(parsed.user) ? { user: parsed.user, session: parsed.session } : null;
+  } catch {
+    return null;
+  }
+};
+
+const storeBackendAuth = (authResult: BackendAuthResponse) => {
+  try {
+    window.localStorage.setItem(BACKEND_AUTH_STORAGE_KEY, JSON.stringify(authResult));
+  } catch (error) {
+    console.error('백엔드 로그인 세션 저장 실패:', error);
+  }
+};
+
+const clearBackendAuth = () => {
+  try {
+    window.localStorage.removeItem(BACKEND_AUTH_STORAGE_KEY);
+  } catch (error) {
+    console.error('백엔드 로그인 세션 삭제 실패:', error);
+  }
+};
 
 const authUserFromSession = (session: Session | null): AuthUser | null => {
   if (session === null) return null;
@@ -277,14 +328,19 @@ const mapIntermediateTranscript = (data: IntermediateTranscript): TranscriptSegm
 };
 
 function App() {
-  const [projects, setProjects] = useState<Project[]>(() => loadStoredProjects(null));
+  const initialBackendAuthRef = useRef<BackendAuthResponse | null>(
+    supabase === null ? loadStoredBackendAuth() : null,
+  );
+  const initialBackendUser = initialBackendAuthRef.current?.user ?? null;
+  const [projects, setProjects] = useState<Project[]>(() => loadStoredProjects(initialBackendUser?.id ?? null));
   const [sourceItems, setSourceItems] = useState(initialSourceItems);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [activeProjectIndex, setActiveProjectIndex] = useState<number | null>(null);
   const [isProfileOpen, setIsProfileOpen] = useState(false);
   const [isAdminOpen, setIsAdminOpen] = useState(false);
-  const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
-  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [currentUser, setCurrentUser] = useState<AuthUser | null>(initialBackendUser);
+  const [isLoggedIn, setIsLoggedIn] = useState(initialBackendUser !== null);
+  const [isAuthReady, setIsAuthReady] = useState(supabase === null);
   const [authEmail, setAuthEmail] = useState('');
   const [authPassword, setAuthPassword] = useState('');
   const [authName, setAuthName] = useState('');
@@ -377,11 +433,18 @@ function App() {
   const sourceFileInputRef = useRef<HTMLInputElement | null>(null);
   const recordingFileInputRef = useRef<HTMLInputElement | null>(null);
   const recordingMediaFileInputRef = useRef<HTMLInputElement | null>(null);
+  const projectMaterialFilesRef = useRef<Record<string, ProjectMaterialFile[]>>({});
   const shouldSeedDemoRecordingRef = useRef(window.location.search.includes('demoRecording'));
 
   const activeProject = activeProjectIndex === null ? null : projects[activeProjectIndex];
   const activeProjectId = activeProject?.id ?? null;
   const storageUserId = currentUser?.id ?? null;
+  const projectMaterialFiles = activeProjectId === null
+    ? []
+    : projectMaterialFilesRef.current[activeProjectId] ?? [];
+  const projectMaterialCount = projectMaterialFiles.length;
+  const recordingMaterialCount = recordingMaterialFiles.length;
+  const totalTranscriptionMaterialCount = projectMaterialCount + recordingMaterialCount;
 
   // gsvx 호출 공통 헤더 — 프로젝트가 열려 있으면 X-Project-Id로 하위 네임스페이스를 지정한다.
   const gsvxHeaders = (projectId: string | null): Record<string, string> => ({
@@ -509,8 +572,16 @@ function App() {
 
     const handlePopState = (event: PopStateEvent) => {
       const state = event.state as { view?: string; projectIndex?: number } | null;
+      const isAdmin = currentUser?.role === 'admin';
 
       if (state?.view === 'project' && typeof state.projectIndex === 'number') {
+        if (isAdmin) {
+          setIsAdminOpen(true);
+          setIsProfileOpen(false);
+          setIsHelpOpen(false);
+          setActiveProjectIndex(null);
+          return;
+        }
         setIsProfileOpen(false);
         setIsAdminOpen(false);
         setIsHelpOpen(false);
@@ -519,6 +590,13 @@ function App() {
       }
 
       if (state?.view === 'profile') {
+        if (isAdmin) {
+          setIsAdminOpen(true);
+          setIsProfileOpen(false);
+          setIsHelpOpen(false);
+          setActiveProjectIndex(null);
+          return;
+        }
         setIsProfileOpen(true);
         setIsAdminOpen(false);
         setIsHelpOpen(false);
@@ -534,6 +612,14 @@ function App() {
         return;
       }
 
+      if (isAdmin) {
+        setIsAdminOpen(true);
+        setIsProfileOpen(false);
+        setIsHelpOpen(false);
+        setActiveProjectIndex(null);
+        return;
+      }
+
       setIsProfileOpen(false);
       setIsAdminOpen(false);
       setIsHelpOpen(false);
@@ -542,7 +628,7 @@ function App() {
 
     window.addEventListener('popstate', handlePopState);
     return () => window.removeEventListener('popstate', handlePopState);
-  }, []);
+  }, [currentUser?.role]);
 
   useEffect(() => {
     if (
@@ -616,7 +702,7 @@ function App() {
   const transcriptsRef = useRef(transcriptsBySourceId);
   transcriptsRef.current = transcriptsBySourceId;
   const projectWorkspacesRef = useRef<Record<string, ProjectWorkspace>>(
-    loadStoredWorkspaces(null),
+    loadStoredWorkspaces(initialBackendUser?.id ?? null),
   );
   const prevProjectIdRef = useRef<string | null>(null);
 
@@ -635,6 +721,7 @@ function App() {
   const switchProjectStorage = (userId: string | null) => {
     setProjects(userId === null ? [] : loadStoredProjects(userId));
     projectWorkspacesRef.current = userId === null ? {} : loadStoredWorkspaces(userId);
+    projectMaterialFilesRef.current = {};
     prevProjectIdRef.current = null;
     setSourceItems([]);
     setTranscriptsBySourceId({});
@@ -651,16 +738,28 @@ function App() {
 
   useEffect(() => {
     if (supabase === null) {
-      switchProjectStorage(null);
+      const storedAuth = loadStoredBackendAuth();
+      if (storedAuth !== null) {
+        setIsLoggedIn(true);
+        setCurrentUser(storedAuth.user);
+        switchProjectStorage(storedAuth.user.id);
+      } else {
+        setIsLoggedIn(false);
+        setCurrentUser(null);
+        switchProjectStorage(null);
+      }
+      setIsAuthReady(true);
       return undefined;
     }
 
     const syncSession = (session: Session | null) => {
       const user = authUserFromSession(session);
+      clearBackendAuth();
       setIsLoggedIn(user !== null);
       setCurrentUser(user);
       setIsAdminOpen(false);
       switchProjectStorage(user?.id ?? null);
+      setIsAuthReady(true);
     };
 
     supabase.auth.getSession().then(({ data }) => {
@@ -811,6 +910,10 @@ function App() {
       setAuthMode('login');
       return;
     }
+    if (currentUser?.role === 'admin') {
+      openAdminHome();
+      return;
+    }
     setIsProfileOpen(false);
     setIsAdminOpen(false);
     setIsHelpOpen(false);
@@ -834,7 +937,30 @@ function App() {
     window.history.pushState({ view: 'home' }, '', window.location.pathname);
   };
 
+  const openAdminHome = () => {
+    setIsProfileOpen(false);
+    setIsAdminOpen(true);
+    setIsHelpOpen(false);
+    setIsSettingsOpen(false);
+    setIsAccountMenuOpen(false);
+    setActiveProjectIndex(null);
+    setAdminSection('개요');
+    window.history.pushState({ view: 'admin' }, '', window.location.pathname);
+  };
+
+  const openHome = () => {
+    if (currentUser?.role === 'admin') {
+      openAdminHome();
+      return;
+    }
+    openProjectHome();
+  };
+
   const openProfile = () => {
+    if (currentUser?.role === 'admin') {
+      openAdminHome();
+      return;
+    }
     setIsProfileOpen(true);
     setIsAdminOpen(false);
     setIsHelpOpen(false);
@@ -846,6 +972,7 @@ function App() {
 
   const logout = () => {
     void supabase?.auth.signOut();
+    clearBackendAuth();
     setIsLoggedIn(false);
     setCurrentUser(null);
     switchProjectStorage(null);
@@ -870,7 +997,22 @@ function App() {
     closeAuthModal();
   };
 
+  const completeBackendAuth = (authResult: BackendAuthResponse) => {
+    storeBackendAuth(authResult);
+    const { user } = authResult;
+    setIsLoggedIn(true);
+    setCurrentUser(user);
+    switchProjectStorage(user.id);
+    setIsAdminOpen(false);
+    setIsProfileOpen(false);
+    setIsHelpOpen(false);
+    setActiveProjectIndex(null);
+    setIsAccountMenuOpen(false);
+    closeAuthModal();
+  };
+
   const completeAdminAuth = () => {
+    clearBackendAuth();
     const adminUser = {
       id: 'local-admin',
       email: 'admin@synapvox.local',
@@ -898,22 +1040,38 @@ function App() {
     setAuthError(null);
     setAuthLoading(true);
     try {
-      const supabaseClient = requireSupabase();
-      if (authMode === 'signup') {
-        const { error } = await supabaseClient.auth.signUp({
-          email: authEmail,
-          password: authPassword,
-          options: { data: { name: authName } },
+      if (supabase === null) {
+        const endpoint = authMode === 'signup' ? '/api/auth/signup' : '/api/auth/login';
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(authMode === 'signup'
+            ? { name: authName, email: authEmail, password: authPassword }
+            : { identifier: authEmail, password: authPassword }),
         });
-        if (error) throw error;
+        if (!response.ok) {
+          const errorBody = await response.json().catch(() => null) as { detail?: string } | null;
+          throw new Error(errorBody?.detail ?? '인증에 실패했습니다.');
+        }
+        const authResult = await response.json() as BackendAuthResponse;
+        completeBackendAuth(authResult);
       } else {
-        const { error } = await supabaseClient.auth.signInWithPassword({
-          email: authEmail,
-          password: authPassword,
-        });
-        if (error) throw error;
+        if (authMode === 'signup') {
+          const { error } = await supabase.auth.signUp({
+            email: authEmail,
+            password: authPassword,
+            options: { data: { name: authName } },
+          });
+          if (error) throw error;
+        } else {
+          const { error } = await supabase.auth.signInWithPassword({
+            email: authEmail,
+            password: authPassword,
+          });
+          if (error) throw error;
+        }
+        completeAuth();
       }
-      completeAuth();
     } catch (error) {
       setAuthError(error instanceof Error ? error.message : '인증에 실패했습니다.');
     } finally {
@@ -926,6 +1084,10 @@ function App() {
       setAuthMode('login');
       return;
     }
+    if (currentUser?.role === 'admin') {
+      openAdminHome();
+      return;
+    }
     setProjectDraft({
       name: createDefaultProjectName(projects),
       description: '',
@@ -936,6 +1098,10 @@ function App() {
   const createProject = () => {
     if (!isLoggedIn) {
       setAuthMode('login');
+      return;
+    }
+    if (currentUser?.role === 'admin') {
+      openAdminHome();
       return;
     }
     const name = projectDraft.name.trim() || '새 프로젝트';
@@ -1029,6 +1195,10 @@ function App() {
       URL.revokeObjectURL(targetSource.audioUrl);
     }
     setSourceItems((currentSourceItems) => currentSourceItems.filter((source) => source.id !== sourceId));
+    if (activeProjectId !== null) {
+      projectMaterialFilesRef.current[activeProjectId] = (projectMaterialFilesRef.current[activeProjectId] ?? [])
+        .filter((entry) => entry.source.id !== sourceId);
+    }
     if (targetSource !== undefined && activeProjectIndex !== null) {
       setProjects((currentProjects) => currentProjects.map((project, projectIndex) => {
         if (projectIndex !== activeProjectIndex) return project;
@@ -1065,7 +1235,11 @@ function App() {
     setIsRecordingMenuOpen(false);
   };
 
-  const createMaterialItems = (files: FileList | File[], prefix = 'material') => {
+  const createMaterialItems = (
+    files: FileList | File[],
+    prefix = 'material',
+    materialScope: SourceItem['materialScope'] = 'project',
+  ) => {
     const fileList = Array.from(files).filter((file) => file.size > 0 || file.name.trim().length > 0);
     if (fileList.length === 0) return [];
 
@@ -1075,6 +1249,7 @@ function App() {
       title: file.name,
       type: getMaterialSourceType(file),
       category: '자료',
+      materialScope,
       meta: `자료 · ${formatFileSize(file.size)}`,
       updatedOrder: index,
     }));
@@ -1112,8 +1287,16 @@ function App() {
 
   const addProjectMaterialFiles = (files: FileList | File[]) => {
     const fileList = Array.from(files).filter((file) => file.size > 0 || file.name.trim().length > 0);
-    const nextMaterials = createMaterialItems(fileList, 'material');
+    const nextMaterials = createMaterialItems(fileList, 'material', 'project');
     if (nextMaterials.length === 0) return 0;
+    const projectId = activeProjectId;
+
+    if (projectId !== null) {
+      projectMaterialFilesRef.current[projectId] = [
+        ...nextMaterials.map((source, index) => ({ source, file: fileList[index] })),
+        ...(projectMaterialFilesRef.current[projectId] ?? []),
+      ];
+    }
 
     setSourceItems((currentSourceItems) => [
       ...nextMaterials,
@@ -1138,7 +1321,7 @@ function App() {
 
   const addRecordingMaterialFiles = (files: FileList | File[]) => {
     const fileList = Array.from(files).filter((file) => file.size > 0 || file.name.trim().length > 0);
-    const nextMaterials = createMaterialItems(fileList, 'recording-material');
+    const nextMaterials = createMaterialItems(fileList, 'recording-material', 'recording');
     if (nextMaterials.length === 0) return 0;
 
     setSourceItems((currentSourceItems) => [
@@ -1297,6 +1480,12 @@ function App() {
 
     const body = new FormData();
     body.append('audio', recordedAudioBlob, recordedAudioFileName ?? `synapvox-recording-${Date.now()}.webm`);
+    const projectMaterialsForTranscription = activeProjectId === null
+      ? []
+      : projectMaterialFilesRef.current[activeProjectId] ?? [];
+    projectMaterialsForTranscription.forEach(({ file }) => {
+      body.append('materials', file, file.name);
+    });
     recordingMaterialFiles.forEach((file) => {
       body.append('materials', file, file.name);
     });
@@ -1343,16 +1532,22 @@ function App() {
         hour12: false,
       });
       const recordingId = `recording-${now.getTime()}`;
+      const linkedMaterials = [
+        ...projectMaterialsForTranscription.map((entry) => entry.source),
+        ...recordingAttachedMaterials,
+      ].filter((material, index, materials) => (
+        materials.findIndex((candidate) => candidate.id === material.id) === index
+      ));
       const savedRecording: SourceItem = {
         id: recordingId,
         title: getRecordingTitle(recordedAudioFileName, `녹음본 ${timeLabel}`),
         type: recordedAudioFileName === null ? '녹음' : '파일',
         category: '녹음본',
-        meta: `전사 완료 · 오늘 ${timeLabel}${recordingAttachedMaterials.length > 0 ? ` · 연결 자료 ${recordingAttachedMaterials.length}개` : ''}`,
+        meta: `전사 완료 · 오늘 ${timeLabel}${linkedMaterials.length > 0 ? ` · 연결 자료 ${linkedMaterials.length}개` : ''}`,
         updatedOrder: 0,
         audioUrl: recordedAudioUrl ?? undefined,
         durationLabel: recordedAudioDurationLabel,
-        attachedMaterials: recordingAttachedMaterials,
+        attachedMaterials: linkedMaterials,
         mediaKind: recordedMediaKind,
       };
       if (recordedAudioUrl !== null) savedAudioUrlsRef.current.add(recordedAudioUrl);
@@ -1501,7 +1696,7 @@ function App() {
         <div className="sidebar-top">
           <div className="brand">
             <div className="sidebar-content">
-              <button className="brand-home" type="button" onClick={openProjectHome}>
+              <button className="brand-home" type="button" onClick={openHome}>
                 SynapVox
               </button>
             </div>
@@ -1581,7 +1776,9 @@ function App() {
 
               {isAccountMenuOpen && (
                 <div className="account-menu">
-                  <button type="button" onClick={openProfile}>내 정보 보기</button>
+                  {currentUser?.role !== 'admin' && (
+                    <button type="button" onClick={openProfile}>내 정보 보기</button>
+                  )}
                   <button className="danger" type="button" onClick={logout}>로그아웃</button>
                 </div>
               )}
@@ -1599,7 +1796,7 @@ function App() {
       <main className="workspace">
         {!isProjectWorkspace && (
           <header className="app-topbar">
-            <button className="topbar-brand" type="button" onClick={openProjectHome}>
+            <button className="topbar-brand" type="button" onClick={openHome}>
               Synap<span>Vox</span>
             </button>
 
@@ -1664,7 +1861,9 @@ function App() {
                   </button>
                   {isAccountMenuOpen && (
                     <div className="account-menu">
-                      <button type="button" onClick={openProfile}>내 정보 보기</button>
+                      {currentUser?.role !== 'admin' && (
+                        <button type="button" onClick={openProfile}>내 정보 보기</button>
+                      )}
                       <button className="danger" type="button" onClick={logout}>로그아웃</button>
                     </div>
                   )}
@@ -1729,8 +1928,8 @@ function App() {
                     </button>
                   ))}
                 </nav>
-                <button className="admin-home-button" type="button" onClick={openProjectHome}>
-                  홈으로
+                <button className="admin-home-button" type="button" onClick={openAdminHome}>
+                  운영 홈
                 </button>
               </aside>
 
@@ -2059,6 +2258,13 @@ function App() {
               </article>
             </section>
           </>
+        ) : !isAuthReady ? (
+          <section className="signed-out-home" aria-label="loading account">
+            <div className="signed-out-copy">
+              <p className="eyebrow">SynapVox</p>
+              <h1>계정 상태를 확인하고 있어요.</h1>
+            </div>
+          </section>
         ) : !isLoggedIn ? (
           <section className="signed-out-home" aria-label="login required">
             <div className="signed-out-copy">
@@ -2331,7 +2537,10 @@ function App() {
 
               <div className="source-panel-content">
                 <div className="source-actions">
-                  <button className="source-primary-button" type="button" onClick={() => setSourceModalMode('source')}>+ 자료 추가</button>
+                  <div className="project-material-action">
+                    <button className="source-primary-button" type="button" onClick={() => setSourceModalMode('source')}>+ 프로젝트 자료</button>
+                    <p>이 프로젝트의 모든 녹음 전사와 AI 답변에 참고돼요.</p>
+                  </div>
                   <button className="record-primary-button" type="button" onClick={() => setSourceModalMode('record')}>녹음 하기</button>
                 </div>
 
@@ -2808,12 +3017,12 @@ function App() {
 
             <p className="eyebrow">{sourceModalMode === 'source' ? 'Add source' : 'Record audio'}</p>
             <h2 id="source-modal-title">
-              {sourceModalMode === 'source' ? '자료 추가' : '녹음 시작'}
+              {sourceModalMode === 'source' ? '프로젝트 자료 추가' : '녹음 시작'}
             </h2>
             <p>
               {sourceModalMode === 'source'
-                ? '파일을 추가하면 자료 소스 카드에 표시됩니다.'
-                : '녹음에 참고할 파일을 함께 넣고 전사, 요약, 그래프 연결을 진행합니다.'}
+                ? '이 프로젝트의 모든 녹음 전사와 AI 답변에 참고할 자료를 추가합니다.'
+                : '프로젝트 자료와 이번 녹음 참고자료를 함께 사용해 전사를 진행합니다.'}
             </p>
 
             {sourceModalMode === 'source' ? (
@@ -2837,8 +3046,8 @@ function App() {
                   }}
                 >
                   <span aria-hidden="true">+</span>
-                  <strong>파일을 여기에 드래그하세요</strong>
-                  <p>추가하면 자료 소스 카드에 바로 들어갑니다.</p>
+                  <strong>프로젝트 자료를 여기에 드래그하세요</strong>
+                  <p>추가한 자료는 이 프로젝트의 녹음 전사와 AI 답변에 자동 참고됩니다.</p>
                 </div>
                 <input
                   ref={sourceFileInputRef}
@@ -2934,8 +3143,8 @@ function App() {
                 >
                   <span aria-hidden="true">+</span>
                   <div>
-                    <strong>녹음 참고 파일 추가</strong>
-                    <p>자료 카드에 표시되고, 전사 후 녹음본 상세에서도 보입니다.</p>
+                    <strong>이번 녹음 참고자료 추가</strong>
+                    <p>이 녹음본 전사에만 추가로 참고됩니다.</p>
                   </div>
                 </div>
                 <input
@@ -2948,11 +3157,27 @@ function App() {
                     event.target.value = '';
                   }}
                 />
-                {recordingAttachedMaterials.length > 0 && (
+                {totalTranscriptionMaterialCount > 0 && (
+                  <div className="record-reference-summary" aria-label="전사 참고자료">
+                    <strong>전사 참고자료</strong>
+                    <p>
+                      프로젝트 자료 {projectMaterialCount}개
+                      {' '}
+                      + 이번 녹음 자료 {recordingMaterialCount}개
+                    </p>
+                  </div>
+                )}
+                {(projectMaterialFiles.length > 0 || recordingAttachedMaterials.length > 0) && (
                   <div className="record-attached-list" aria-label="이 녹음본에 연결된 자료">
+                    {projectMaterialFiles.map(({ source }) => (
+                      <span key={source.id}>
+                        <b>공통</b>
+                        {source.title}
+                      </span>
+                    ))}
                     {recordingAttachedMaterials.map((material) => (
                       <span key={material.id}>
-                        <b>{material.type}</b>
+                        <b>이번</b>
                         {material.title}
                       </span>
                     ))}
