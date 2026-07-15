@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState, type PointerEvent, type WheelEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent, type WheelEvent } from 'react';
 import './App.css';
-import { supabase } from './lib/supabaseClient';
+import { requireSupabase, supabase } from './supabaseClient';
+import type { Session } from '@supabase/supabase-js';
 
 type Project = {
   id: string;              // gsvx 하위 네임스페이스 키 (X-Project-Id 헤더로 전달, ASCII 슬러그)
@@ -53,12 +54,39 @@ type TranscriptSegment = {
   text: string;
 };
 
+type ProjectWorkspace = {
+  sources: SourceItem[];
+  transcripts: Record<string, TranscriptSegment[]>;
+};
+
+type AuthUser = {
+  id: string;
+  email: string;
+  name: string;
+  role: string;
+};
+
 const PROJECTS_STORAGE_KEY = 'synapvox-projects';
+const WORKSPACES_STORAGE_KEY = 'synapvox-project-workspaces';
+const scopedStorageKey = (baseKey: string, userId: string | null) => `${baseKey}:${userId ?? 'guest'}`;
+
+const authUserFromSession = (session: Session | null): AuthUser | null => {
+  if (session === null) return null;
+  const metadataName = session.user.user_metadata.name;
+  return {
+    id: session.user.id,
+    email: session.user.email ?? '로그인된 계정',
+    name: typeof metadataName === 'string' && metadataName.trim() !== ''
+      ? metadataName
+      : session.user.email?.split('@')[0] ?? '사용자',
+    role: 'user',
+  };
+};
 
 // 프로젝트 목록을 localStorage에 영속화 — 새로고침해도 프로젝트 id↔그래프(gsvx 네임스페이스) 매핑이 유지된다.
-const loadStoredProjects = (): Project[] => {
+const loadStoredProjects = (userId: string | null): Project[] => {
   try {
-    const raw = window.localStorage.getItem(PROJECTS_STORAGE_KEY);
+    const raw = window.localStorage.getItem(scopedStorageKey(PROJECTS_STORAGE_KEY, userId));
     if (raw === null) return [];
     const parsed = JSON.parse(raw) as Project[];
     return Array.isArray(parsed)
@@ -69,11 +97,38 @@ const loadStoredProjects = (): Project[] => {
   }
 };
 
+const loadStoredWorkspaces = (userId: string | null): Record<string, ProjectWorkspace> => {
+  try {
+    const raw = window.localStorage.getItem(scopedStorageKey(WORKSPACES_STORAGE_KEY, userId));
+    if (raw === null) return {};
+    const parsed = JSON.parse(raw) as Record<string, ProjectWorkspace>;
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+};
+
 // HTTP 헤더는 ASCII 제약이 있어 프로젝트 이름(한글 가능) 대신 ASCII 슬러그 id를 쓴다.
 const createProjectId = () => `p-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 
+const createDefaultProjectName = (projects: Project[]) => {
+  const activeNames = new Set(
+    projects
+      .filter((project) => !project.trashed)
+      .map((project) => project.name.trim()),
+  );
+  if (!activeNames.has('새 프로젝트')) return '새 프로젝트';
+
+  let index = 1;
+  while (activeNames.has(`새 프로젝트 ${index}`)) {
+    index += 1;
+  }
+  return `새 프로젝트 ${index}`;
+};
+
 const statusFilters = ['전체', '분석 중', '요약 완료', '자료 필요'];
 const homeSections = ['노트북', '즐겨찾기', '공유됨', '휴지통'];
+const adminNavItems = ['개요', '사용자', '작업 큐', '비용', '품질', '시스템'];
 const projectSortOptions = ['최근 수정순', '이름순', '녹음 많은 순'];
 const initialSourceItems: SourceItem[] = [];
 const sourceTabs = ['녹음본', '자료'] as const;
@@ -222,11 +277,13 @@ const mapIntermediateTranscript = (data: IntermediateTranscript): TranscriptSegm
 };
 
 function App() {
-  const [projects, setProjects] = useState<Project[]>(loadStoredProjects);
+  const [projects, setProjects] = useState<Project[]>(() => loadStoredProjects(null));
   const [sourceItems, setSourceItems] = useState(initialSourceItems);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [activeProjectIndex, setActiveProjectIndex] = useState<number | null>(null);
   const [isProfileOpen, setIsProfileOpen] = useState(false);
+  const [isAdminOpen, setIsAdminOpen] = useState(false);
+  const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [authEmail, setAuthEmail] = useState('');
   const [authPassword, setAuthPassword] = useState('');
@@ -238,6 +295,7 @@ function App() {
   const [projectSort, setProjectSort] = useState('최근 수정순');
   const [isProjectSortOpen, setIsProjectSortOpen] = useState(false);
   const [homeSection, setHomeSection] = useState('노트북');
+  const [adminSection, setAdminSection] = useState('개요');
   const [authMode, setAuthMode] = useState<'login' | 'signup' | null>(null);
   const [isProjectModalOpen, setIsProjectModalOpen] = useState(false);
   const [projectDraft, setProjectDraft] = useState({
@@ -319,9 +377,11 @@ function App() {
   const sourceFileInputRef = useRef<HTMLInputElement | null>(null);
   const recordingFileInputRef = useRef<HTMLInputElement | null>(null);
   const recordingMediaFileInputRef = useRef<HTMLInputElement | null>(null);
+  const shouldSeedDemoRecordingRef = useRef(window.location.search.includes('demoRecording'));
 
   const activeProject = activeProjectIndex === null ? null : projects[activeProjectIndex];
   const activeProjectId = activeProject?.id ?? null;
+  const storageUserId = currentUser?.id ?? null;
 
   // gsvx 호출 공통 헤더 — 프로젝트가 열려 있으면 X-Project-Id로 하위 네임스페이스를 지정한다.
   const gsvxHeaders = (projectId: string | null): Record<string, string> => ({
@@ -405,18 +465,44 @@ function App() {
   const profileProjectCount = projects.filter((project) => !project.trashed).length;
   const profileRecordingCount = sourceItems.filter((source) => source.category === '녹음본').length;
   const profileMaterialCount = sourceItems.filter((source) => source.category === '자료').length;
-
-  useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => {
-      setIsLoggedIn(data.session !== null);
-    });
-
-    const { data: subscription } = supabase.auth.onAuthStateChange((_event, session) => {
-      setIsLoggedIn(session !== null);
-    });
-
-    return () => subscription.subscription.unsubscribe();
-  }, []);
+  const accountName = currentUser?.name ?? '사용자';
+  const accountEmail = currentUser?.email ?? '로그인된 계정';
+  const accountInitial = accountName.trim().charAt(0).toUpperCase() || '사';
+  const adminUserCount = isLoggedIn ? 1 : 0;
+  const adminRecordingCount = projects.reduce((total, project) => total + (project.trashed ? 0 : project.recordings), 0);
+  const adminMaterialCount = projects.reduce((total, project) => total + (project.trashed ? 0 : project.materials), 0);
+  const adminActiveProjectCount = projects.filter((project) => !project.trashed).length;
+  const adminTotalSourceCount = adminRecordingCount + adminMaterialCount;
+  const adminRows = [
+    {
+      label: '사용자/키',
+      value: adminUserCount,
+      detail: adminUserCount > 0 ? '현재 로그인한 관리자' : '연결된 사용자 없음',
+    },
+    {
+      label: '오늘 비용',
+      value: '₩0',
+      detail: '수집된 비용 없음',
+    },
+    {
+      label: '작업 큐',
+      value: 0,
+      detail: '수집된 작업 없음',
+    },
+    {
+      label: '피드백',
+      value: 0,
+      detail: '수집된 피드백 없음',
+    },
+  ];
+  const adminPipelines: string[][] = [];
+  const adminCostBreakdown: string[][] = [];
+  const adminUsers = currentUser === null
+    ? []
+    : [[currentUser.name, currentUser.role, currentUser.email, 'active']];
+  const adminBudgetRows: string[][] = [];
+  const adminQualityRows: string[][] = [];
+  const adminSystemRows: string[][] = [];
 
   useEffect(() => {
     window.history.replaceState({ view: 'home' }, '', window.location.pathname);
@@ -426,6 +512,7 @@ function App() {
 
       if (state?.view === 'project' && typeof state.projectIndex === 'number') {
         setIsProfileOpen(false);
+        setIsAdminOpen(false);
         setIsHelpOpen(false);
         setActiveProjectIndex(state.projectIndex);
         return;
@@ -433,12 +520,22 @@ function App() {
 
       if (state?.view === 'profile') {
         setIsProfileOpen(true);
+        setIsAdminOpen(false);
+        setIsHelpOpen(false);
+        setActiveProjectIndex(null);
+        return;
+      }
+
+      if (state?.view === 'admin') {
+        setIsAdminOpen(true);
+        setIsProfileOpen(false);
         setIsHelpOpen(false);
         setActiveProjectIndex(null);
         return;
       }
 
       setIsProfileOpen(false);
+      setIsAdminOpen(false);
       setIsHelpOpen(false);
       setActiveProjectIndex(null);
     };
@@ -504,12 +601,13 @@ function App() {
 
   // 프로젝트 목록 영속화 — id↔gsvx 네임스페이스 매핑이 새로고침 후에도 유지되게.
   useEffect(() => {
+    if (storageUserId === null) return;
     try {
-      window.localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(projects));
+      window.localStorage.setItem(scopedStorageKey(PROJECTS_STORAGE_KEY, storageUserId), JSON.stringify(projects));
     } catch (error) {
       console.error('프로젝트 목록 저장 실패:', error);
     }
-  }, [projects]);
+  }, [projects, storageUserId]);
 
   // 프로젝트 전환 시: 그래프를 해당 프로젝트 네임스페이스로 다시 불러오고,
   // 소스 카드·전사 목록도 프로젝트별로 분리 보관/복원한다(이전 프로젝트 데이터가 새 프로젝트에 안 섞이게).
@@ -517,8 +615,135 @@ function App() {
   sourceItemsRef.current = sourceItems;
   const transcriptsRef = useRef(transcriptsBySourceId);
   transcriptsRef.current = transcriptsBySourceId;
-  const projectWorkspacesRef = useRef<Record<string, { sources: SourceItem[]; transcripts: Record<string, TranscriptSegment[]> }>>({});
+  const projectWorkspacesRef = useRef<Record<string, ProjectWorkspace>>(
+    loadStoredWorkspaces(null),
+  );
   const prevProjectIdRef = useRef<string | null>(null);
+
+  const persistProjectWorkspaces = useCallback(() => {
+    if (storageUserId === null) return;
+    try {
+      window.localStorage.setItem(
+        scopedStorageKey(WORKSPACES_STORAGE_KEY, storageUserId),
+        JSON.stringify(projectWorkspacesRef.current),
+      );
+    } catch (error) {
+      console.error('프로젝트 작업공간 저장 실패:', error);
+    }
+  }, [storageUserId]);
+
+  const switchProjectStorage = (userId: string | null) => {
+    setProjects(userId === null ? [] : loadStoredProjects(userId));
+    projectWorkspacesRef.current = userId === null ? {} : loadStoredWorkspaces(userId);
+    prevProjectIdRef.current = null;
+    setSourceItems([]);
+    setTranscriptsBySourceId({});
+    setSelectedSource(null);
+    setActiveProjectIndex(null);
+    setHomeSection('노트북');
+    setStatusFilter('전체');
+    setProjectQuery('');
+    setGraphNodes([]);
+    setGraphLinks([]);
+    setSelectedGraphNodeId(null);
+    setGraphFocusNodeIds([]);
+  };
+
+  useEffect(() => {
+    if (supabase === null) {
+      switchProjectStorage(null);
+      return undefined;
+    }
+
+    const syncSession = (session: Session | null) => {
+      const user = authUserFromSession(session);
+      setIsLoggedIn(user !== null);
+      setCurrentUser(user);
+      setIsAdminOpen(false);
+      switchProjectStorage(user?.id ?? null);
+    };
+
+    supabase.auth.getSession().then(({ data }) => {
+      syncSession(data.session);
+    }).catch((error) => {
+      console.error('Supabase 세션 확인 실패:', error);
+      syncSession(null);
+    });
+
+    const { data: subscription } = supabase.auth.onAuthStateChange((_event, session) => {
+      syncSession(session);
+    });
+
+    return () => subscription.subscription.unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!shouldSeedDemoRecordingRef.current) return;
+    shouldSeedDemoRecordingRef.current = false;
+
+    const demoProjectId = 'p-demo-recording';
+    const demoRecordingId = 'recording-demo';
+    const demoRecording: SourceItem = {
+      id: demoRecordingId,
+      title: '테스트 회의 녹음본',
+      type: '파일',
+      category: '녹음본',
+      meta: '전사 완료 · 오늘 09:50 · 테스트 데이터',
+      updatedOrder: 0,
+      durationLabel: '02:00',
+      mediaKind: 'audio',
+      attachedMaterials: [],
+    };
+    const demoTranscript: TranscriptSegment[] = [
+      {
+        id: 0,
+        speakerNumber: 1,
+        speakerLabel: '화자 1',
+        time: '00:00',
+        text: '오늘은 SynapVox의 녹음본 전사 흐름과 그래프 뷰 연결 상태를 간단히 확인하겠습니다.',
+      },
+      {
+        id: 1,
+        speakerNumber: 2,
+        speakerLabel: '화자 2',
+        time: '00:18',
+        text: '자료를 넣고 녹음본을 전사하면 소스 카드에 기록되고, 이후 그래프와 AI 대화에서 근거로 사용할 수 있습니다.',
+      },
+      {
+        id: 2,
+        speakerNumber: 1,
+        speakerLabel: '화자 1',
+        time: '00:43',
+        text: '지금 데이터는 화면 확인을 위한 임시 녹음본이며, 실제 파일 저장은 Supabase Storage를 붙이면 영구화됩니다.',
+      },
+    ];
+
+    projectWorkspacesRef.current[demoProjectId] = {
+      sources: [demoRecording],
+      transcripts: { [demoRecordingId]: demoTranscript },
+    };
+    persistProjectWorkspaces();
+    setSourceItems([demoRecording]);
+    setTranscriptsBySourceId({ [demoRecordingId]: demoTranscript });
+    setSourceTab('녹음본');
+    setProjects((currentProjects) => {
+      const demoProject: Project = {
+        id: demoProjectId,
+        name: '테스트 녹음 프로젝트',
+        description: '그래프 뷰와 전사 화면 확인용 임시 프로젝트',
+        updatedAt: '방금',
+        recordings: 1,
+        materials: 0,
+        status: '분석 중',
+      };
+      const nextProjects = [
+        demoProject,
+        ...currentProjects.filter((project) => project.id !== demoProjectId && project.name !== demoProject.name),
+      ];
+      window.setTimeout(() => setActiveProjectIndex(0), 0);
+      return nextProjects;
+    });
+  }, [persistProjectWorkspaces]);
 
   useEffect(() => {
     const prev = prevProjectIdRef.current;
@@ -527,6 +752,7 @@ function App() {
         sources: sourceItemsRef.current,
         transcripts: transcriptsRef.current,
       };
+      persistProjectWorkspaces();
     }
     if (activeProjectId !== null && prev !== activeProjectId) {
       const saved = projectWorkspacesRef.current[activeProjectId];
@@ -540,7 +766,16 @@ function App() {
       void refreshGsvxGraph(activeProjectId);
     }
     prevProjectIdRef.current = activeProjectId;
-  }, [activeProjectId]);
+  }, [activeProjectId, persistProjectWorkspaces]);
+
+  useEffect(() => {
+    if (activeProjectId === null) return;
+    projectWorkspacesRef.current[activeProjectId] = {
+      sources: sourceItems,
+      transcripts: transcriptsBySourceId,
+    };
+    persistProjectWorkspaces();
+  }, [activeProjectId, sourceItems, transcriptsBySourceId, persistProjectWorkspaces]);
 
   const closeSourceModal = () => {
     isClosingRecordingRef.current = true;
@@ -572,7 +807,12 @@ function App() {
   };
 
   const openProject = (index: number) => {
+    if (!isLoggedIn) {
+      setAuthMode('login');
+      return;
+    }
     setIsProfileOpen(false);
+    setIsAdminOpen(false);
     setIsHelpOpen(false);
     setIsSettingsOpen(false);
     setIsAccountMenuOpen(false);
@@ -582,9 +822,13 @@ function App() {
 
   const openProjectHome = () => {
     setIsProfileOpen(false);
+    setIsAdminOpen(false);
     setIsHelpOpen(false);
     setIsSettingsOpen(false);
     setIsAccountMenuOpen(false);
+    setIsFeedbackOpen(false);
+    setIsProjectSortOpen(false);
+    setAuthMode(null);
     setActiveProjectIndex(null);
     setHomeSection('노트북');
     window.history.pushState({ view: 'home' }, '', window.location.pathname);
@@ -592,6 +836,7 @@ function App() {
 
   const openProfile = () => {
     setIsProfileOpen(true);
+    setIsAdminOpen(false);
     setIsHelpOpen(false);
     setIsSettingsOpen(false);
     setIsAccountMenuOpen(false);
@@ -600,9 +845,13 @@ function App() {
   };
 
   const logout = () => {
-    void supabase.auth.signOut();
+    void supabase?.auth.signOut();
     setIsLoggedIn(false);
+    setCurrentUser(null);
+    switchProjectStorage(null);
     setIsProfileOpen(false);
+    setIsAdminOpen(false);
+    setIsHelpOpen(false);
     setIsAccountMenuOpen(false);
     setAuthMode(null);
   };
@@ -621,19 +870,44 @@ function App() {
     closeAuthModal();
   };
 
+  const completeAdminAuth = () => {
+    const adminUser = {
+      id: 'local-admin',
+      email: 'admin@synapvox.local',
+      name: '관리자',
+      role: 'admin',
+    };
+    setIsLoggedIn(true);
+    setCurrentUser(adminUser);
+    switchProjectStorage(adminUser.id);
+    setIsAdminOpen(true);
+    setIsProfileOpen(false);
+    setIsHelpOpen(false);
+    setActiveProjectIndex(null);
+    setIsAccountMenuOpen(false);
+    closeAuthModal();
+    window.history.pushState({ view: 'admin' }, '', window.location.pathname);
+  };
+
   const submitAuth = async () => {
+    if (authMode === 'login' && authEmail.trim() === '0101') {
+      completeAdminAuth();
+      return;
+    }
+
     setAuthError(null);
     setAuthLoading(true);
     try {
+      const supabaseClient = requireSupabase();
       if (authMode === 'signup') {
-        const { error } = await supabase.auth.signUp({
+        const { error } = await supabaseClient.auth.signUp({
           email: authEmail,
           password: authPassword,
           options: { data: { name: authName } },
         });
         if (error) throw error;
       } else {
-        const { error } = await supabase.auth.signInWithPassword({
+        const { error } = await supabaseClient.auth.signInWithPassword({
           email: authEmail,
           password: authPassword,
         });
@@ -648,16 +922,22 @@ function App() {
   };
 
   const openCreateProjectModal = () => {
-    const existingNewProjectCount = projects.filter((project) => project.name.startsWith('새 프로젝트')).length;
-    const projectName = existingNewProjectCount === 0 ? '새 프로젝트' : `새 프로젝트 ${existingNewProjectCount + 1}`;
+    if (!isLoggedIn) {
+      setAuthMode('login');
+      return;
+    }
     setProjectDraft({
-      name: projectName,
+      name: createDefaultProjectName(projects),
       description: '',
     });
     setIsProjectModalOpen(true);
   };
 
   const createProject = () => {
+    if (!isLoggedIn) {
+      setAuthMode('login');
+      return;
+    }
     const name = projectDraft.name.trim() || '새 프로젝트';
     const description = projectDraft.description.trim() || '녹음본과 자료를 묶을 새 작업 공간';
     const nextProject: Project = {
@@ -673,6 +953,7 @@ function App() {
     setProjects((currentProjects) => [nextProject, ...currentProjects]);
     setIsProjectModalOpen(false);
     setIsProfileOpen(false);
+    setIsAdminOpen(false);
     setIsHelpOpen(false);
     setIsSettingsOpen(false);
     setHomeSection('노트북');
@@ -954,34 +1235,9 @@ function App() {
     }
   };
 
-  const resetRecordedMedia = () => {
-    isClosingRecordingRef.current = true;
-    if (mediaRecorderRef.current?.state === 'recording') {
-      mediaRecorderRef.current.stop();
-    }
-    recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
-    recordingStreamRef.current = null;
-    mediaRecorderRef.current = null;
-    recordingChunksRef.current = [];
-    recordingStartedAtRef.current = null;
-    if (recordedAudioUrl !== null && !savedAudioUrlsRef.current.has(recordedAudioUrl)) {
-      URL.revokeObjectURL(recordedAudioUrl);
-    }
-    setRecordedAudioUrl(null);
-    setRecordedAudioBlob(null);
-    setRecordedAudioFileName(null);
-    setRecordedAudioDurationLabel('00:00');
-    setRecordedMediaKind('audio');
-    setRecordingState('idle');
-    setRecordingError(null);
-    setTranscriptionError(null);
-    setTranscriptionState('idle');
-    setTranscriptionStep(0);
-  };
-
   const changeRecordInputMode = (mode: 'record' | 'upload') => {
     if (recordInputMode === mode) return;
-    resetRecordedMedia();
+    setRecordingError(null);
     setRecordInputMode(mode);
   };
 
@@ -1060,7 +1316,6 @@ function App() {
         throw new Error(errorBody?.detail ?? '전사 요청에 실패했습니다.');
       }
 
-      setTranscriptionStep(3);
       const result = await response.json() as IntermediateTranscript;
       const transcriptSegments = mapIntermediateTranscript(result);
 
@@ -1121,7 +1376,7 @@ function App() {
       setRecordingAttachedMaterials([]);
       await new Promise((resolve) => window.setTimeout(resolve, 250));
       setTranscriptionState('done');
-      setTranscriptionStep(4);
+      setTranscriptionStep(3);
     } catch (error) {
       setTranscriptionState('idle');
       setTranscriptionStep(0);
@@ -1236,11 +1491,11 @@ function App() {
     }
   };
 
-  const isProjectWorkspace = activeProject !== null && !isProfileOpen;
+  const isProjectWorkspace = activeProject !== null && !isProfileOpen && !isAdminOpen && !isHelpOpen;
   const showSidebar = false;
 
   return (
-    <div className={`app-shell ${isSidebarOpen ? '' : 'sidebar-collapsed'} navigationless ${isProjectWorkspace ? 'project-focused' : ''}`}>
+    <div className={`app-shell ${isSidebarOpen ? '' : 'sidebar-collapsed'} navigationless ${isProjectWorkspace ? 'project-focused' : ''} ${isAdminOpen ? 'admin-focused' : ''}`}>
       {showSidebar && !isProjectWorkspace && (
       <aside className="sidebar">
         <div className="sidebar-top">
@@ -1317,10 +1572,10 @@ function App() {
                 aria-expanded={isAccountMenuOpen}
                 onClick={() => setIsAccountMenuOpen((value) => !value)}
               >
-                <span className="avatar">도</span>
+                <span className="avatar">{accountInitial}</span>
                 <span>
-                  <strong>도원</strong>
-                  <small>내 정보</small>
+                  <strong>{accountName}</strong>
+                  <small>{currentUser?.role === 'admin' ? '관리자' : '내 정보'}</small>
                 </span>
               </button>
 
@@ -1348,54 +1603,55 @@ function App() {
               Synap<span>Vox</span>
             </button>
 
-            <div className="topbar-actions">
-              <div className="settings-menu-wrap">
-                <button
-                  className="topbar-icon-button settings-button"
-                  type="button"
-                  aria-label="설정"
-                  aria-expanded={isSettingsOpen}
-                  onClick={() => {
-                    setIsAccountMenuOpen(false);
-                    setIsSettingsOpen((value) => !value);
-                  }}
-                >
-                  <span className="settings-icon" aria-hidden="true">⚙</span>
-                </button>
+            {isLoggedIn && (
+              <div className="topbar-actions">
+                <div className="settings-menu-wrap">
+                  <button
+                    className="topbar-icon-button settings-button"
+                    type="button"
+                    aria-label="설정"
+                    aria-expanded={isSettingsOpen}
+                    onClick={() => {
+                      setIsAccountMenuOpen(false);
+                      setIsSettingsOpen((value) => !value);
+                    }}
+                  >
+                    <span className="settings-icon" aria-hidden="true">⚙</span>
+                  </button>
 
-                {isSettingsOpen && (
-                  <div className="settings-menu">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setIsHelpOpen(true);
-                        setIsProfileOpen(false);
-                        setActiveProjectIndex(null);
-                        setIsAccountMenuOpen(false);
-                        setIsSettingsOpen(false);
-                      }}
-                    >
-                      도움말
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setIsFeedbackOpen(true);
-                        setIsAccountMenuOpen(false);
-                        setIsSettingsOpen(false);
-                      }}
-                    >
-                      의견 보내기
-                    </button>
-                    <button className="settings-language-row" type="button">
-                      <span>출력 언어</span>
-                      <strong>한국어</strong>
-                    </button>
-                  </div>
-                )}
-              </div>
+                  {isSettingsOpen && (
+                    <div className="settings-menu">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsHelpOpen(true);
+                          setIsProfileOpen(false);
+                          setIsAdminOpen(false);
+                          setActiveProjectIndex(null);
+                          setIsAccountMenuOpen(false);
+                          setIsSettingsOpen(false);
+                        }}
+                      >
+                        도움말
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsFeedbackOpen(true);
+                          setIsAccountMenuOpen(false);
+                          setIsSettingsOpen(false);
+                        }}
+                      >
+                        의견 보내기
+                      </button>
+                      <button className="settings-language-row" type="button">
+                        <span>출력 언어</span>
+                        <strong>한국어</strong>
+                      </button>
+                    </div>
+                  )}
+                </div>
 
-              {isLoggedIn ? (
                 <div className="account-menu-wrap topbar-account-menu">
                   <button
                     className="topbar-avatar"
@@ -1404,7 +1660,7 @@ function App() {
                     aria-expanded={isAccountMenuOpen}
                     onClick={() => setIsAccountMenuOpen((value) => !value)}
                   >
-                    도
+                    {accountInitial}
                   </button>
                   {isAccountMenuOpen && (
                     <div className="account-menu">
@@ -1413,45 +1669,8 @@ function App() {
                     </div>
                   )}
                 </div>
-              ) : (
-                <div className="account-menu-wrap topbar-account-menu">
-                  <button
-                    className="topbar-icon-button"
-                    type="button"
-                    aria-label="계정 메뉴"
-                    aria-expanded={isAccountMenuOpen}
-                    onClick={() => setIsAccountMenuOpen((value) => !value)}
-                  >
-                    <svg className="person-icon" viewBox="0 0 24 24" aria-hidden="true">
-                      <circle cx="12" cy="8" r="4" />
-                      <path d="M4.5 20c1.6-4.2 4-6.3 7.5-6.3s5.9 2.1 7.5 6.3" />
-                    </svg>
-                  </button>
-                  {isAccountMenuOpen && (
-                    <div className="account-menu">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setAuthMode('login');
-                          setIsAccountMenuOpen(false);
-                        }}
-                      >
-                        로그인
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setAuthMode('signup');
-                          setIsAccountMenuOpen(false);
-                        }}
-                      >
-                        회원가입
-                      </button>
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
+              </div>
+            )}
           </header>
         )}
 
@@ -1490,6 +1709,301 @@ function App() {
               </article>
             </section>
           </>
+        ) : isAdminOpen ? (
+          <>
+            <section className="admin-console" aria-label="admin dashboard">
+              <aside className="admin-rail" aria-label="admin navigation">
+                <div>
+                  <p className="eyebrow">Admin</p>
+                  <h1>운영 관리</h1>
+                </div>
+                <nav>
+                  {adminNavItems.map((item) => (
+                    <button
+                      className={adminSection === item ? 'selected' : ''}
+                      type="button"
+                      key={item}
+                      onClick={() => setAdminSection(item)}
+                    >
+                      {item}
+                    </button>
+                  ))}
+                </nav>
+                <button className="admin-home-button" type="button" onClick={openProjectHome}>
+                  홈으로
+                </button>
+              </aside>
+
+              <div className="admin-main">
+                <header className="admin-topline">
+                  <div>
+                    <p className="eyebrow">Service overview</p>
+                    <h2>{adminSection === '개요' ? 'SynapVox 운영 상태' : `${adminSection} 관리`}</h2>
+                  </div>
+                  <div className="admin-top-actions">
+                    <span>마지막 동기화 방금</span>
+                    <button type="button">로그 내보내기</button>
+                  </div>
+                </header>
+
+                {adminSection === '개요' && (
+                  <>
+                    <div className="admin-metrics">
+                      {adminRows.map((row) => (
+                        <article key={row.label}>
+                          <span>{row.label}</span>
+                          <strong>{row.value}</strong>
+                          <small>{row.detail}</small>
+                        </article>
+                      ))}
+                    </div>
+
+                    <div className="admin-board">
+                      <article className="admin-panel admin-panel-large">
+                        <div className="admin-panel-header">
+                          <div>
+                            <p className="eyebrow">Pipeline</p>
+                            <h3>최근 작업</h3>
+                          </div>
+                          <span>{adminActiveProjectCount} 프로젝트 · {adminTotalSourceCount} 소스</span>
+                        </div>
+                        <div className="admin-table" role="table" aria-label="최근 작업">
+                          {adminPipelines.length > 0 ? (
+                            adminPipelines.map(([name, detail, status, meta]) => (
+                              <div className="admin-table-row" role="row" key={name}>
+                                <strong>{name}</strong>
+                                <span>{detail}</span>
+                                <small>{meta}</small>
+                                <mark>{status}</mark>
+                              </div>
+                            ))
+                          ) : (
+                            <div className="admin-empty">아직 작업 기록이 없습니다.</div>
+                          )}
+                        </div>
+                      </article>
+
+                      <article className="admin-panel">
+                        <div className="admin-panel-header">
+                          <div>
+                            <p className="eyebrow">Users</p>
+                            <h3>사용자 상태</h3>
+                          </div>
+                        </div>
+                        <div className="admin-user-row">
+                          <span className="admin-avatar">도</span>
+                          <div>
+                            <strong>도원</strong>
+                            <small>admin · 전체 관리</small>
+                          </div>
+                          <span className="admin-role">active</span>
+                        </div>
+                      </article>
+
+                      <article className="admin-panel">
+                        <div className="admin-panel-header">
+                          <div>
+                            <p className="eyebrow">Quality</p>
+                            <h3>품질 게이트</h3>
+                          </div>
+                        </div>
+                        <div className="admin-empty">품질 평가 기록이 없습니다.</div>
+                      </article>
+                    </div>
+                  </>
+                )}
+
+                {adminSection === '사용자' && (
+                  <section className="admin-section-grid">
+                    <article className="admin-panel admin-panel-large">
+                      <div className="admin-panel-header">
+                        <div>
+                          <p className="eyebrow">Users</p>
+                          <h3>사용자·권한 목록</h3>
+                        </div>
+                        <button className="admin-small-button" type="button">사용자 초대</button>
+                      </div>
+                      <div className="admin-table admin-user-table" role="table" aria-label="사용자 목록">
+                        {adminUsers.map(([name, role, scope, status]) => (
+                          <div className="admin-table-row" role="row" key={name}>
+                            <strong>{name}</strong>
+                            <span>{role}</span>
+                            <small>{scope}</small>
+                            <mark>{status}</mark>
+                          </div>
+                        ))}
+                      </div>
+                    </article>
+                    <article className="admin-panel">
+                      <div className="admin-panel-header">
+                        <div>
+                          <p className="eyebrow">Keys</p>
+                          <h3>API 키 정책</h3>
+                        </div>
+                      </div>
+                      <div className="admin-empty">등록된 API 키가 없습니다.</div>
+                    </article>
+                  </section>
+                )}
+
+                {adminSection === '작업 큐' && (
+                  <section className="admin-section-grid">
+                    <article className="admin-panel admin-panel-large">
+                      <div className="admin-panel-header">
+                        <div>
+                          <p className="eyebrow">Jobs</p>
+                          <h3>인제스트·전사 작업 큐</h3>
+                        </div>
+                        <button className="admin-small-button" type="button">실패 재시도</button>
+                      </div>
+                      <div className="admin-table" role="table" aria-label="작업 큐">
+                        {adminPipelines.length > 0 ? (
+                          adminPipelines.map(([name, detail, status, meta]) => (
+                            <div className="admin-table-row" role="row" key={name}>
+                              <strong>{name}</strong>
+                              <span>{detail}</span>
+                              <small>{meta}</small>
+                              <mark>{status}</mark>
+                            </div>
+                          ))
+                        ) : (
+                          <div className="admin-empty">대기 중인 작업이 없습니다.</div>
+                        )}
+                      </div>
+                    </article>
+                    <article className="admin-panel">
+                      <div className="admin-panel-header">
+                        <div>
+                          <p className="eyebrow">Rules</p>
+                          <h3>작업 규칙</h3>
+                        </div>
+                      </div>
+                      <div className="admin-empty">등록된 작업 규칙이 없습니다.</div>
+                    </article>
+                  </section>
+                )}
+
+                {adminSection === '비용' && (
+                  <section className="admin-section-grid">
+                    <article className="admin-panel admin-panel-large">
+                      <div className="admin-panel-header">
+                        <div>
+                          <p className="eyebrow">Budget</p>
+                          <h3>토큰·비용 예산</h3>
+                        </div>
+                        <button className="admin-small-button" type="button">알림 설정</button>
+                      </div>
+                      <div className="admin-table" role="table" aria-label="비용 예산">
+                        {adminBudgetRows.length > 0 ? (
+                          adminBudgetRows.map(([name, detail, status]) => (
+                            <div className="admin-table-row admin-table-row-compact" role="row" key={name}>
+                              <strong>{name}</strong>
+                              <span>{detail}</span>
+                              <mark>{status}</mark>
+                            </div>
+                          ))
+                        ) : (
+                          <div className="admin-empty">수집된 비용 데이터가 없습니다.</div>
+                        )}
+                      </div>
+                    </article>
+                    <article className="admin-panel">
+                      <div className="admin-panel-header">
+                        <div>
+                          <p className="eyebrow">Stages</p>
+                          <h3>단계별 비용</h3>
+                        </div>
+                      </div>
+                      {adminCostBreakdown.length > 0 ? (
+                        <div className="admin-cost-list">
+                          {adminCostBreakdown.map(([name, detail]) => (
+                            <div key={name}>
+                              <span>{name}</span>
+                              <small>{detail}</small>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="admin-empty">단계별 비용 기록이 없습니다.</div>
+                      )}
+                    </article>
+                  </section>
+                )}
+
+                {adminSection === '품질' && (
+                  <section className="admin-section-grid">
+                    <article className="admin-panel admin-panel-large">
+                      <div className="admin-panel-header">
+                        <div>
+                          <p className="eyebrow">Evaluation</p>
+                          <h3>품질 평가 기준</h3>
+                        </div>
+                        <button className="admin-small-button" type="button">평가 실행</button>
+                      </div>
+                      <div className="admin-table" role="table" aria-label="품질 평가">
+                        {adminQualityRows.length > 0 ? (
+                          adminQualityRows.map(([name, detail, status]) => (
+                            <div className="admin-table-row admin-table-row-compact" role="row" key={name}>
+                              <strong>{name}</strong>
+                              <span>{detail}</span>
+                              <mark>{status}</mark>
+                            </div>
+                          ))
+                        ) : (
+                          <div className="admin-empty">품질 평가 기록이 없습니다.</div>
+                        )}
+                      </div>
+                    </article>
+                    <article className="admin-panel">
+                      <div className="admin-panel-header">
+                        <div>
+                          <p className="eyebrow">Gate</p>
+                          <h3>승인 기준</h3>
+                        </div>
+                      </div>
+                      <div className="admin-empty">승인 기준 데이터가 없습니다.</div>
+                    </article>
+                  </section>
+                )}
+
+                {adminSection === '시스템' && (
+                  <section className="admin-section-grid">
+                    <article className="admin-panel admin-panel-large">
+                      <div className="admin-panel-header">
+                        <div>
+                          <p className="eyebrow">Health</p>
+                          <h3>서비스 헬스체크</h3>
+                        </div>
+                        <button className="admin-small-button" type="button">새로고침</button>
+                      </div>
+                      <div className="admin-table" role="table" aria-label="서비스 헬스체크">
+                        {adminSystemRows.length > 0 ? (
+                          adminSystemRows.map(([name, detail, status]) => (
+                            <div className="admin-table-row admin-table-row-compact" role="row" key={name}>
+                              <strong>{name}</strong>
+                              <span>{detail}</span>
+                              <mark>{status}</mark>
+                            </div>
+                          ))
+                        ) : (
+                          <div className="admin-empty">헬스체크 데이터가 없습니다.</div>
+                        )}
+                      </div>
+                    </article>
+                    <article className="admin-panel">
+                      <div className="admin-panel-header">
+                        <div>
+                          <p className="eyebrow">Incident</p>
+                          <h3>알림 규칙</h3>
+                        </div>
+                      </div>
+                      <div className="admin-empty">등록된 알림 규칙이 없습니다.</div>
+                    </article>
+                  </section>
+                )}
+              </div>
+            </section>
+          </>
         ) : isProfileOpen ? (
           <>
             <header className="workspace-header home-header">
@@ -1505,10 +2019,10 @@ function App() {
             <section className="profile-grid">
               <article className="profile-card profile-hero">
                 <div className="profile-identity">
-                  <span className="profile-avatar-large">도</span>
+                  <span className="profile-avatar-large">{accountInitial}</span>
                   <div>
-                    <h2>도원</h2>
-                    <p>로컬 작업 공간 계정</p>
+                    <h2>{accountName}</h2>
+                    <p>{accountEmail}</p>
                   </div>
                 </div>
                 <button className="ghost-button" type="button" onClick={logout}>로그아웃</button>
@@ -1541,10 +2055,58 @@ function App() {
               <article className="profile-card">
                 <p className="eyebrow">Storage</p>
                 <h2>저장 상태</h2>
-                <p>현재 화면의 프로젝트와 소스는 프론트 상태에 보관됩니다. 백엔드 저장소가 연결되면 계정별로 분리됩니다.</p>
+                <p>계정은 백엔드 인증 API를 거쳐 Supabase Postgres에 저장됩니다. 프로젝트와 소스 영속화는 다음 단계에서 계정별로 분리됩니다.</p>
               </article>
             </section>
           </>
+        ) : !isLoggedIn ? (
+          <section className="signed-out-home" aria-label="login required">
+            <div className="signed-out-copy">
+              <p className="eyebrow">Lecture knowledge pipeline</p>
+              <h1>강의 지식을 한 흐름으로 정리하세요.</h1>
+              <p>
+                강의 녹음, 수업 자료, 필기를 프로젝트로 묶고 전사문과 지식 그래프로 이어서 복습합니다.
+              </p>
+              <div className="signed-out-actions">
+                <button className="auth-submit" type="button" onClick={() => setAuthMode('login')}>
+                  로그인
+                </button>
+                <button className="ghost-button" type="button" onClick={() => setAuthMode('signup')}>
+                  회원가입
+                </button>
+              </div>
+            </div>
+
+            <div className="signed-out-preview" aria-hidden="true">
+              <div className="preview-column preview-sources">
+                <span>Sources</span>
+                <strong>오늘 강의 녹음</strong>
+                <strong>강의 슬라이드</strong>
+                <strong>수업 필기</strong>
+              </div>
+              <div className="preview-graph">
+                <svg className="preview-graph-svg" viewBox="0 0 300 420" role="img" aria-label="강의 지식 그래프 예시">
+                  <line className="preview-link one" x1="92" y1="126" x2="150" y2="214" pathLength={1} />
+                  <line className="preview-link two" x1="224" y1="114" x2="150" y2="214" pathLength={1} />
+                  <line className="preview-link three" x1="190" y1="330" x2="150" y2="214" pathLength={1} />
+                  <line className="preview-link four" x1="86" y1="300" x2="150" y2="214" pathLength={1} />
+                  <circle className="preview-node main" cx="150" cy="214" r="38" />
+                  <circle className="preview-node one" cx="92" cy="126" r="20" />
+                  <circle className="preview-node two" cx="224" cy="114" r="20" />
+                  <circle className="preview-node three" cx="190" cy="330" r="20" />
+                  <circle className="preview-node four" cx="86" cy="300" r="16" />
+                </svg>
+              </div>
+              <div className="preview-column preview-chat">
+                <span>AI</span>
+                <p className="preview-question">“오늘 강의에서 시험에 나올 만한 부분만 정리해줘.”</p>
+                <div className="preview-answer">
+                  교수님이 강조한 개념과 슬라이드 근거를 묶어 핵심 흐름만 정리했어요.
+                </div>
+                <strong>근거 4개 연결</strong>
+              </div>
+            </div>
+          </section>
         ) : activeProject === null ? (
           <>
             <section className="home-controls" aria-label="notebook controls">
@@ -1980,7 +2542,7 @@ function App() {
 
                   <g className="graph-stage" transform={`translate(${graphViewport.x} ${graphViewport.y}) scale(${graphViewport.scale})`}>
                     <g className="graph-edge-layer">
-                      {visibleGraphLinks.map((link) => {
+                      {visibleGraphLinks.map((link, index) => {
                         const from = getGraphNode(link.from);
                         const to = getGraphNode(link.to);
                         if (from === undefined || to === undefined) return null;
@@ -2003,14 +2565,16 @@ function App() {
                             y1={from.y}
                             x2={to.x}
                             y2={to.y}
+                            pathLength={1}
                             markerEnd={marker}
+                            style={{ '--graph-delay': `${Math.min(index * 22 + 180, 900)}ms` } as CSSProperties}
                           />
                         );
                       })}
                     </g>
 
                     <g className="graph-node-layer">
-                      {graphNodes.filter((node) => visibleGraphNodeIds.has(node.id)).map((node) => {
+                      {graphNodes.filter((node) => visibleGraphNodeIds.has(node.id)).map((node, index) => {
                         const isFocused = true;
 
                         return (
@@ -2018,6 +2582,7 @@ function App() {
                             className={`graph-svg-node graph-svg-node-${node.type} ${selectedGraphNodeId === node.id ? 'selected' : ''} ${isFocused ? 'focused' : 'dimmed'}`}
                             key={node.id}
                             transform={`translate(${node.x} ${node.y})`}
+                            style={{ '--graph-delay': `${Math.min(index * 28, 700)}ms` } as CSSProperties}
                             onClick={() => {
                               setSelectedGraphNodeId(node.id);
                               setGraphFocusNodeIds([node.id]);
@@ -2134,11 +2699,11 @@ function App() {
               )}
 
               <label>
-                이메일
+                {authMode === 'login' ? '이메일 또는 관리자 코드' : '이메일'}
                 <input
-                  type="email"
+                  type={authMode === 'login' ? 'text' : 'email'}
                   placeholder="you@synapvox.com"
-                  autoComplete="email"
+                  autoComplete={authMode === 'login' ? 'username' : 'email'}
                   required
                   value={authEmail}
                   onChange={(event) => setAuthEmail(event.target.value)}
@@ -2149,12 +2714,12 @@ function App() {
                 비밀번호
                 <input
                   type="password"
+                  value={authPassword}
+                  onChange={(event) => setAuthPassword(event.target.value)}
                   placeholder="비밀번호"
                   autoComplete={authMode === 'login' ? 'current-password' : 'new-password'}
                   required
                   minLength={6}
-                  value={authPassword}
-                  onChange={(event) => setAuthPassword(event.target.value)}
                 />
               </label>
 
@@ -2168,6 +2733,9 @@ function App() {
                 className="auth-switch"
                 type="button"
                 onClick={() => {
+                  setAuthEmail('');
+                  setAuthPassword('');
+                  setAuthName('');
                   setAuthError(null);
                   setAuthMode(authMode === 'login' ? 'signup' : 'login');
                 }}
@@ -2411,7 +2979,7 @@ function App() {
                 {recordingState === 'ready' && transcriptionState !== 'idle' && (
                   <div className="transcription-panel">
                     <div className="transcription-steps">
-                      {['준비', '분석', '전사', '완료'].map((step, index) => {
+                      {['준비', '전사', '완료'].map((step, index) => {
                         const stepNumber = index + 1;
                         return (
                           <div

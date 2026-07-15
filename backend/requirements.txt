@@ -1,4 +1,5 @@
 fastapi
+pydantic[email]
 python-multipart
 uvicorn[standard]
 python-dotenv
@@ -8,4 +9,5 @@ pypdf
 pdfplumber
 pymupdf
 python-pptx
+psycopg2-binary>=2.9
 pyjwt[crypto]
