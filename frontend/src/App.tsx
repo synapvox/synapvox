@@ -5,7 +5,7 @@ import GraphModule from './graphmodule/GraphModule';
 import type { Session } from '@supabase/supabase-js';
 
 type Project = {
-  id: string;              // gsvx 하위 네임스페이스 키 (X-Project-Id 헤더로 전달, ASCII 슬러그)
+  id: string;              // 그래프/벡터 저장소의 프로젝트 네임스페이스 키
   name: string;
   description: string;
   updatedAt: string;
@@ -95,7 +95,7 @@ const authUserFromSession = (session: Session | null): AuthUser | null => {
   };
 };
 
-// 프로젝트 목록을 localStorage에 영속화 — 새로고침해도 프로젝트 id↔그래프(gsvx 네임스페이스) 매핑이 유지된다.
+// 프로젝트 목록을 localStorage에 영속화 — 새로고침해도 프로젝트 id↔그래프 매핑이 유지된다.
 const loadStoredProjects = (userId: string | null): Project[] => {
   try {
     const raw = window.localStorage.getItem(scopedStorageKey(PROJECTS_STORAGE_KEY, userId));
@@ -145,13 +145,6 @@ const projectSortOptions = ['최근 수정순', '이름순', '녹음 많은 순'
 const initialSourceItems: SourceItem[] = [];
 const sourceTabs = ['녹음본', '자료'] as const;
 const sourceSortOptions = ['최신순', '오래된순', '글자순', '종류순'] as const;
-
-// gsvx(Graphiti) 백엔드 — 그래프 엔진 본체(click6067-ship-it/synapVOX).
-// 이 프론트는 D0won/synapvox의 /api(포트 8000, STT)만 프록시하므로, gsvx는 절대경로+
-// X-API-Key로 별도 호출한다(gsvx CORSMiddleware가 이 오리진을 허용하도록 열려 있어야 함).
-// 배포 시 VITE_API_BASE(예: https://synapvox-graphiti.onrender.com)·VITE_API_KEY를 빌드 환경변수로 주입.
-const GSVX_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:8020';
-const GSVX_API_KEY = import.meta.env.VITE_API_KEY ?? 'demo-bio';
 
 const formatTranscriptTime = (value = 0) => {
   const seconds = Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
@@ -290,6 +283,7 @@ function App() {
       text: '프로젝트의 녹음본과 자료를 바탕으로 질문에 답변합니다. 궁금한 내용을 입력하면 가운데 그래프에서 관련 노드를 함께 표시할게요.',
     },
   ]);
+  const [graphReloadKey, setGraphReloadKey] = useState(0);
   const [isDetailAudioPlaying, setIsDetailAudioPlaying] = useState(false);
   const [detailAudioTimeLabel, setDetailAudioTimeLabel] = useState('00:00');
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -315,11 +309,14 @@ function App() {
   const recordingMaterialCount = recordingMaterialFiles.length;
   const totalTranscriptionMaterialCount = projectMaterialCount + recordingMaterialCount;
 
-  // gsvx 호출 공통 헤더 — 프로젝트가 열려 있으면 X-Project-Id로 하위 네임스페이스를 지정한다.
-  const gsvxHeaders = (projectId: string | null): Record<string, string> => ({
-    'X-API-Key': GSVX_API_KEY,
-    ...(projectId !== null ? { 'X-Project-Id': projectId } : {}),
-  });
+  const apiHeaders = async (projectId: string | null, meetingId?: string): Promise<Record<string, string>> => {
+    const token = (await supabase?.auth.getSession())?.data.session?.access_token;
+    return {
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(projectId !== null ? { 'X-Project-Id': projectId } : {}),
+      ...(meetingId ? { 'X-Meeting-Id': meetingId } : {}),
+    };
+  };
   const visibleSourceItems = sourceItems
     .filter((source) => source.category === sourceTab)
     .sort((a, b) => {
@@ -515,7 +512,7 @@ function App() {
   };
 
 
-  // 프로젝트 목록 영속화 — id↔gsvx 네임스페이스 매핑이 새로고침 후에도 유지되게.
+  // 프로젝트 목록 영속화 — id↔그래프 네임스페이스 매핑이 새로고침 후에도 유지되게.
   useEffect(() => {
     if (storageUserId === null) return;
     try {
@@ -1030,10 +1027,15 @@ function App() {
     }));
   };
 
-  // gsvx /ingest-doc이 지원하는 문서 형식 — 이 외(이미지 등)는 카드만 추가하고 그래프 반영은 건너뜀
+  // 내부 그래프 API가 지원하는 문서 형식 — 이 외 형식은 소스 카드만 추가한다.
   const isGraphIngestibleDocument = (file: File) => /\.(pdf|pptx|docx|md|txt)$/i.test(file.name);
 
-  const uploadMaterialToGsvx = async (file: File, itemId: string, projectId: string | null) => {
+  const uploadMaterialToGraph = async (
+    file: File,
+    itemId: string,
+    projectId: string | null,
+    meetingId?: string,
+  ) => {
     const markMeta = (suffix: string) => setSourceItems((items) => items.map((source) => (
       source.id === itemId ? { ...source, meta: `자료 · ${formatFileSize(file.size)} · ${suffix}` } : source
     )));
@@ -1043,7 +1045,7 @@ function App() {
       form.append('file', file, file.name);
       const response = await fetch('/api/ingest-doc', {
         method: 'POST',
-        headers: gsvxHeaders(projectId),
+        headers: await apiHeaders(projectId, meetingId),
         body: form,
       });
       if (!response.ok) {
@@ -1052,10 +1054,13 @@ function App() {
       }
       const result = await response.json() as { chunks_ingested: number; concepts_total: number };
       markMeta(`그래프 반영 완료 (청크 ${result.chunks_ingested}개)`);
+      setGraphReloadKey((value) => value + 1);
+      return true;
     } catch (error) {
-      console.error('gsvx 문서 그래프 반영 실패:', error);
+      console.error('문서 그래프 반영 실패:', error);
       const message = error instanceof Error ? error.message : '';
       markMeta(message.includes('이미 등록된') ? '중복 — 이미 등록된 문서라 건너뜀' : '그래프 반영 실패');
+      return false;
     }
   };
 
@@ -1085,9 +1090,9 @@ function App() {
       )));
     }
 
-    // 문서 형식이면 gsvx로 업로드해 청킹→에피소드→그래프 노드까지 반영(카드 meta로 진행상태 표시)
+    // 문서 형식이면 내부 API로 업로드해 청킹→Neo4j 적재까지 반영한다.
     fileList.forEach((file, index) => {
-      if (isGraphIngestibleDocument(file)) void uploadMaterialToGsvx(file, nextMaterials[index].id, activeProjectId);
+      if (isGraphIngestibleDocument(file)) void uploadMaterialToGraph(file, nextMaterials[index].id, activeProjectId);
     });
 
     return nextMaterials.length;
@@ -1263,14 +1268,17 @@ function App() {
     recordingMaterialFiles.forEach((file) => {
       body.append('materials', file, file.name);
     });
-    body.append('project_id', activeProject?.name ?? 'local-project');
-    body.append('meeting_id', `meeting-${Date.now()}`);
+    const graphProjectId = activeProjectId ?? 'local-project';
+    const meetingId = `meeting-${Date.now()}`;
+    body.append('project_id', graphProjectId);
+    body.append('meeting_id', meetingId);
 
     try {
       await new Promise((resolve) => window.setTimeout(resolve, 250));
       setTranscriptionStep(2);
       const response = await fetch('/api/stt/transcribe', {
         method: 'POST',
+        headers: await apiHeaders(activeProjectId),
         body,
       });
 
@@ -1282,21 +1290,29 @@ function App() {
       const result = await response.json() as IntermediateTranscript;
       const transcriptSegments = mapIntermediateTranscript(result);
 
-      // STT 결과(중간 포맷 JSON)를 gsvx(Graphiti)로 이어서 그래프에 반영한다.
-      // 실패해도 전사 자체는 이미 성공했으니 화면 전체를 막지 않고 그래프만 조용히 스킵.
-      const gsvxProjectId = activeProjectId;
-      void (async () => {
-        try {
-          const ingestResponse = await fetch('/api/ingest-stt', {
-            method: 'POST',
-            headers: { ...gsvxHeaders(gsvxProjectId), 'Content-Type': 'application/json' },
-            body: JSON.stringify(result),
-          });
-          if (!ingestResponse.ok) throw new Error(`전사 그래프 반영 요청 실패 (${ingestResponse.status})`);
-        } catch (error) {
-          console.error('gsvx로 STT 결과를 넘기지 못했습니다:', error);
+      // 전사문과 이 녹음에만 붙인 참고 자료를 같은 meeting_id로 Neo4j에 묶는다.
+      try {
+        const ingestResponse = await fetch('/api/ingest-stt', {
+          method: 'POST',
+          headers: {
+            ...(await apiHeaders(activeProjectId)),
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(result),
+        });
+        if (!ingestResponse.ok) {
+          const errorBody = await ingestResponse.json().catch(() => null) as { detail?: string } | null;
+          throw new Error(errorBody?.detail ?? `전사 그래프 반영 요청 실패 (${ingestResponse.status})`);
         }
-      })();
+        await Promise.all(recordingMaterialFiles.map((file, index) => (
+          isGraphIngestibleDocument(file)
+            ? uploadMaterialToGraph(file, recordingAttachedMaterials[index]?.id ?? '', activeProjectId, meetingId)
+            : Promise.resolve(false)
+        )));
+        setGraphReloadKey((value) => value + 1);
+      } catch (error) {
+        console.error('전사 결과를 그래프에 반영하지 못했습니다:', error);
+      }
       const savedTranscriptSegments = transcriptSegments;
       const now = new Date();
       const timeLabel = now.toLocaleTimeString('ko-KR', {
@@ -1391,17 +1407,17 @@ function App() {
     void (async () => {
       let assistantText: string;
       try {
-        const response = await fetch(`${GSVX_BASE}/ask?q=${encodeURIComponent(query)}&k=6`, {
-          headers: gsvxHeaders(activeProjectId),
+        const response = await fetch(`/api/ask?project=${encodeURIComponent(activeProjectId ?? '')}&q=${encodeURIComponent(query)}&k=6`, {
+          headers: await apiHeaders(activeProjectId),
         });
-        if (!response.ok) throw new Error(`gsvx /ask ${response.status}`);
+        if (!response.ok) throw new Error(`/api/ask ${response.status}`);
         const data = await response.json() as {
           answer: string; hits?: { session_id: string }[];
           expansion?: { nodes?: { id: string }[] };
         };
         assistantText = data.answer;
       } catch (error) {
-        console.error('gsvx AI 답변을 받아오지 못했습니다:', error);
+        console.error('AI 답변을 받아오지 못했습니다:', error);
         const hasRecordings = sourceItems.some((source) => source.category === '녹음본');
         const hasMaterials = sourceItems.some((source) => source.category === '자료');
         assistantText = hasRecordings || hasMaterials
@@ -2379,7 +2395,7 @@ function App() {
               </aside>
 
               <section className="studio-graph">
-                <GraphModule project={activeProjectId} projectName={activeProject.name} />
+                <GraphModule project={activeProjectId} projectName={activeProject.name} reloadKey={graphReloadKey} />
               </section>
 
               <aside className="studio-chat">

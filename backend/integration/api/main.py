@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
@@ -299,18 +299,68 @@ async def transcribe_recording(
             material_path.unlink(missing_ok=True)
 
 
-# ── gsvx(Graphiti) 릴레이 — STT 결과·자료를 그래프 엔진으로 ──
-#
-# 프론트(App.tsx)는 POST /api/ingest-stt(중간포맷 JSON)·/api/ingest-doc(multipart)를
-# 호출한다. gsvx 본체(click6067-ship-it/synapVOX)에는 이 두 엔드포인트가 없고 텍스트
-# 입구는 /ingest-text 하나뿐이므로, 여기서 같은 계약으로 받아 텍스트로 변환해 릴레이한다.
-# 변환·분할·응답 요약 규칙은 backend/integration/gsvx_connector.py 참조.
+# ── 프로젝트 지식 그래프 — 문서/전사 → Neo4j → 조회/RAG ──
+
+_neo4j_driver = None
+_graph_store_instance = None
+_vector_store_instance = None
 
 
-def _gsvx_client(x_api_key: str | None):
-    from backend.integration import gsvx_connector
-    # 프론트가 보낸 X-API-Key가 있으면 그대로 gsvx에 전달, 없으면 서버 환경변수 사용.
-    return gsvx_connector.GsvxClient(api_key=x_api_key or None)
+def _graph_runtime():
+    global _neo4j_driver, _graph_store_instance
+    try:
+        from neo4j import GraphDatabase
+        from backend.graphrag import GraphStore
+        if _neo4j_driver is None:
+            _neo4j_driver = GraphDatabase.driver(
+                os.environ["NEO4J_URI"],
+                auth=(os.getenv("NEO4J_USERNAME") or os.getenv("NEO4J_USER") or "neo4j",
+                      os.environ["NEO4J_PASSWORD"]),
+            )
+            _neo4j_driver.verify_connectivity()
+        database = os.getenv("NEO4J_DATABASE") or "neo4j"
+        if _graph_store_instance is None:
+            _graph_store_instance = GraphStore(_neo4j_driver, database=database)
+        return _neo4j_driver, _graph_store_instance, database
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"graph database is not configured: {exc}") from exc
+
+
+def _vector_store():
+    global _vector_store_instance
+    if _vector_store_instance is None:
+        from backend.graphrag import VectorStore
+        _vector_store_instance = VectorStore()
+    return _vector_store_instance
+
+
+def _optional_vector_store():
+    try:
+        return _vector_store()
+    except Exception:
+        return None
+
+
+def _answer_from_hits(question: str, hits: list[dict]) -> str:
+    if not hits:
+        return "아직 이 프로젝트에서 질문과 관련된 자료나 전사문을 찾지 못했습니다."
+    context = "\n\n".join(
+        f"[{hit.get('meeting_title') or hit.get('meeting_id') or '근거'}]\n{hit.get('text', '')}"
+        for hit in hits
+    )[:12000]
+    if os.getenv("OPENAI_API_KEY"):
+        try:
+            from openai import OpenAI
+            response = OpenAI().responses.create(
+                model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
+                instructions="제공된 강의 자료와 전사문만 근거로 한국어로 간결하게 답하세요. 근거가 부족하면 부족하다고 말하세요.",
+                input=f"질문: {question}\n\n근거:\n{context}",
+            )
+            if response.output_text:
+                return response.output_text.strip()
+        except Exception:
+            pass
+    return f"관련 자료에서 다음 내용을 확인했습니다.\n\n{hits[0].get('text', '')[:700]}"
 
 
 @app.post("/ingest-stt", include_in_schema=False)
@@ -318,21 +368,31 @@ def _gsvx_client(x_api_key: str | None):
 async def ingest_stt_to_graph(
     transcript: dict,
     x_project_id: str | None = Header(None, alias="X-Project-Id"),
-    x_api_key: str | None = Header(None, alias="X-API-Key"),
+    user: dict = Depends(require_user),
 ) -> dict:
-    """STT 중간포맷 JSON → gsvx 그래프 반영 (프론트 App.tsx POST /ingest-stt 계약)."""
-    from backend.integration.gsvx_connector import GsvxError
-
+    """STT 중간포맷 JSON을 현재 프로젝트의 Neo4j 그래프에 적재한다."""
     try:
         validate(transcript)
     except (KeyError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=f"invalid intermediate format: {exc}") from exc
-
-    client = _gsvx_client(x_api_key)
+    project_id = x_project_id or transcript.get("project_id")
+    if not project_id:
+        raise HTTPException(status_code=400, detail="X-Project-Id or transcript.project_id is required")
     try:
-        return await run_in_threadpool(client.ingest_transcript, transcript, x_project_id)
-    except GsvxError as exc:
-        raise HTTPException(status_code=exc.status_code or 502, detail=exc.detail) from exc
+        from backend.integration.pipeline import ingest_intermediate
+        driver, graph_store, database = _graph_runtime()
+        result = await run_in_threadpool(
+            ingest_intermediate, transcript, graph_store, _optional_vector_store(), project_id)
+        from backend.graphrag import graph_data
+        graph = await run_in_threadpool(graph_data, driver, project_id, database)
+        return {
+            "project": result["project_id"], "meeting": result["meeting_id"],
+            "chunks_ingested": len(result["chunks"]), "concepts_new": len(result["topic_ids"]),
+            "concepts_total": sum(node["type"] == "concept" for node in graph["nodes"]),
+            "relations_new": result["relations"],
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"graph ingest failed: {exc}") from exc
 
 
 @app.post("/ingest-doc", include_in_schema=False)
@@ -341,15 +401,11 @@ async def ingest_doc_to_graph(
     file: UploadFile = File(...),
     x_project_id: str | None = Header(None, alias="X-Project-Id"),
     x_meeting_id: str | None = Header(None, alias="X-Meeting-Id"),
-    x_api_key: str | None = Header(None, alias="X-API-Key"),
+    user: dict = Depends(require_user),
 ) -> dict:
-    """회의자료 파일 → 텍스트 추출 → gsvx 그래프 반영 (프론트 POST /ingest-doc 계약).
-
-    X-Meeting-Id를 보내면 특정 회의(음성 파일)에 딸린 자료로 스코프된다(세션 제목에 붙음,
-    gsvx_connector.document_title 참조) — 미지정 시 기존과 동일하게 프로젝트 전역 자료로 취급.
-    응답은 프론트가 기대하는 {chunks_ingested, concepts_total, ...} 형태.
-    """
-    from backend.integration.gsvx_connector import GsvxError
+    """자료 텍스트를 현재 프로젝트에 적재한다. X-Meeting-Id가 있으면 해당 녹음본에 연결한다."""
+    if not x_project_id:
+        raise HTTPException(status_code=400, detail="X-Project-Id is required")
 
     suffix = Path(file.filename or "").suffix or ".bin"
     temp_path = None
@@ -368,13 +424,80 @@ async def ingest_doc_to_graph(
                 detail="텍스트를 추출하지 못했습니다 (지원: pdf/pptx/docx/md/txt).",
             )
 
-        client = _gsvx_client(x_api_key)
         title = Path(file.filename or "자료").stem or "자료"
         try:
-            return await run_in_threadpool(
-                client.ingest_document_text, text, title, x_project_id, x_meeting_id)
-        except GsvxError as exc:
-            raise HTTPException(status_code=exc.status_code or 502, detail=exc.detail) from exc
+            from backend.integration.pipeline import ingest_document_text
+            driver, graph_store, database = _graph_runtime()
+            result = await run_in_threadpool(
+                ingest_document_text, text, title, x_project_id, graph_store,
+                _optional_vector_store(), x_meeting_id)
+            from backend.graphrag import graph_data
+            graph = await run_in_threadpool(graph_data, driver, x_project_id, database)
+            return {
+                "project": result["project_id"], "meeting": result["meeting_id"], "title": title,
+                "chunks_ingested": len(result["chunks"]), "concepts_new": len(result["topic_ids"]),
+                "concepts_total": sum(node["type"] == "concept" for node in graph["nodes"]),
+                "relations_new": result["relations"],
+            }
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"graph ingest failed: {exc}") from exc
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
+
+
+@app.get("/api/graph")
+async def get_project_graph(
+    project: str = Query(..., min_length=1),
+    user: dict = Depends(require_user),
+) -> dict:
+    from backend.graphrag import graph_data
+    driver, _, database = _graph_runtime()
+    return await run_in_threadpool(graph_data, driver, project, database)
+
+
+@app.get("/api/ask")
+async def ask_project_graph(
+    project: str = Query(..., min_length=1),
+    q: str = Query(..., min_length=1),
+    k: int = Query(6, ge=1, le=12),
+    user: dict = Depends(require_user),
+) -> dict:
+    from backend.graphrag import HybridSearch, expansion_for_chunks
+    driver, _, database = _graph_runtime()
+    vector_store = _optional_vector_store()
+    if vector_store is None:
+        raise HTTPException(status_code=503, detail="vector search is not configured")
+    hits = await run_in_threadpool(HybridSearch(driver, vector_store, database).search, project, q, k)
+    expansion = await run_in_threadpool(
+        expansion_for_chunks, driver, project, [hit["chunk_id"] for hit in hits], database)
+    return {"answer": await run_in_threadpool(_answer_from_hits, q, hits),
+            "hits": hits, "expansion": expansion}
+
+
+@app.get("/api/concept/{concept_id}")
+async def get_concept_detail(
+    concept_id: str,
+    project: str = Query(..., min_length=1),
+    user: dict = Depends(require_user),
+) -> dict:
+    from backend.graphrag import concept_detail
+    driver, _, database = _graph_runtime()
+    result = await run_in_threadpool(concept_detail, driver, project, concept_id, database)
+    if result is None:
+        raise HTTPException(status_code=404, detail="concept not found")
+    return result
+
+
+@app.get("/api/session/{meeting_id}")
+async def get_session_detail(
+    meeting_id: str,
+    project: str = Query(..., min_length=1),
+    user: dict = Depends(require_user),
+) -> dict:
+    from backend.graphrag import session_detail
+    driver, _, database = _graph_runtime()
+    result = await run_in_threadpool(session_detail, driver, project, meeting_id, database)
+    if result is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    return result

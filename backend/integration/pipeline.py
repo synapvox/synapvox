@@ -28,10 +28,12 @@ graph_store 없이 호출하면 dry-run — 청크만 만들어 반환한다 (�
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import sys
 import zipfile
 from datetime import date
+from itertools import combinations
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -39,6 +41,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from backend.stt.stt_normalizer import validate  # noqa: E402  (중간포맷 검증 — 스키마 소유자 stt)
+from backend.stt.keyword_prompt import extract_keywords  # noqa: E402
 
 TEXT_SUFFIXES = {".txt", ".md", ".csv", ".srt", ".vtt"}
 
@@ -186,6 +189,94 @@ def chunk_document(text: str, doc_id: str, max_chars: int = 800) -> list[dict]:
         size += len(para)
     flush()
     return chunks
+
+
+def _topic_id(project_id: str, name: str) -> str:
+    digest = hashlib.sha1(f"{project_id}\x1f{name.strip().lower()}".encode("utf-8")).hexdigest()[:16]
+    return f"topic-{digest}"
+
+
+def extract_chunk_topics(project_id: str, chunk: dict, top_n: int = 7) -> dict:
+    """기존 키워드 추출기를 llm_extraction 계약의 Topic 형태로 변환한다."""
+    topics = [
+        {"topic_id": _topic_id(project_id, name), "name": name, "aliases": []}
+        for name in extract_keywords(chunk.get("text", ""), top_n=top_n)
+    ]
+    return {"chunk_id": chunk["chunk_id"], "topics": topics, "decisions": [], "action_items": []}
+
+
+def ingest_intermediate(
+    intermediate: dict,
+    graph_store,
+    vector_store=None,
+    project_id: str | None = None,
+    max_chars: int = 800,
+) -> dict:
+    """인메모리 STT 중간포맷을 기존 GraphStore/VectorStore 계약으로 적재한다."""
+    validate(intermediate)
+    data = {**intermediate, "project_id": project_id or intermediate["project_id"]}
+    data["source_type"] = "transcript"
+    pid, mid = data["project_id"], data["meeting_id"]
+    data.setdefault("title", data.get("source") or mid)
+    chunks = chunk_transcript(data, max_chars=max_chars)
+    graph_store.load_intermediate(data)
+    graph_store.load_chunks(pid, mid, chunks)
+    if vector_store is not None:
+        vector_store.add_chunks(pid, mid, chunks)
+    topic_ids: set[str] = set()
+    relation_count = 0
+    for chunk in chunks:
+        extraction = extract_chunk_topics(pid, chunk)
+        graph_store.load_extraction(pid, mid, extraction)
+        ids = [topic["topic_id"] for topic in extraction["topics"]]
+        topic_ids.update(ids)
+        for left, right in combinations(ids, 2):
+            graph_store.relate_topics(pid, left, right)
+            relation_count += 1
+    return {"project_id": pid, "meeting_id": mid, "chunks": chunks,
+            "topic_ids": sorted(topic_ids), "relations": relation_count, "loaded": True}
+
+
+def ingest_document_text(
+    text: str,
+    title: str,
+    project_id: str,
+    graph_store,
+    vector_store=None,
+    meeting_id: str | None = None,
+    max_chars: int = 800,
+) -> dict:
+    """이미 추출된 프로젝트 자료를 기존 적재 파이프라인으로 저장한다."""
+    doc_digest = hashlib.sha1(f"{project_id}\x1f{title}".encode("utf-8")).hexdigest()[:16]
+    mid = meeting_id or f"document-{doc_digest}"
+    intermediate = {
+        "source": title,
+        "project_id": project_id,
+        "meeting_id": mid,
+        "date": date.today().isoformat(),
+        "mode": "lecture",
+        "title": title,
+        "source_type": "document",
+        "preserve_existing": meeting_id is not None,
+        "segments": [],
+    }
+    graph_store.load_intermediate(intermediate)
+    chunks = chunk_document(text, f"doc-{doc_digest}", max_chars=max_chars)
+    graph_store.load_chunks(project_id, mid, chunks)
+    if vector_store is not None:
+        vector_store.add_chunks(project_id, mid, chunks)
+    topic_ids: set[str] = set()
+    relation_count = 0
+    for chunk in chunks:
+        extraction = extract_chunk_topics(project_id, chunk)
+        graph_store.load_extraction(project_id, mid, extraction)
+        ids = [topic["topic_id"] for topic in extraction["topics"]]
+        topic_ids.update(ids)
+        for left, right in combinations(ids, 2):
+            graph_store.relate_topics(project_id, left, right)
+            relation_count += 1
+    return {"project_id": project_id, "meeting_id": mid, "chunks": chunks,
+            "topic_ids": sorted(topic_ids), "relations": relation_count, "loaded": True}
 
 
 # ── 3) 중간 매개 함수: 입력 파일 → graphrag 적재 ────────

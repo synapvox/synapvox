@@ -10,12 +10,6 @@ export default defineConfig(({ mode }) => {
       proxy: {
         // STT 통합 API(backend/integration/api/main.py). 배포에선 프록시 대신 리버스프록시/같은 도메인 사용.
         '/api': env.VITE_STT_PROXY_TARGET ?? 'http://127.0.0.1:8000',
-        // Graphiti/gsvx API. 로컬 개발에서는 브라우저 CORS를 피하려고 Vite가 대신 전달한다.
-        '/gsvx': {
-          target: env.VITE_GSVX_PROXY_TARGET ?? 'https://synapvox-graphiti.onrender.com',
-          changeOrigin: true,
-          rewrite: (path) => path.replace(/^\/gsvx/, ''),
-        },
       },
     },
   }

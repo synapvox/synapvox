@@ -16,7 +16,7 @@ import { DetailDrawer } from './detail/DetailDrawer'
 import { useDetail } from './detail/useDetail'
 import './graphmodule.css'
 
-export default function GraphModule({ project, projectName }: { project: string | null; projectName: string }) {
+export default function GraphModule({ project, projectName, reloadKey = 0 }: { project: string | null; projectName: string; reloadKey?: number }) {
   const [meta, setMeta] = useState({ nodes: 0, edges: 0, settled: false })
   const [askExpansion, setAskExpansion] = useState<Set<string> | null>(null)
   const [panel, setPanel] = useState<'detail' | 'answer' | null>(null)
@@ -81,6 +81,7 @@ export default function GraphModule({ project, projectName }: { project: string 
           <GraphView
             project={base}
             projectName={projectName}
+            reloadKey={reloadKey}
             onGraphMeta={onMeta}
             onSelectNode={onSelectNode}
             askExpansionIds={askExpansion}
