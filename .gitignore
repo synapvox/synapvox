@@ -350,3 +350,5 @@ $RECYCLE.BIN/
 # 샘플 회의 녹음/자료 (개인정보·용량 이슈로 커밋하지 않음)
 /data/*
 !/data/README.md
+*.pptx
+/tmp/
