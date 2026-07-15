@@ -192,7 +192,7 @@ def test_ingest_text_maps_gsvx_error_detail(monkeypatch):
         def json():
             return {"detail": "텍스트가 너무 깁니다"}
 
-    monkeypatch.setattr(gsvx_connector.requests, "post", lambda *a, **k: _FakeResponse())
+    monkeypatch.setattr(gsvx_connector.requests, "request", lambda *a, **k: _FakeResponse())
     with pytest.raises(GsvxError) as exc_info:
         GsvxClient().ingest_text("본문", "제목")
     assert exc_info.value.status_code == 413
@@ -203,7 +203,34 @@ def test_ingest_text_wraps_connection_failure(monkeypatch):
     def _boom(*args, **kwargs):
         raise gsvx_connector.requests.ConnectionError("refused")
 
-    monkeypatch.setattr(gsvx_connector.requests, "post", _boom)
+    monkeypatch.setattr(gsvx_connector.requests, "request", _boom)
     with pytest.raises(GsvxError) as exc_info:
         GsvxClient().ingest_text("본문", "제목")
     assert exc_info.value.status_code is None
+
+
+def test_graph_and_ask_use_graphiti_contract(monkeypatch):
+    calls = []
+
+    class _FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"nodes": [], "edges": []}
+
+    def fake_request(method, url, **kwargs):
+        calls.append((method, url, kwargs.get("params")))
+        return _FakeResponse()
+
+    monkeypatch.setattr(gsvx_connector.requests, "request", fake_request)
+    client = GsvxClient(base_url="https://graphiti.example")
+    client.graph("project-uuid")
+    client.ask("project-uuid", "미분이 뭐야", 6)
+
+    assert calls == [
+        ("GET", "https://graphiti.example/graph", {"project": "project-uuid"}),
+        ("GET", "https://graphiti.example/ask", {
+            "project": "project-uuid", "q": "미분이 뭐야", "k": 6,
+        }),
+    ]

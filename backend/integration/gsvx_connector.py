@@ -40,6 +40,7 @@ import os
 import sys
 import types
 from pathlib import Path
+from urllib.parse import quote
 
 import requests
 
@@ -64,7 +65,7 @@ GSVX_TEXT_LIMIT = 48_000
 # 경계에 걸린 개념·관계가 양쪽 어디에서든 온전한 맥락으로 추출되게 한다.
 SPLIT_OVERLAP = 1_000
 
-DEFAULT_BASE_URL = "http://127.0.0.1:8020"
+DEFAULT_BASE_URL = "https://synapvox-graphiti.onrender.com"
 DEFAULT_API_KEY = "demo-bio"  # gsvx 공개 데모 키 (프론트 .env.example과 동일)
 
 
@@ -157,6 +158,31 @@ class GsvxClient:
         self.timeout = timeout
         self.text_limit = GSVX_TEXT_LIMIT
 
+    def _request(self, method: str, path: str, *, params: dict | None = None,
+                 body: dict | None = None) -> dict:
+        """Call the Graphiti service and normalize transport/API failures."""
+        try:
+            resp = requests.request(
+                method,
+                f"{self.base_url}{path}",
+                params=params,
+                json=body,
+                headers={"X-API-Key": self.api_key},
+                timeout=self.timeout,
+            )
+        except requests.RequestException as exc:
+            raise GsvxError(None, f"Graphiti에 연결하지 못했습니다 ({self.base_url}): {exc}") from exc
+        if resp.status_code >= 400:
+            try:
+                detail = (resp.json() or {}).get("detail")
+            except ValueError:
+                detail = None
+            raise GsvxError(resp.status_code, detail or f"Graphiti {path} {resp.status_code}")
+        try:
+            return resp.json()
+        except ValueError as exc:
+            raise GsvxError(resp.status_code, f"Graphiti {path} 응답이 JSON이 아닙니다.") from exc
+
     def ingest_text(self, text: str, title: str, project: str | None = None,
                     name: str | None = None) -> dict:
         """gsvx POST /ingest-text 1회 호출 — 계약은 모듈 docstring 참조."""
@@ -165,18 +191,26 @@ class GsvxClient:
             body["project"] = project
         if name:
             body["name"] = name
-        try:
-            resp = requests.post(f"{self.base_url}/ingest-text", json=body,
-                                 headers={"X-API-Key": self.api_key}, timeout=self.timeout)
-        except requests.RequestException as exc:
-            raise GsvxError(None, f"gsvx에 연결하지 못했습니다 ({self.base_url}): {exc}") from exc
-        if resp.status_code >= 400:
-            try:
-                detail = (resp.json() or {}).get("detail")
-            except ValueError:
-                detail = None
-            raise GsvxError(resp.status_code, detail or f"gsvx /ingest-text {resp.status_code}")
-        return resp.json()
+        return self._request("POST", "/ingest-text", body=body)
+
+    def graph(self, project: str) -> dict:
+        return self._request("GET", "/graph", params={"project": project})
+
+    def ask(self, project: str, question: str, k: int = 6) -> dict:
+        return self._request(
+            "GET", "/ask", params={"project": project, "q": question, "k": k})
+
+    def concept(self, project: str, concept_id: str) -> dict:
+        return self._request(
+            "GET", f"/concept/{quote(concept_id, safe='')}", params={"project": project})
+
+    def session(self, project: str, session_id: str) -> dict:
+        return self._request(
+            "GET", f"/session/{quote(session_id, safe='')}", params={"project": project})
+
+    def reset(self, project: str) -> dict:
+        return self._request(
+            "POST", "/reset", params={"project": project}, body={"project": project})
 
     def ingest_transcript(self, im: dict, project: str | None = None) -> dict:
         """STT 중간포맷 dict → gsvx 세션(들). project 미지정 시 중간포맷의 project_id 사용.

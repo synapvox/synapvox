@@ -12,7 +12,6 @@ import re
 import zipfile
 from datetime import date
 from pathlib import Path
-from time import perf_counter
 from typing import Literal, Optional
 from uuid import uuid4
 
@@ -305,46 +304,19 @@ async def transcribe_recording(
             material_path.unlink(missing_ok=True)
 
 
-# ── 프로젝트 지식 그래프 — 문서/전사 → Neo4j → 조회/RAG ──
-
-_neo4j_driver = None
-_graph_store_instance = None
-_vector_store_instance = None
+# ── 프로젝트 지식 그래프 — Graphiti(gsvx) API relay ──
 
 
-def _graph_runtime():
-    global _neo4j_driver, _graph_store_instance
-    try:
-        from neo4j import GraphDatabase
-        from backend.graphrag import GraphStore
-        if _neo4j_driver is None:
-            _neo4j_driver = GraphDatabase.driver(
-                os.environ["NEO4J_URI"],
-                auth=(os.getenv("NEO4J_USERNAME") or os.getenv("NEO4J_USER") or "neo4j",
-                      os.environ["NEO4J_PASSWORD"]),
-            )
-            _neo4j_driver.verify_connectivity()
-        database = os.getenv("NEO4J_DATABASE") or "neo4j"
-        if _graph_store_instance is None:
-            _graph_store_instance = GraphStore(_neo4j_driver, database=database)
-        return _neo4j_driver, _graph_store_instance, database
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"graph database is not configured: {exc}") from exc
+def _gsvx_client():
+    from backend.integration.gsvx_connector import GsvxClient
+    return GsvxClient()
 
 
-def _vector_store():
-    global _vector_store_instance
-    if _vector_store_instance is None:
-        from backend.graphrag import VectorStore
-        _vector_store_instance = VectorStore()
-    return _vector_store_instance
-
-
-def _optional_vector_store():
-    try:
-        return _vector_store()
-    except Exception:
-        return None
+def _graphiti_error(exc: Exception) -> HTTPException:
+    from backend.integration.gsvx_connector import GsvxError
+    if isinstance(exc, GsvxError):
+        return HTTPException(status_code=exc.status_code or 502, detail=exc.detail)
+    return HTTPException(status_code=502, detail=f"Graphiti request failed: {exc}")
 
 
 def _owned_source_record(user_id: str, source_id: str) -> dict | None:
@@ -417,13 +389,6 @@ def _owned_transcript_exists(user_id: str, project_id: str, meeting_id: str) -> 
             return cursor.fetchone() is not None
 
 
-ANSWER_INSTRUCTIONS = (
-    "제공된 강의 자료와 전사문만 근거로 한국어로 간결하게 답하세요. "
-    "근거가 부족하면 부족하다고 말하세요. 답변은 Markdown으로 구조화하고, "
-    "수학 수식은 인라인 수식은 $...$, 블록 수식은 $$...$$ 형태의 LaTeX로 작성하세요."
-)
-
-
 class ChatHistoryMessage(BaseModel):
     role: Literal["user", "assistant"]
     text: str = Field(min_length=1, max_length=8000)
@@ -436,60 +401,6 @@ class AskStreamRequest(BaseModel):
     history: list[ChatHistoryMessage] = Field(default_factory=list, max_length=30)
 
 
-def _fallback_answer(hits: list[dict]) -> str:
-    if not hits:
-        return "아직 이 프로젝트에서 질문과 관련된 자료나 전사문을 찾지 못했습니다."
-    return f"관련 자료에서 다음 내용을 확인했습니다.\n\n{hits[0].get('text', '')[:700]}"
-
-
-def _answer_request(
-    question: str,
-    hits: list[dict],
-    history: list[dict] | None = None,
-) -> dict:
-    context = "\n\n".join(
-        f"[{hit.get('meeting_title') or hit.get('meeting_id') or '근거'}]\n{hit.get('text', '')}"
-        for hit in hits
-    )[:12000]
-    history_text = "\n".join(
-        f"{'사용자' if item.get('role') == 'user' else 'AI'}: {item.get('text', '')}"
-        for item in (history or [])[-12:]
-    )[-6000:]
-    conversation = f"\n\n그동안의 대화:\n{history_text}" if history_text else ""
-    return {
-        "model": os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
-        "instructions": ANSWER_INSTRUCTIONS,
-        "input": (
-            f"질문: {question}{conversation}\n\n근거:\n{context}\n\n"
-            "이전 대화는 질문의 맥락을 이해하는 용도로만 사용하고, 사실 판단은 반드시 근거를 우선하세요."
-        ),
-        "max_output_tokens": int(os.getenv("OPENAI_CHAT_MAX_TOKENS", "900")),
-        "store": False,
-    }
-
-
-def _stream_answer_text(question: str, hits: list[dict], history: list[dict] | None = None):
-    if not hits or not os.getenv("OPENAI_API_KEY"):
-        yield _fallback_answer(hits)
-        return
-    emitted = False
-    if os.getenv("OPENAI_API_KEY"):
-        try:
-            with _chat_client().responses.stream(**_answer_request(question, hits, history)) as stream:
-                for event in stream:
-                    if event.type == "response.output_text.delta" and event.delta:
-                        emitted = True
-                        yield event.delta
-        except Exception:
-            logger.exception("OpenAI answer stream failed")
-    if not emitted:
-        yield _fallback_answer(hits)
-
-
-def _answer_from_hits(question: str, hits: list[dict]) -> str:
-    return "".join(_stream_answer_text(question, hits)).strip()
-
-
 @app.post("/ingest-stt", include_in_schema=False)
 @app.post("/api/ingest-stt")
 async def ingest_stt_to_graph(
@@ -497,7 +408,7 @@ async def ingest_stt_to_graph(
     x_project_id: str | None = Header(None, alias="X-Project-Id"),
     user: dict = Depends(require_user),
 ) -> dict:
-    """STT 중간포맷 JSON을 현재 프로젝트의 Neo4j 그래프에 적재한다."""
+    """STT intermediate JSON -> Graphiti episode ingestion."""
     try:
         validate(transcript)
     except (KeyError, TypeError, ValueError) as exc:
@@ -515,25 +426,11 @@ async def ingest_stt_to_graph(
             detail="transcript must be saved before graph ingest",
         )
     try:
-        from backend.integration.pipeline import ingest_intermediate
-        _, graph_store, _ = _graph_runtime()
         result = await run_in_threadpool(
-            ingest_intermediate, transcript, graph_store, _optional_vector_store(), project_id)
-        logger.info(
-            "STT graph ingest timings project=%s meeting=%s timings_ms=%s",
-            project_id,
-            meeting_id,
-            result.get("timings_ms"),
-        )
-        return {
-            "project": result["project_id"], "meeting": result["meeting_id"],
-            "chunks_ingested": len(result["chunks"]), "concepts_new": len(result["topic_ids"]),
-            "concepts_total": result.get("concepts_total", len(result["topic_ids"])),
-            "relations_new": result["relations"],
-            "timings_ms": result.get("timings_ms", {}),
-        }
+            _gsvx_client().ingest_transcript, transcript, project_id)
+        return {"project": project_id, "meeting": meeting_id, **result}
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"graph ingest failed: {exc}") from exc
+        raise _graphiti_error(exc) from exc
 
 
 @app.post("/ingest-doc", include_in_schema=False)
@@ -568,40 +465,22 @@ async def ingest_doc_to_graph(
 
         title = Path(file.filename or "자료").stem or "자료"
         try:
-            from backend.integration.pipeline import ingest_document_text
-            _, graph_store, _ = _graph_runtime()
-            if x_source_id:
-                from functools import partial
-                ingest = partial(
-                    ingest_document_text,
-                    text,
-                    title,
-                    x_project_id,
-                    graph_store,
-                    _optional_vector_store(),
-                    x_meeting_id,
-                    document_id=x_source_id,
-                )
-                result = await run_in_threadpool(ingest)
-            else:
-                result = await run_in_threadpool(
-                    ingest_document_text, text, title, x_project_id, graph_store,
-                    _optional_vector_store(), x_meeting_id)
-            logger.info(
-                "document graph ingest timings project=%s meeting=%s timings_ms=%s",
+            result = await run_in_threadpool(
+                _gsvx_client().ingest_document_text,
+                text,
+                title,
                 x_project_id,
-                result["meeting_id"],
-                result.get("timings_ms"),
+                x_meeting_id,
             )
             return {
-                "project": result["project_id"], "meeting": result["meeting_id"], "title": title,
-                "chunks_ingested": len(result["chunks"]), "concepts_new": len(result["topic_ids"]),
-                "concepts_total": result.get("concepts_total", len(result["topic_ids"])),
-                "relations_new": result["relations"],
-                "timings_ms": result.get("timings_ms", {}),
+                "project": x_project_id,
+                "meeting": x_meeting_id,
+                "source_id": x_source_id,
+                "title": title,
+                **result,
             }
         except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"graph ingest failed: {exc}") from exc
+            raise _graphiti_error(exc) from exc
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
@@ -612,55 +491,15 @@ async def delete_source_graph(
     source_id: str = Query(..., min_length=1),
     user: dict = Depends(require_user),
 ) -> dict:
-    """Delete the Neo4j and pgvector data belonging to one owned source."""
+    """Refuse unsafe partial deletion until the Graphiti service exposes it."""
     user_id = str(user.get("sub") or "")
     source = await run_in_threadpool(_owned_source_record, user_id, source_id)
     if source is None:
         raise HTTPException(status_code=404, detail="source not found")
-
-    project_id = source["project_id"]
-    _, graph_store, _ = _graph_runtime()
-    try:
-        vector_store = _vector_store()
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"vector database is not configured: {exc}") from exc
-    if source["kind"] == "audio":
-        payload = source.get("source_payload") or {}
-        meeting_id = payload.get("graphMeetingId") if isinstance(payload, dict) else None
-        if not meeting_id:
-            meeting_id = source.get("recording_id") or source_id
-            if meeting_id.startswith("recording-"):
-                meeting_id = meeting_id.replace("recording-", "meeting-", 1)
-        graph_deleted = await run_in_threadpool(graph_store.delete_meeting, project_id, meeting_id)
-        vector_deleted = await run_in_threadpool(vector_store.delete_meeting, project_id, meeting_id)
-        return {
-            "source_id": source_id,
-            "project_id": project_id,
-            "meeting_id": meeting_id,
-            "graph_chunks_deleted": graph_deleted,
-            "vector_chunks_deleted": vector_deleted,
-        }
-
-    from backend.integration.pipeline import document_chunk_prefix
-    chunk_prefix = document_chunk_prefix(project_id, source_id)
-    graph_deleted = await run_in_threadpool(
-        graph_store.delete_chunks_by_prefix, project_id, chunk_prefix)
-    if graph_deleted == 0:
-        title = Path(source["original_name"]).stem or source["original_name"]
-        legacy_prefix = document_chunk_prefix(project_id, title)
-        if legacy_prefix != chunk_prefix:
-            chunk_prefix = legacy_prefix
-            graph_deleted = await run_in_threadpool(
-                graph_store.delete_chunks_by_prefix, project_id, chunk_prefix)
-    vector_deleted = await run_in_threadpool(
-        vector_store.delete_chunks_by_prefix, project_id, chunk_prefix)
-    return {
-        "source_id": source_id,
-        "project_id": project_id,
-        "chunk_prefix": chunk_prefix,
-        "graph_chunks_deleted": graph_deleted,
-        "vector_chunks_deleted": vector_deleted,
-    }
+    raise HTTPException(
+        status_code=501,
+        detail="Graphiti API에 개별 세션 삭제 기능이 아직 없어 삭제하지 않았습니다.",
+    )
 
 
 @app.get("/api/graph")
@@ -668,9 +507,10 @@ async def get_project_graph(
     project: str = Query(..., min_length=1),
     user: dict = Depends(require_user),
 ) -> dict:
-    from backend.graphrag import graph_data
-    driver, _, database = _graph_runtime()
-    return await run_in_threadpool(graph_data, driver, project, database)
+    try:
+        return await run_in_threadpool(_gsvx_client().graph, project)
+    except Exception as exc:
+        raise _graphiti_error(exc) from exc
 
 
 @app.get("/api/ask")
@@ -680,97 +520,28 @@ async def ask_project_graph(
     k: int = Query(6, ge=1, le=12),
     user: dict = Depends(require_user),
 ) -> dict:
-    from backend.graphrag import HybridSearch, expansion_for_chunks
-    driver, _, database = _graph_runtime()
-    vector_store = _optional_vector_store()
-    if vector_store is None:
-        raise HTTPException(status_code=503, detail="vector search is not configured")
-    started = perf_counter()
-    hits = await run_in_threadpool(HybridSearch(driver, vector_store, database).search, project, q, k)
-    searched = perf_counter()
-    answer = await run_in_threadpool(_answer_from_hits, q, hits)
-    answered = perf_counter()
-    expansion = await run_in_threadpool(
-        expansion_for_chunks,
-        driver,
-        project,
-        [hit["chunk_id"] for hit in hits],
-        database,
-    )
-    finished = perf_counter()
-    timings = {
-        "search": round((searched - started) * 1000),
-        "answer": round((answered - searched) * 1000),
-        "focus": round((finished - answered) * 1000),
-        "total": round((finished - started) * 1000),
-    }
-    logger.info("ask timings project=%s query=%r timings_ms=%s", project, q[:80], timings)
-    return {"answer": answer,
-            "hits": hits, "expansion": expansion,
-            "timings_ms": timings}
+    try:
+        return await run_in_threadpool(_gsvx_client().ask, project, q, k)
+    except Exception as exc:
+        raise _graphiti_error(exc) from exc
 
 
 def _ndjson_event(event_type: str, **payload) -> str:
     return json.dumps({"type": event_type, **payload}, ensure_ascii=False) + "\n"
 
 
-def _ask_stream_events(
-    driver,
-    vector_store,
-    database,
-    project: str,
-    q: str,
-    k: int,
-    history: list[dict] | None = None,
-):
-    from backend.graphrag import HybridSearch, expansion_for_chunks
-
-    started = perf_counter()
+def _ask_stream_events(project: str, q: str, k: int):
+    """Adapt Graphiti's complete answer response to the frontend NDJSON contract."""
     try:
-        hits = HybridSearch(driver, vector_store, database).search(project, q, k)
-        searched = perf_counter()
-        answer_parts: list[str] = []
-        pending_delta = ""
-        last_flush = perf_counter()
-        first_flush = True
-        for delta in _stream_answer_text(q, hits, history):
-            answer_parts.append(delta)
-            pending_delta += delta
-            now = perf_counter()
-            threshold = 16 if first_flush else 64
-            if len(pending_delta) >= threshold or now - last_flush >= 0.05:
-                yield _ndjson_event("delta", text=pending_delta)
-                pending_delta = ""
-                last_flush = now
-                first_flush = False
-        if pending_delta:
-            yield _ndjson_event("delta", text=pending_delta)
-        answered = perf_counter()
-        answer = "".join(answer_parts).strip()
-        expansion = expansion_for_chunks(
-            driver,
-            project,
-            [hit["chunk_id"] for hit in hits],
-            database,
-        )
-        finished = perf_counter()
-        timings = {
-            "search": round((searched - started) * 1000),
-            "answer": round((answered - searched) * 1000),
-            "focus": round((finished - answered) * 1000),
-            "total": round((finished - started) * 1000),
-        }
-        logger.info("ask stream timings project=%s query=%r timings_ms=%s", project, q[:80], timings)
-        yield _ndjson_event(
-            "complete",
-            answer=answer,
-            hits=hits,
-            expansion=expansion,
-            timings_ms=timings,
-        )
+        result = _gsvx_client().ask(project, q, k)
+        answer = str(result.get("answer") or "")
+        for start in range(0, len(answer), 48):
+            yield _ndjson_event("delta", text=answer[start:start + 48])
+        yield _ndjson_event("complete", **result)
     except Exception as exc:
-        logger.exception("ask stream failed project=%s query=%r", project, q[:80])
-        yield _ndjson_event("error", message=str(exc))
+        logger.exception("Graphiti ask failed project=%s query=%r", project, q[:80])
+        error = _graphiti_error(exc)
+        yield _ndjson_event("error", message=error.detail)
 
 
 @app.get("/api/ask-stream")
@@ -780,12 +551,8 @@ def ask_project_graph_stream(
     k: int = Query(6, ge=1, le=12),
     user: dict = Depends(require_user),
 ) -> StreamingResponse:
-    driver, _, database = _graph_runtime()
-    vector_store = _optional_vector_store()
-    if vector_store is None:
-        raise HTTPException(status_code=503, detail="vector search is not configured")
     return StreamingResponse(
-        _ask_stream_events(driver, vector_store, database, project, q, k),
+        _ask_stream_events(project, q, k),
         media_type="application/x-ndjson",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -796,21 +563,8 @@ def ask_project_graph_stream_with_history(
     request: AskStreamRequest,
     user: dict = Depends(require_user),
 ) -> StreamingResponse:
-    driver, _, database = _graph_runtime()
-    vector_store = _optional_vector_store()
-    if vector_store is None:
-        raise HTTPException(status_code=503, detail="vector search is not configured")
-    history = [message.model_dump() for message in request.history]
     return StreamingResponse(
-        _ask_stream_events(
-            driver,
-            vector_store,
-            database,
-            request.project,
-            request.q,
-            request.k,
-            history,
-        ),
+        _ask_stream_events(request.project, request.q, request.k),
         media_type="application/x-ndjson",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -822,12 +576,10 @@ async def get_concept_detail(
     project: str = Query(..., min_length=1),
     user: dict = Depends(require_user),
 ) -> dict:
-    from backend.graphrag import concept_detail
-    driver, _, database = _graph_runtime()
-    result = await run_in_threadpool(concept_detail, driver, project, concept_id, database)
-    if result is None:
-        raise HTTPException(status_code=404, detail="concept not found")
-    return result
+    try:
+        return await run_in_threadpool(_gsvx_client().concept, project, concept_id)
+    except Exception as exc:
+        raise _graphiti_error(exc) from exc
 
 
 @app.get("/api/session/{meeting_id}")
@@ -836,9 +588,7 @@ async def get_session_detail(
     project: str = Query(..., min_length=1),
     user: dict = Depends(require_user),
 ) -> dict:
-    from backend.graphrag import session_detail
-    driver, _, database = _graph_runtime()
-    result = await run_in_threadpool(session_detail, driver, project, meeting_id, database)
-    if result is None:
-        raise HTTPException(status_code=404, detail="session not found")
-    return result
+    try:
+        return await run_in_threadpool(_gsvx_client().session, project, meeting_id)
+    except Exception as exc:
+        raise _graphiti_error(exc) from exc

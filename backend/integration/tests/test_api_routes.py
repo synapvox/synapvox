@@ -32,21 +32,18 @@ def test_legacy_graph_ingest_routes_remain_as_hidden_aliases():
 
 
 def test_api_ingest_stt_uses_active_project(monkeypatch):
-    import backend.graphrag as graphrag
-    from backend.integration import pipeline
-    monkeypatch.setattr(api_main, "_graph_runtime", lambda: (None, object(), None))
-    monkeypatch.setattr(api_main, "_optional_vector_store", lambda: None)
+    captured = {}
+
+    class _Graphiti:
+        def ingest_transcript(self, transcript, project):
+            captured["project"] = project
+            return {
+                "chunks_ingested": 1, "concepts_new": 1,
+                "concepts_total": 1, "relations_new": 0,
+            }
+
+    monkeypatch.setattr(api_main, "_gsvx_client", lambda: _Graphiti())
     monkeypatch.setattr(api_main, "_owned_transcript_exists", lambda user, project, meeting: True)
-    monkeypatch.setattr(graphrag, "graph_data", lambda driver, project, database: {
-        "nodes": [{"id": "t1", "type": "concept", "label": "그래프", "meta": {}}], "edges": [],
-    })
-    monkeypatch.setattr(
-        pipeline, "ingest_intermediate",
-        lambda transcript, store, vector, project: {
-            "project_id": project, "meeting_id": transcript["meeting_id"],
-            "chunks": [{"chunk_id": "c1"}], "topic_ids": ["t1"], "relations": 0,
-        },
-    )
     transcript = {
         "source": "lecture.wav",
         "meeting_id": "lecture-01",
@@ -66,25 +63,21 @@ def test_api_ingest_stt_uses_active_project(monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["project"] == "project-uuid"
+    assert captured["project"] == "project-uuid"
 
 
 def test_api_ingest_doc_stores_text_file(monkeypatch):
-    import backend.graphrag as graphrag
-    from backend.integration import pipeline
     captured = {}
-    monkeypatch.setattr(api_main, "_graph_runtime", lambda: (None, object(), None))
-    monkeypatch.setattr(api_main, "_optional_vector_store", lambda: None)
-    monkeypatch.setattr(graphrag, "graph_data", lambda driver, project, database: {
-        "nodes": [{"id": "t1", "type": "concept", "label": "graph", "meta": {}}], "edges": [],
-    })
-    def fake_ingest(text, title, project, store, vector, meeting, document_id=None):
-        captured["document_id"] = document_id
-        return {
-            "project_id": project, "meeting_id": meeting, "chunks": [{"chunk_id": "c1"}],
-            "topic_ids": ["t1"], "relations": 0,
-        }
 
-    monkeypatch.setattr(pipeline, "ingest_document_text", fake_ingest)
+    class _Graphiti:
+        def ingest_document_text(self, text, title, project, meeting):
+            captured.update(text=text, title=title, project=project, meeting=meeting)
+            return {
+                "chunks_ingested": 1, "concepts_new": 1,
+                "concepts_total": 1, "relations_new": 0,
+            }
+
+    monkeypatch.setattr(api_main, "_gsvx_client", lambda: _Graphiti())
 
     response = TestClient(app).post(
         "/api/ingest-doc",
@@ -101,40 +94,30 @@ def test_api_ingest_doc_stores_text_file(monkeypatch):
     assert response.json() == {
         "project": "project-uuid",
         "meeting": "lecture-01",
+        "source_id": "material-123",
         "title": "notes",
         "chunks_ingested": 1,
         "concepts_new": 1,
         "concepts_total": 1,
         "relations_new": 0,
-        "timings_ms": {},
     }
-    assert captured["document_id"] == "material-123"
+    assert captured == {
+        "text": "graph theory notes", "title": "notes",
+        "project": "project-uuid", "meeting": "lecture-01",
+    }
 
 
 def test_api_graph_and_ask_use_current_project(monkeypatch):
-    import backend.graphrag as graphrag
-
-    class _FakeSearch:
-        def __init__(self, driver, vector, database):
-            pass
-
-        def search(self, project, question, k):
-            return [{"chunk_id": "c1", "text": "근거", "meeting_id": "m1", "topics": []}]
-
-    monkeypatch.setattr(api_main, "_graph_runtime", lambda: (object(), object(), "neo4j"))
-    monkeypatch.setattr(api_main, "_optional_vector_store", lambda: object())
-    monkeypatch.setattr(api_main, "_answer_from_hits", lambda question, hits: question)
-    monkeypatch.setattr(
-        graphrag, "graph_data",
-        lambda driver, project, database: {
+    class _Graphiti:
+        def graph(self, project):
+            return {
             "nodes": [{"id": project, "type": "session", "label": "강의", "meta": {}}], "edges": [],
-        },
-    )
-    monkeypatch.setattr(graphrag, "HybridSearch", _FakeSearch)
-    monkeypatch.setattr(
-        graphrag, "expansion_for_chunks",
-        lambda driver, project, chunk_ids, database: {"nodes": [], "edges": []},
-    )
+            }
+
+        def ask(self, project, question, k):
+            return {"answer": question, "hits": [], "expansion": {"nodes": [], "edges": []}}
+
+    monkeypatch.setattr(api_main, "_gsvx_client", lambda: _Graphiti())
     client = TestClient(app)
 
     graph = client.get("/api/graph", params={"project": "project-uuid"})
@@ -147,39 +130,18 @@ def test_api_graph_and_ask_use_current_project(monkeypatch):
 
 
 def test_api_ask_stream_emits_deltas_then_focus_graph(monkeypatch):
-    import backend.graphrag as graphrag
+    class _Graphiti:
+        def ask(self, project, question, k):
+            return {
+                "answer": "미분은 변화율입니다.",
+                "hits": [],
+                "expansion": {
+                    "nodes": [{"id": "t1", "type": "concept", "label": "미분", "meta": {}}],
+                    "edges": [],
+                },
+            }
 
-    class _FakeSearch:
-        def __init__(self, driver, vector, database):
-            pass
-
-        def search(self, project, question, k):
-            return [{
-                "chunk_id": "c1",
-                "text": "미분 근거",
-                "score": 0.8,
-                "meeting_id": "m1",
-                "meeting_title": "최적화 개론",
-                "topics": ["미분"],
-                "topic_nodes": [{"id": "t1", "label": "미분"}],
-            }]
-
-    monkeypatch.setattr(api_main, "_graph_runtime", lambda: (object(), object(), "neo4j"))
-    monkeypatch.setattr(api_main, "_optional_vector_store", lambda: object())
-    monkeypatch.setattr(
-        api_main,
-        "_stream_answer_text",
-        lambda question, hits, history=None: iter(["미분은 ", "변화율입니다."]),
-    )
-    monkeypatch.setattr(graphrag, "HybridSearch", _FakeSearch)
-    monkeypatch.setattr(
-        graphrag,
-        "expansion_for_chunks",
-        lambda driver, project, chunk_ids, database: {
-            "nodes": [{"id": "t1", "type": "concept", "label": "미분", "meta": {}}],
-            "edges": [],
-        },
-    )
+    monkeypatch.setattr(api_main, "_gsvx_client", lambda: _Graphiti())
 
     response = TestClient(app).get(
         "/api/ask-stream",
@@ -194,37 +156,15 @@ def test_api_ask_stream_emits_deltas_then_focus_graph(monkeypatch):
     assert events[-1]["expansion"]["nodes"][0]["id"] == "t1"
 
 
-def test_api_ask_stream_post_passes_chat_history(monkeypatch):
-    import backend.graphrag as graphrag
-
+def test_api_ask_stream_post_uses_graphiti_question(monkeypatch):
     captured = {}
 
-    class _FakeSearch:
-        def __init__(self, driver, vector, database):
-            pass
+    class _Graphiti:
+        def ask(self, project, question, k):
+            captured.update(project=project, question=question, k=k)
+            return {"answer": "이전 대화를 이어서 답변", "hits": [], "expansion": {"nodes": [], "edges": []}}
 
-        def search(self, project, question, k):
-            return [{
-                "chunk_id": "c1",
-                "text": "근거",
-                "meeting_id": "m1",
-                "topics": [],
-                "topic_nodes": [],
-            }]
-
-    def fake_stream(question, hits, history=None):
-        captured["history"] = history
-        return iter(["이전 대화를 이어서 답변"])
-
-    monkeypatch.setattr(api_main, "_graph_runtime", lambda: (object(), object(), "neo4j"))
-    monkeypatch.setattr(api_main, "_optional_vector_store", lambda: object())
-    monkeypatch.setattr(api_main, "_stream_answer_text", fake_stream)
-    monkeypatch.setattr(graphrag, "HybridSearch", _FakeSearch)
-    monkeypatch.setattr(
-        graphrag,
-        "expansion_for_chunks",
-        lambda driver, project, chunk_ids, database: {"nodes": [], "edges": []},
-    )
+    monkeypatch.setattr(api_main, "_gsvx_client", lambda: _Graphiti())
 
     response = TestClient(app).post(
         "/api/ask-stream",
@@ -239,24 +179,9 @@ def test_api_ask_stream_post_passes_chat_history(monkeypatch):
     )
 
     assert response.status_code == 200
-    assert captured["history"] == [
-        {"role": "user", "text": "KKT가 뭐야?"},
-        {"role": "assistant", "text": "최적화의 필요 조건입니다."},
-    ]
+    assert captured == {"project": "project-uuid", "question": "그럼 제약은?", "k": 6}
 
-def test_delete_recording_source_removes_graph_meeting_and_vectors(monkeypatch):
-    calls = []
-
-    class _GraphStore:
-        def delete_meeting(self, project, meeting):
-            calls.append(("graph", project, meeting))
-            return 3
-
-    class _VectorStore:
-        def delete_meeting(self, project, meeting):
-            calls.append(("vector", project, meeting))
-            return 3
-
+def test_delete_source_is_blocked_until_graphiti_supports_session_delete(monkeypatch):
     monkeypatch.setattr(api_main, "_owned_source_record", lambda user, source: {
         "id": source,
         "project_id": "project-uuid",
@@ -265,49 +190,7 @@ def test_delete_recording_source_removes_graph_meeting_and_vectors(monkeypatch):
         "original_name": "lecture.webm",
         "source_payload": {"graphMeetingId": "meeting-123"},
     })
-    monkeypatch.setattr(api_main, "_graph_runtime", lambda: (object(), _GraphStore(), "neo4j"))
-    monkeypatch.setattr(api_main, "_vector_store", lambda: _VectorStore())
-
     response = TestClient(app).delete("/api/source-graph", params={"source_id": "recording-123"})
 
-    assert response.status_code == 200
-    assert response.json()["graph_chunks_deleted"] == 3
-    assert calls == [
-        ("graph", "project-uuid", "meeting-123"),
-        ("vector", "project-uuid", "meeting-123"),
-    ]
-
-
-def test_delete_document_source_removes_only_its_chunk_prefix(monkeypatch):
-    calls = []
-
-    class _GraphStore:
-        def delete_chunks_by_prefix(self, project, prefix):
-            calls.append(("graph", project, prefix))
-            return 2
-
-    class _VectorStore:
-        def delete_chunks_by_prefix(self, project, prefix):
-            calls.append(("vector", project, prefix))
-            return 2
-
-    monkeypatch.setattr(api_main, "_owned_source_record", lambda user, source: {
-        "id": source,
-        "project_id": "project-uuid",
-        "recording_id": "recording-123",
-        "kind": "document",
-        "original_name": "lecture-notes.pdf",
-        "source_payload": {},
-    })
-    monkeypatch.setattr(api_main, "_graph_runtime", lambda: (object(), _GraphStore(), "neo4j"))
-    monkeypatch.setattr(api_main, "_vector_store", lambda: _VectorStore())
-
-    response = TestClient(app).delete("/api/source-graph", params={"source_id": "material-123"})
-
-    assert response.status_code == 200
-    prefix = response.json()["chunk_prefix"]
-    assert prefix.startswith("doc-") and prefix.endswith("-d")
-    assert calls == [
-        ("graph", "project-uuid", prefix),
-        ("vector", "project-uuid", prefix),
-    ]
+    assert response.status_code == 501
+    assert "Graphiti" in response.json()["detail"]

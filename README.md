@@ -1,6 +1,6 @@
 # SynapVox
 
-회의 지식 파이프라인 — 녹음/자료 → RAG 기반 2-pass STT → Vector+Graph DB → Graph RAG+ 질의응답.
+강의 지식 파이프라인 — 녹음/자료 → 2-pass STT → Graphiti 지식 그래프 → 질의응답.
 
 기획 배경과 상세 설계는 ClickUp Team Docs("회의 지식 파이프라인 MVP 구현 계획") 참고.
 

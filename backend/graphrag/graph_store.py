@@ -39,170 +39,20 @@ class GraphStore:
                 f"MERGE (p)-[:{S.HAS_MEETING}]->(m)",
                 pid=pid, mid=mid, date=im.get("date"), title=title, summary=summary,
                 source_type=source_type, preserve=preserve_existing)
-        if not preserve_existing:
-            self._rebuild_follows(pid)
+        self._rebuild_follows(pid)
         return mid
 
     def load_chunks(self, project_id: str, meeting_id: str, chunks: list[dict]):
         """chunking 산출 청크 → Chunk 노드 + HAS_CHUNK. chunk = {chunk_id, source_type, raw_span, timestamps, text}."""
-        rows = [
-            {
-                "chunk_id": c["chunk_id"],
-                "source_type": c.get("source_type"),
-                "raw_span": str(c.get("raw_span")),
-                "timestamps": str(c.get("timestamps")),
-                "text": c.get("text", ""),
-            }
-            for c in chunks
-        ]
-        if not rows:
-            return
         with self._session() as s:
-            s.run(
-                f"MATCH (m:{S.MEETING} {{project_id:$pid, meeting_id:$mid}}) "
-                "UNWIND $chunks AS row "
-                f"MERGE (c:{S.CHUNK} {{project_id:$pid, chunk_id:row.chunk_id}}) "
-                "SET c.source_type=row.source_type, c.raw_span=row.raw_span, "
-                "c.timestamps=row.timestamps, c.vector_ref=row.chunk_id, c.text=row.text "
-                f"MERGE (m)-[:{S.HAS_CHUNK}]->(c)",
-                pid=project_id,
-                mid=meeting_id,
-                chunks=rows,
-            ).consume()
-
-    def load_knowledge_batch(
-        self,
-        project_id: str,
-        meeting_id: str,
-        chunks: list[dict],
-        extractions: list[dict],
-        topic_relations: list[tuple[str, str]] | None = None,
-    ) -> dict:
-        """Store one lecture's chunks, concepts and edges in one Aura round trip."""
-        chunk_rows = [
-            {
-                "chunk_id": chunk["chunk_id"],
-                "source_type": chunk.get("source_type"),
-                "raw_span": str(chunk.get("raw_span")),
-                "timestamps": str(chunk.get("timestamps")),
-                "text": chunk.get("text", ""),
-            }
-            for chunk in chunks
-        ]
-        topic_rows = [
-            {
-                "chunk_id": extraction["chunk_id"],
-                "topic_id": topic["topic_id"],
-                "name": topic["name"],
-                "aliases": topic.get("aliases", []),
-            }
-            for extraction in extractions
-            for topic in extraction.get("topics", [])
-        ]
-        decision_rows = [
-            {
-                "decision_id": decision["decision_id"],
-                "statement": decision["statement"],
-                "date": decision.get("date"),
-                "supersedes": decision.get("supersedes"),
-            }
-            for extraction in extractions
-            for decision in extraction.get("decisions", [])
-        ]
-        action_rows = [
-            {
-                "item_id": action["item_id"],
-                "task": action["task"],
-                "assignee": action.get("assignee"),
-                "due": action.get("due"),
-            }
-            for extraction in extractions
-            for action in extraction.get("action_items", [])
-        ]
-        relation_rows = [
-            {"left": left, "right": right}
-            for left, right in (topic_relations or [])
-            if left != right
-        ]
-        query = f"""
-        WITH $chunks AS chunks, $topics AS topics, $decisions AS decisions,
-             $actions AS actions, $relations AS relations, $pid AS pid, $mid AS mid
-        CALL (chunks, pid, mid) {{
-          MATCH (m:{S.MEETING} {{project_id:pid, meeting_id:mid}})
-          UNWIND chunks AS row
-          MERGE (c:{S.CHUNK} {{project_id:pid, chunk_id:row.chunk_id}})
-          SET c.source_type=row.source_type, c.raw_span=row.raw_span,
-              c.timestamps=row.timestamps, c.vector_ref=row.chunk_id, c.text=row.text
-          MERGE (m)-[:{S.HAS_CHUNK}]->(c)
-          RETURN count(*) AS chunks_loaded
-        }}
-        CALL (topics, pid, mid) {{
-          UNWIND topics AS row
-          MERGE (tp:{S.TOPIC} {{project_id:pid, topic_id:row.topic_id}})
-          SET tp.name=row.name, tp.aliases=row.aliases
-          WITH tp, row
-          MATCH (c:{S.CHUNK} {{project_id:pid, chunk_id:row.chunk_id}})
-          MERGE (c)-[:{S.DISCUSSES}]->(tp)
-          WITH tp
-          MATCH (m:{S.MEETING} {{project_id:pid, meeting_id:mid}})
-          MERGE (m)-[:{S.DISCUSSES}]->(tp)
-          RETURN count(*) AS topics_loaded
-        }}
-        CALL (decisions, pid, mid) {{
-          UNWIND decisions AS row
-          MERGE (de:{S.DECISION} {{project_id:pid, decision_id:row.decision_id}})
-          SET de.statement=row.statement, de.date=row.date
-          WITH de, row
-          MATCH (m:{S.MEETING} {{project_id:pid, meeting_id:mid}})
-          MERGE (de)-[:{S.DECIDED_IN}]->(m)
-          WITH de, row
-          OPTIONAL MATCH (previous:{S.DECISION} {{project_id:pid, decision_id:row.supersedes}})
-          FOREACH (_ IN CASE WHEN previous IS NULL THEN [] ELSE [1] END |
-            MERGE (de)-[:{S.SUPERSEDES}]->(previous))
-          RETURN count(*) AS decisions_loaded
-        }}
-        CALL (actions, pid, mid) {{
-          UNWIND actions AS row
-          MERGE (ai:{S.ACTION_ITEM} {{project_id:pid, item_id:row.item_id}})
-          SET ai.task=row.task, ai.assignee=row.assignee, ai.due=row.due
-          WITH ai
-          MATCH (m:{S.MEETING} {{project_id:pid, meeting_id:mid}})
-          MERGE (ai)-[:{S.RAISED_IN}]->(m)
-          RETURN count(*) AS actions_loaded
-        }}
-        CALL (relations, pid) {{
-          UNWIND relations AS row
-          MATCH (a:{S.TOPIC} {{project_id:pid, topic_id:row.left}}),
-                (b:{S.TOPIC} {{project_id:pid, topic_id:row.right}})
-          MERGE (a)-[:{S.RELATES_TO}]->(b)
-          RETURN count(*) AS relations_loaded
-        }}
-        CALL (pid) {{
-          MATCH (topic:{S.TOPIC} {{project_id:pid}})
-          RETURN count(topic) AS concepts_total
-        }}
-        RETURN chunks_loaded, topics_loaded, decisions_loaded, actions_loaded,
-               relations_loaded, concepts_total
-        """
-        with self._session() as session:
-            record = session.run(
-                query,
-                pid=project_id,
-                mid=meeting_id,
-                chunks=chunk_rows,
-                topics=topic_rows,
-                decisions=decision_rows,
-                actions=action_rows,
-                relations=relation_rows,
-            ).single()
-        return dict(record) if record is not None else {
-            "chunks_loaded": 0,
-            "topics_loaded": 0,
-            "decisions_loaded": 0,
-            "actions_loaded": 0,
-            "relations_loaded": 0,
-            "concepts_total": 0,
-        }
+            for c in chunks:
+                s.run(
+                    f"MATCH (m:{S.MEETING} {{project_id:$pid, meeting_id:$mid}}) "
+                    f"MERGE (c:{S.CHUNK} {{project_id:$pid, chunk_id:$cid}}) "
+                    f"SET c.source_type=$st, c.raw_span=$span, c.timestamps=$ts, c.vector_ref=$cid, c.text=$text "
+                    f"MERGE (m)-[:{S.HAS_CHUNK}]->(c)",
+                    pid=project_id, mid=meeting_id, cid=c["chunk_id"], st=c.get("source_type"),
+                    span=str(c.get("raw_span")), ts=str(c.get("timestamps")), text=c.get("text", ""))
 
     def load_extraction(self, project_id: str, meeting_id: str, ext: dict):
         """llm_extraction → Topic/Decision/ActionItem + DISCUSSES/DECIDED_IN/RAISED_IN/SUPERSEDES."""
