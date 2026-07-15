@@ -84,6 +84,7 @@ type BackendAuthResponse = {
 const PROJECTS_STORAGE_KEY = 'synapvox-projects';
 const WORKSPACES_STORAGE_KEY = 'synapvox-project-workspaces';
 const BACKEND_AUTH_STORAGE_KEY = 'synapvox-backend-auth';
+const SUPABASE_ADMIN_EMAIL = 'root@synapvox.local';
 const scopedStorageKey = (baseKey: string, userId: string | null) => `${baseKey}:${userId ?? 'guest'}`;
 
 const isAuthUser = (value: unknown): value is AuthUser => {
@@ -125,13 +126,17 @@ const clearBackendAuth = () => {
 const authUserFromSession = (session: Session | null): AuthUser | null => {
   if (session === null) return null;
   const metadataName = session.user.user_metadata.name;
+  const email = session.user.email?.toLowerCase() ?? '로그인된 계정';
+  const isAdmin = email === SUPABASE_ADMIN_EMAIL;
   return {
     id: session.user.id,
-    email: session.user.email ?? '로그인된 계정',
-    name: typeof metadataName === 'string' && metadataName.trim() !== ''
+    email,
+    name: isAdmin
+      ? '관리자'
+      : typeof metadataName === 'string' && metadataName.trim() !== ''
       ? metadataName
       : session.user.email?.split('@')[0] ?? '사용자',
-    role: 'user',
+    role: isAdmin ? 'admin' : 'user',
   };
 };
 
@@ -607,17 +612,20 @@ function App() {
   };
 
   useEffect(() => {
+    const storedAuth = supabase === null ? loadStoredBackendAuth() : null;
+    if (storedAuth !== null) {
+      setIsLoggedIn(true);
+      setCurrentUser(storedAuth.user);
+      setIsAdminOpen(storedAuth.user.role === 'admin');
+      switchProjectStorage(storedAuth.user.id);
+      setIsAuthReady(true);
+      return undefined;
+    }
+
     if (supabase === null) {
-      const storedAuth = loadStoredBackendAuth();
-      if (storedAuth !== null) {
-        setIsLoggedIn(true);
-        setCurrentUser(storedAuth.user);
-        switchProjectStorage(storedAuth.user.id);
-      } else {
         setIsLoggedIn(false);
         setCurrentUser(null);
         switchProjectStorage(null);
-      }
       setIsAuthReady(true);
       return undefined;
     }
@@ -627,7 +635,7 @@ function App() {
       clearBackendAuth();
       setIsLoggedIn(user !== null);
       setCurrentUser(user);
-      setIsAdminOpen(false);
+      setIsAdminOpen(user?.role === 'admin');
       switchProjectStorage(user?.id ?? null);
       setIsAuthReady(true);
     };
@@ -888,7 +896,9 @@ function App() {
     setAuthError(null);
     setAuthLoading(true);
     try {
-      if (supabase === null) {
+      const useBackendAuth = supabase === null;
+
+      if (useBackendAuth) {
         const endpoint = authMode === 'signup' ? '/api/auth/signup' : '/api/auth/login';
         const response = await fetch(endpoint, {
           method: 'POST',
@@ -903,17 +913,26 @@ function App() {
         }
         const authResult = await response.json() as BackendAuthResponse;
         completeBackendAuth(authResult);
-      } else {
+      } else if (supabase !== null) {
         if (authMode === 'signup') {
-          const { error } = await supabase.auth.signUp({
+          const { data, error } = await supabase.auth.signUp({
             email: authEmail,
             password: authPassword,
             options: { data: { name: authName } },
           });
           if (error) throw error;
+          if (data.session === null) {
+            setAuthMode('login');
+            setAuthPassword('');
+            setAuthError('가입 확인 이메일을 보냈습니다. 확인 후 로그인해주세요.');
+            return;
+          }
         } else {
+          const loginEmail = authEmail.trim().toLowerCase() === 'root'
+            ? SUPABASE_ADMIN_EMAIL
+            : authEmail.trim();
           const { error } = await supabase.auth.signInWithPassword({
-            email: authEmail,
+            email: loginEmail,
             password: authPassword,
           });
           if (error) throw error;

@@ -2,70 +2,67 @@
 // link colors. No DOM/canvas/React here so they stay unit-testable; the actual
 // canvas painting lives in GraphView.tsx and calls these.
 //
-// Palette (spec §3, exact hexes):
-//   --node-core  #D8FF6A  (concept core, lime)
-//   --session-red #C84E3A (session core, vermilion)
-//   --rule-blue  #2F6F86  (links / focus / selection)
+// Palette mirrors the main SynapVox notebook UI: warm paper, moss accents,
+// and quiet wood lines instead of the original high-contrast studio colors.
 
 import type { FRelClass } from './buildForceData'
 
-const CONCEPT_BASE = 4
-const SESSION_BASE = 5 // sessions read slightly heavier than concepts
-const DEGREE_SCALE = 1.8
+const CONCEPT_BASE = 4.2
+const SESSION_BASE = 5.8 // sessions read slightly heavier than concepts
+const DEGREE_SCALE = 1.15
 
-/** Node radius in graph units. `base + sqrt(degree) * scale` — sqrt keeps hubs
- * visibly bigger without letting a single super-hub dwarf everything (linear
- * would). Strictly monotonic increasing in degree. */
+/** Node radius in graph units. `base + sqrt(degree) * scale` keeps hubs visibly
+ * bigger, then a tier-specific cap prevents one node from dwarfing the graph. */
 export function nodeRadius(degree: number, type: 'session' | 'concept' | 'main'): number {
-  if (type === 'main') return 18 // the single project hub — always the biggest
+  if (type === 'main') return 14 // clear hierarchy without overpowering the graph
   const base = type === 'session' ? SESSION_BASE : CONCEPT_BASE
   const d = Number.isFinite(degree) && degree > 0 ? degree : 0
-  return base + Math.sqrt(d) * DEGREE_SCALE
+  const cap = type === 'session' ? 10.5 : 9
+  return Math.min(base + Math.sqrt(d) * DEGREE_SCALE, cap)
 }
 
-// Hierarchy tiers by color (sub-nodes drawn HOLLOW → the color is the outline):
-//   main (topic hub)       → paper ivory
-//   session (lecture)      → vermilion
-//   bridge concept (핵심)  → lime (spans ≥2 lectures — the load-bearing ideas)
-//   leaf concept (일반)    → muted teal (a single lecture's concept, recedes)
-const C_MAIN = '#F4F0E7'
-const C_SESSION = '#C84E3A'
-const C_CONCEPT_BRIDGE = '#D8FF6A'
-const C_CONCEPT_LEAF = '#4FA3A0'
+// Hierarchy tiers by color:
+//   main (project hub)     → dark ink
+//   session (recording)    → warm wood
+//   bridge concept (핵심)  → moss
+//   leaf concept (일반)    → quiet stone
+const C_MAIN = '#342E26'
+const C_SESSION = '#987653'
+const C_CONCEPT_BRIDGE = '#66715B'
+const C_CONCEPT_LEAF = '#A89B84'
 
-/** Core/stroke color for a node, by hierarchy tier. `bridge` splits concepts into
- * the load-bearing (lime) vs leaf (teal) tiers. Size still encodes degree (see
- * nodeRadius) — color and size together read the hierarchy. */
+/** Core/stroke color for a node. `bridge` splits load-bearing concepts from
+ * leaf concepts; size still encodes degree. */
 export function nodeCoreColor(type: 'session' | 'concept' | 'main', bridge: boolean): string {
   if (type === 'main') return C_MAIN
   if (type === 'session') return C_SESSION
   return bridge ? C_CONCEPT_BRIDGE : C_CONCEPT_LEAF
 }
 
-// rule-blue variants. Structural/cooccurrence edges use the flat base; the
-// sequential NEXT/CONTINUES spine is slightly brighter (stronger); loose
-// SESSION_MENTIONS_CONCEPT edges are translucent (dimmer) — and drawn dashed
-// in GraphView via linkLineDash.
-const RULE_BLUE = '#2F6F86'
-const RULE_BLUE_STRONG = '#4E90A8'
-const MENTIONS_DIM = 'rgba(47, 111, 134, 0.38)'
-// Cross-project "shared concept" bridge — brighter rule-blue so it reads across
-// the gap between two topic clusters (drawn dashed in GraphView).
-const CROSS_BLUE = '#5FB6D4'
+// Dense relationship edges stay quiet by default. Hover and AI evidence focus
+// replace their alpha in GraphView, so the relevant path becomes crisp on demand.
+const RULE_WOOD = 'rgba(165, 147, 120, 0.34)'
+const RULE_MOSS = 'rgba(102, 113, 91, 0.48)'
+const RULE_STRONG = '#7E7867'
+const MENTIONS_DIM = 'rgba(126, 120, 103, 0.18)'
+// Cross-project shared-concept bridge; drawn dashed in GraphView.
+const CROSS_MOSS = '#5F766B'
 
 /** Link stroke color by relation class. */
 export function linkColor(relClass: FRelClass): string {
   switch (relClass) {
     case 'cross':
-      return CROSS_BLUE
+      return CROSS_MOSS
     case 'mentions':
       return MENTIONS_DIM
     case 'next':
     case 'continues':
-      return RULE_BLUE_STRONG
+      return RULE_STRONG
     case 'cooccur':
+      return RULE_WOOD
     case 'expands':
+      return RULE_MOSS
     default:
-      return RULE_BLUE
+      return RULE_WOOD
   }
 }
