@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent, type WheelEvent } from 'react';
 import './App.css';
-import { requireSupabase, supabase } from './supabaseClient';
+import { supabase } from './supabaseClient';
 import type { Session } from '@supabase/supabase-js';
 
 type Project = {
@@ -64,6 +64,10 @@ type AuthUser = {
   email: string;
   name: string;
   role: string;
+};
+
+type BackendAuthResponse = {
+  user: AuthUser;
 };
 
 const PROJECTS_STORAGE_KEY = 'synapvox-projects';
@@ -881,6 +885,18 @@ function App() {
     closeAuthModal();
   };
 
+  const completeBackendAuth = (user: AuthUser) => {
+    setIsLoggedIn(true);
+    setCurrentUser(user);
+    switchProjectStorage(user.id);
+    setIsAdminOpen(false);
+    setIsProfileOpen(false);
+    setIsHelpOpen(false);
+    setActiveProjectIndex(null);
+    setIsAccountMenuOpen(false);
+    closeAuthModal();
+  };
+
   const completeAdminAuth = () => {
     const adminUser = {
       id: 'local-admin',
@@ -909,22 +925,38 @@ function App() {
     setAuthError(null);
     setAuthLoading(true);
     try {
-      const supabaseClient = requireSupabase();
-      if (authMode === 'signup') {
-        const { error } = await supabaseClient.auth.signUp({
-          email: authEmail,
-          password: authPassword,
-          options: { data: { name: authName } },
+      if (supabase === null) {
+        const endpoint = authMode === 'signup' ? '/api/auth/signup' : '/api/auth/login';
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(authMode === 'signup'
+            ? { name: authName, email: authEmail, password: authPassword }
+            : { identifier: authEmail, password: authPassword }),
         });
-        if (error) throw error;
+        if (!response.ok) {
+          const errorBody = await response.json().catch(() => null) as { detail?: string } | null;
+          throw new Error(errorBody?.detail ?? '인증에 실패했습니다.');
+        }
+        const authResult = await response.json() as BackendAuthResponse;
+        completeBackendAuth(authResult.user);
       } else {
-        const { error } = await supabaseClient.auth.signInWithPassword({
-          email: authEmail,
-          password: authPassword,
-        });
-        if (error) throw error;
+        if (authMode === 'signup') {
+          const { error } = await supabase.auth.signUp({
+            email: authEmail,
+            password: authPassword,
+            options: { data: { name: authName } },
+          });
+          if (error) throw error;
+        } else {
+          const { error } = await supabase.auth.signInWithPassword({
+            email: authEmail,
+            password: authPassword,
+          });
+          if (error) throw error;
+        }
+        completeAuth();
       }
-      completeAuth();
     } catch (error) {
       setAuthError(error instanceof Error ? error.message : '인증에 실패했습니다.');
     } finally {
