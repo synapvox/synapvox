@@ -68,11 +68,52 @@ type AuthUser = {
 
 type BackendAuthResponse = {
   user: AuthUser;
+  session?: {
+    token?: string;
+    expiresAt?: string;
+  };
 };
 
 const PROJECTS_STORAGE_KEY = 'synapvox-projects';
 const WORKSPACES_STORAGE_KEY = 'synapvox-project-workspaces';
+const BACKEND_AUTH_STORAGE_KEY = 'synapvox-backend-auth';
 const scopedStorageKey = (baseKey: string, userId: string | null) => `${baseKey}:${userId ?? 'guest'}`;
+
+const isAuthUser = (value: unknown): value is AuthUser => {
+  if (value === null || typeof value !== 'object') return false;
+  const candidate = value as Record<string, unknown>;
+  return typeof candidate.id === 'string'
+    && typeof candidate.email === 'string'
+    && typeof candidate.name === 'string'
+    && typeof candidate.role === 'string';
+};
+
+const loadStoredBackendAuth = (): BackendAuthResponse | null => {
+  try {
+    const raw = window.localStorage.getItem(BACKEND_AUTH_STORAGE_KEY);
+    if (raw === null) return null;
+    const parsed = JSON.parse(raw) as { user?: unknown; session?: BackendAuthResponse['session'] };
+    return isAuthUser(parsed.user) ? { user: parsed.user, session: parsed.session } : null;
+  } catch {
+    return null;
+  }
+};
+
+const storeBackendAuth = (authResult: BackendAuthResponse) => {
+  try {
+    window.localStorage.setItem(BACKEND_AUTH_STORAGE_KEY, JSON.stringify(authResult));
+  } catch (error) {
+    console.error('백엔드 로그인 세션 저장 실패:', error);
+  }
+};
+
+const clearBackendAuth = () => {
+  try {
+    window.localStorage.removeItem(BACKEND_AUTH_STORAGE_KEY);
+  } catch (error) {
+    console.error('백엔드 로그인 세션 삭제 실패:', error);
+  }
+};
 
 const authUserFromSession = (session: Session | null): AuthUser | null => {
   if (session === null) return null;
@@ -281,14 +322,19 @@ const mapIntermediateTranscript = (data: IntermediateTranscript): TranscriptSegm
 };
 
 function App() {
-  const [projects, setProjects] = useState<Project[]>(() => loadStoredProjects(null));
+  const initialBackendAuthRef = useRef<BackendAuthResponse | null>(
+    supabase === null ? loadStoredBackendAuth() : null,
+  );
+  const initialBackendUser = initialBackendAuthRef.current?.user ?? null;
+  const [projects, setProjects] = useState<Project[]>(() => loadStoredProjects(initialBackendUser?.id ?? null));
   const [sourceItems, setSourceItems] = useState(initialSourceItems);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [activeProjectIndex, setActiveProjectIndex] = useState<number | null>(null);
   const [isProfileOpen, setIsProfileOpen] = useState(false);
   const [isAdminOpen, setIsAdminOpen] = useState(false);
-  const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
-  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [currentUser, setCurrentUser] = useState<AuthUser | null>(initialBackendUser);
+  const [isLoggedIn, setIsLoggedIn] = useState(initialBackendUser !== null);
+  const [isAuthReady, setIsAuthReady] = useState(supabase === null);
   const [authEmail, setAuthEmail] = useState('');
   const [authPassword, setAuthPassword] = useState('');
   const [authName, setAuthName] = useState('');
@@ -513,8 +559,16 @@ function App() {
 
     const handlePopState = (event: PopStateEvent) => {
       const state = event.state as { view?: string; projectIndex?: number } | null;
+      const isAdmin = currentUser?.role === 'admin';
 
       if (state?.view === 'project' && typeof state.projectIndex === 'number') {
+        if (isAdmin) {
+          setIsAdminOpen(true);
+          setIsProfileOpen(false);
+          setIsHelpOpen(false);
+          setActiveProjectIndex(null);
+          return;
+        }
         setIsProfileOpen(false);
         setIsAdminOpen(false);
         setIsHelpOpen(false);
@@ -523,6 +577,13 @@ function App() {
       }
 
       if (state?.view === 'profile') {
+        if (isAdmin) {
+          setIsAdminOpen(true);
+          setIsProfileOpen(false);
+          setIsHelpOpen(false);
+          setActiveProjectIndex(null);
+          return;
+        }
         setIsProfileOpen(true);
         setIsAdminOpen(false);
         setIsHelpOpen(false);
@@ -538,6 +599,14 @@ function App() {
         return;
       }
 
+      if (isAdmin) {
+        setIsAdminOpen(true);
+        setIsProfileOpen(false);
+        setIsHelpOpen(false);
+        setActiveProjectIndex(null);
+        return;
+      }
+
       setIsProfileOpen(false);
       setIsAdminOpen(false);
       setIsHelpOpen(false);
@@ -546,7 +615,7 @@ function App() {
 
     window.addEventListener('popstate', handlePopState);
     return () => window.removeEventListener('popstate', handlePopState);
-  }, []);
+  }, [currentUser?.role]);
 
   useEffect(() => {
     if (
@@ -620,7 +689,7 @@ function App() {
   const transcriptsRef = useRef(transcriptsBySourceId);
   transcriptsRef.current = transcriptsBySourceId;
   const projectWorkspacesRef = useRef<Record<string, ProjectWorkspace>>(
-    loadStoredWorkspaces(null),
+    loadStoredWorkspaces(initialBackendUser?.id ?? null),
   );
   const prevProjectIdRef = useRef<string | null>(null);
 
@@ -655,16 +724,28 @@ function App() {
 
   useEffect(() => {
     if (supabase === null) {
-      switchProjectStorage(null);
+      const storedAuth = loadStoredBackendAuth();
+      if (storedAuth !== null) {
+        setIsLoggedIn(true);
+        setCurrentUser(storedAuth.user);
+        switchProjectStorage(storedAuth.user.id);
+      } else {
+        setIsLoggedIn(false);
+        setCurrentUser(null);
+        switchProjectStorage(null);
+      }
+      setIsAuthReady(true);
       return undefined;
     }
 
     const syncSession = (session: Session | null) => {
       const user = authUserFromSession(session);
+      clearBackendAuth();
       setIsLoggedIn(user !== null);
       setCurrentUser(user);
       setIsAdminOpen(false);
       switchProjectStorage(user?.id ?? null);
+      setIsAuthReady(true);
     };
 
     supabase.auth.getSession().then(({ data }) => {
@@ -815,6 +896,10 @@ function App() {
       setAuthMode('login');
       return;
     }
+    if (currentUser?.role === 'admin') {
+      openAdminHome();
+      return;
+    }
     setIsProfileOpen(false);
     setIsAdminOpen(false);
     setIsHelpOpen(false);
@@ -849,7 +934,19 @@ function App() {
     window.history.pushState({ view: 'admin' }, '', window.location.pathname);
   };
 
+  const openHome = () => {
+    if (currentUser?.role === 'admin') {
+      openAdminHome();
+      return;
+    }
+    openProjectHome();
+  };
+
   const openProfile = () => {
+    if (currentUser?.role === 'admin') {
+      openAdminHome();
+      return;
+    }
     setIsProfileOpen(true);
     setIsAdminOpen(false);
     setIsHelpOpen(false);
@@ -861,6 +958,7 @@ function App() {
 
   const logout = () => {
     void supabase?.auth.signOut();
+    clearBackendAuth();
     setIsLoggedIn(false);
     setCurrentUser(null);
     switchProjectStorage(null);
@@ -885,7 +983,9 @@ function App() {
     closeAuthModal();
   };
 
-  const completeBackendAuth = (user: AuthUser) => {
+  const completeBackendAuth = (authResult: BackendAuthResponse) => {
+    storeBackendAuth(authResult);
+    const { user } = authResult;
     setIsLoggedIn(true);
     setCurrentUser(user);
     switchProjectStorage(user.id);
@@ -898,6 +998,7 @@ function App() {
   };
 
   const completeAdminAuth = () => {
+    clearBackendAuth();
     const adminUser = {
       id: 'local-admin',
       email: 'admin@synapvox.local',
@@ -939,7 +1040,7 @@ function App() {
           throw new Error(errorBody?.detail ?? '인증에 실패했습니다.');
         }
         const authResult = await response.json() as BackendAuthResponse;
-        completeBackendAuth(authResult.user);
+        completeBackendAuth(authResult);
       } else {
         if (authMode === 'signup') {
           const { error } = await supabase.auth.signUp({
@@ -969,6 +1070,10 @@ function App() {
       setAuthMode('login');
       return;
     }
+    if (currentUser?.role === 'admin') {
+      openAdminHome();
+      return;
+    }
     setProjectDraft({
       name: createDefaultProjectName(projects),
       description: '',
@@ -979,6 +1084,10 @@ function App() {
   const createProject = () => {
     if (!isLoggedIn) {
       setAuthMode('login');
+      return;
+    }
+    if (currentUser?.role === 'admin') {
+      openAdminHome();
       return;
     }
     const name = projectDraft.name.trim() || '새 프로젝트';
@@ -1544,7 +1653,7 @@ function App() {
         <div className="sidebar-top">
           <div className="brand">
             <div className="sidebar-content">
-              <button className="brand-home" type="button" onClick={openProjectHome}>
+              <button className="brand-home" type="button" onClick={openHome}>
                 SynapVox
               </button>
             </div>
@@ -1624,7 +1733,9 @@ function App() {
 
               {isAccountMenuOpen && (
                 <div className="account-menu">
-                  <button type="button" onClick={openProfile}>내 정보 보기</button>
+                  {currentUser?.role !== 'admin' && (
+                    <button type="button" onClick={openProfile}>내 정보 보기</button>
+                  )}
                   <button className="danger" type="button" onClick={logout}>로그아웃</button>
                 </div>
               )}
@@ -1642,7 +1753,7 @@ function App() {
       <main className="workspace">
         {!isProjectWorkspace && (
           <header className="app-topbar">
-            <button className="topbar-brand" type="button" onClick={openProjectHome}>
+            <button className="topbar-brand" type="button" onClick={openHome}>
               Synap<span>Vox</span>
             </button>
 
@@ -1707,7 +1818,9 @@ function App() {
                   </button>
                   {isAccountMenuOpen && (
                     <div className="account-menu">
-                      <button type="button" onClick={openProfile}>내 정보 보기</button>
+                      {currentUser?.role !== 'admin' && (
+                        <button type="button" onClick={openProfile}>내 정보 보기</button>
+                      )}
                       <button className="danger" type="button" onClick={logout}>로그아웃</button>
                     </div>
                   )}
@@ -2102,6 +2215,13 @@ function App() {
               </article>
             </section>
           </>
+        ) : !isAuthReady ? (
+          <section className="signed-out-home" aria-label="loading account">
+            <div className="signed-out-copy">
+              <p className="eyebrow">SynapVox</p>
+              <h1>계정 상태를 확인하고 있어요.</h1>
+            </div>
+          </section>
         ) : !isLoggedIn ? (
           <section className="signed-out-home" aria-label="login required">
             <div className="signed-out-copy">
