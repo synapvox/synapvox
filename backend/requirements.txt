@@ -8,3 +8,4 @@ pypdf
 pdfplumber
 pymupdf
 python-pptx
+pyjwt[crypto]
