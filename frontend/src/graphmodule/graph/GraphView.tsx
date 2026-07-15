@@ -28,10 +28,13 @@ import { projectLabel } from './projectMeta'
 import { computeCrossLinks } from './crossLinks'
 import { makeMainRepel } from './mainRepel'
 
-const CROSS_BLUE = '#6D735D' // shared-concept bridge ring (matches render.ts)
+const CROSS_MOSS = '#5F766B' // shared-concept bridge ring (matches render.ts)
 
 const CANVAS_BG = '#FFFAF0' // literal hex — canvas ctx can't read a CSS var
 const LABEL_INK = '#322B22'
+const NODE_PAPER = '#FFFDF7'
+const SESSION_FILL = '#F1E5D3'
+const BRIDGE_FILL = '#E4E9DE'
 // Canvas ctx can't resolve `var(--font-ui)`; use the literal Atkinson stack.
 const LABEL_FONT = "'Atkinson Hyperlegible', system-ui, sans-serif"
 const COLD_START_MS = 6000 // Render free tier can cold-start ~50s; reassure after this
@@ -55,7 +58,36 @@ function withAlpha(color: string, alpha: number): string {
     const [r, g, b] = m[1].split(',').map((s) => parseFloat(s.trim()))
     return `rgba(${r}, ${g}, ${b}, ${alpha})`
   }
-  return `rgba(216, 255, 106, ${alpha})` // fallback = node-core lime
+  return `rgba(126, 120, 103, ${alpha})`
+}
+
+function compactLabel(label: string, max: number): string {
+  return label.length > max ? `${label.slice(0, max - 1)}…` : label
+}
+
+function roundedSquare(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  size: number,
+  radius: number,
+): void {
+  const left = x - size / 2
+  const top = y - size / 2
+  const right = left + size
+  const bottom = top + size
+  const r = Math.min(radius, size / 2)
+  ctx.beginPath()
+  ctx.moveTo(left + r, top)
+  ctx.lineTo(right - r, top)
+  ctx.quadraticCurveTo(right, top, right, top + r)
+  ctx.lineTo(right, bottom - r)
+  ctx.quadraticCurveTo(right, bottom, right - r, bottom)
+  ctx.lineTo(left + r, bottom)
+  ctx.quadraticCurveTo(left, bottom, left, bottom - r)
+  ctx.lineTo(left, top + r)
+  ctx.quadraticCurveTo(left, top, left + r, top)
+  ctx.closePath()
 }
 
 type GraphData = { nodes: FNode[]; links: FLink[] }
@@ -388,39 +420,54 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
       }
 
       const isMain = node.type === 'main'
+      const isSession = node.type === 'session'
+      const isFocused = node.id === hoverId || node.id === selectedIdRef.current || inAsk
       ctx.save()
       ctx.globalAlpha = nodeAlpha
-      ctx.beginPath()
-      ctx.arc(x, y, r, 0, 2 * Math.PI)
       if (isMain) {
-        // Main hub (e.g. 딥러닝): FILLED + strong glow — the topic center.
-        ctx.shadowBlur = 22 * (nodeAlpha < 0.5 ? 0.3 : 1)
-        ctx.shadowColor = color
+        // Project hub: restrained dark anchor with a paper keyline.
+        ctx.beginPath()
+        ctx.arc(x, y, r, 0, 2 * Math.PI)
         ctx.fillStyle = color
         ctx.fill()
+        ctx.lineWidth = 2 / globalScale
+        ctx.strokeStyle = NODE_PAPER
+        ctx.stroke()
+      } else if (isSession) {
+        // Lecture/recording session: a soft filled tile, distinct from concepts.
+        const size = r * 1.72
+        roundedSquare(ctx, x, y, size, 3.2 / globalScale)
+        ctx.fillStyle = SESSION_FILL
+        ctx.fill()
+        ctx.lineWidth = (isFocused ? 2 : 1.35) / globalScale
+        ctx.strokeStyle = color
+        ctx.stroke()
       } else {
-        // Sub-nodes (sessions + concepts): HOLLOW — outline ring only, no fill.
-        ctx.shadowBlur = Math.min(4 + degree, 14) * (nodeAlpha < 0.5 ? 0.3 : 1)
-        ctx.shadowColor = color
-        ctx.lineWidth = 1.6 / globalScale
+        // Concepts stay circular; bridge concepts get a quiet moss fill.
+        ctx.beginPath()
+        ctx.arc(x, y, r, 0, 2 * Math.PI)
+        ctx.fillStyle = node.bridge ? BRIDGE_FILL : NODE_PAPER
+        ctx.fill()
+        ctx.lineWidth = (isFocused ? 2 : node.bridge ? 1.6 : 1.25) / globalScale
         ctx.strokeStyle = color
         ctx.stroke()
       }
-      // Evidence marker: a rule-blue ring around RAG-cited concepts.
+      // Evidence marker: a clean moss ring around RAG-cited nodes.
       if (inAsk) {
         ctx.globalAlpha = 1
-        ctx.lineWidth = 1.5 / globalScale
-        ctx.strokeStyle = '#6D735D'
+        ctx.lineWidth = 1.8 / globalScale
+        ctx.strokeStyle = '#66715B'
         ctx.beginPath()
-        ctx.arc(x, y, r + 3 / globalScale, 0, 2 * Math.PI)
+        ctx.arc(x, y, r + 3.5 / globalScale, 0, 2 * Math.PI)
         ctx.stroke()
       }
-      // 교차연결 marker: a bright rule-blue ring on concepts shared across projects
+      // 교차연결 marker: a dotted moss ring on concepts shared across projects
       // (the "연결점" between two topics). Dims with the node on hover/ask.
       if (!inAsk && crossIdsRef.current?.has(node.id)) {
         ctx.globalAlpha = nodeAlpha
-        ctx.lineWidth = 1.6 / globalScale
-        ctx.strokeStyle = CROSS_BLUE
+        ctx.lineWidth = 1.4 / globalScale
+        ctx.strokeStyle = CROSS_MOSS
+        ctx.setLineDash([2.5 / globalScale, 2.5 / globalScale])
         ctx.beginPath()
         ctx.arc(x, y, r + 3 / globalScale, 0, 2 * Math.PI)
         ctx.stroke()
@@ -429,29 +476,30 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
 
       // LOD labels: Task 8. Opacity only — the label position never changes, so
       // fading it in/out never shifts layout.
-      const isFocused = node.id === hoverId || node.id === selectedIdRef.current || inAsk
-      // Main hub label always on; session labels only when hovered/selected;
-      // concept labels ramp by zoom.
+      // Main hub is always named. Session names appear at a useful zoom level;
+      // concept labels still ramp by zoom to avoid a wall of text.
       const lodAlpha = isMain
         ? 1
         : node.type === 'session'
-          ? isFocused
+          ? isFocused || globalScale >= 0.78
             ? 1
             : 0
           : labelOpacity(globalScale, degree, maxDegreeRef.current, isFocused)
       // Backgrounded nodes' labels dim with them (so only the focus set reads).
       const labelAlpha = lodAlpha * (hovering || asking ? nodeAlpha : 1)
       if (labelAlpha > 0.02) {
-        const fontSize = (isMain ? 15 : 12) / globalScale // main label bigger; constant on-screen
+        const fontSize = (isMain ? 14 : isSession ? 11.5 : 11) / globalScale
+        const maxChars = isMain ? 28 : isSession ? 22 : 18
+        const label = isFocused ? node.label : compactLabel(node.label, maxChars)
         ctx.save()
         ctx.globalAlpha = labelAlpha
-        ctx.font = `${fontSize}px ${LABEL_FONT}`
+        ctx.font = `${isMain || isSession ? 650 : 520} ${fontSize}px ${LABEL_FONT}`
         ctx.textAlign = 'center'
         ctx.textBaseline = 'top'
-        ctx.shadowColor = 'rgba(255, 250, 240, 0.92)'
-        ctx.shadowBlur = 4
+        ctx.shadowColor = 'rgba(255, 253, 247, 0.98)'
+        ctx.shadowBlur = 3
         ctx.fillStyle = LABEL_INK
-        ctx.fillText(node.label, x, y + r + 2 / globalScale)
+        ctx.fillText(label, x, y + r + 3 / globalScale)
         ctx.restore()
       }
     },
@@ -520,12 +568,12 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
   const linkColorAccessor = useCallback((l: LinkObject<FNode, FLink>) => {
     const base = linkColor(l.relClass)
     if (hoverIdRef.current !== null) {
-      return highlightLinksRef.current.has(l as unknown as FLink) ? withAlpha(base, 0.8) : withAlpha(base, 0.05)
+      return highlightLinksRef.current.has(l as unknown as FLink) ? withAlpha(base, 0.82) : withAlpha(base, 0.045)
     }
     const askIds = askIdsRef.current
     if (askIds && askIds.size) {
       // Evidence subgraph: edges between two cited concepts stay bright, rest fade.
-      return askIds.has(endpointId(l.source)) && askIds.has(endpointId(l.target)) ? withAlpha(base, 0.85) : withAlpha(base, 0.05)
+      return askIds.has(endpointId(l.source)) && askIds.has(endpointId(l.target)) ? withAlpha(base, 0.88) : withAlpha(base, 0.045)
     }
     return base
   }, [])
@@ -605,15 +653,15 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
           linkColor={linkColorAccessor}
           linkWidth={(l: LinkObject<FNode, FLink>) =>
             l.relClass === 'cross'
-              ? 1.4
+              ? 1.15
               : l.relClass === 'next' || l.relClass === 'continues'
-                ? 1.6
+                ? 1.2
                 : l.relClass === 'mentions'
-                  ? 0.6
-                  : 1
+                  ? 0.45
+                  : 0.85
           }
           linkLineDash={(l: LinkObject<FNode, FLink>) =>
-            l.relClass === 'cross' ? [6, 4] : l.relClass === 'mentions' ? [4, 3] : null
+            l.relClass === 'cross' ? [5, 4] : null
           }
           onNodeHover={handleNodeHover}
           onNodeClick={handleNodeClick}
@@ -658,7 +706,7 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
           <>
             <div style={tooltipLabel}>{hover.label}</div>
             <div style={tooltipMeta}>
-              {hover.type === 'session' ? '세션' : '개념'} · 연결 {hover.degree}
+              {hover.type === 'main' ? '프로젝트' : hover.type === 'session' ? '녹음본' : hover.bridge ? '핵심 개념' : '개념'} · 연결 {hover.degree}
             </div>
           </>
         )}

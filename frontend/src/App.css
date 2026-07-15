@@ -1535,8 +1535,15 @@ button {
 
 .signed-out-actions .auth-submit,
 .signed-out-actions .ghost-button {
-  width: auto;
+  width: 116px;
   min-width: 116px;
+  height: 44px;
+  margin-top: 0;
+  padding: 0 18px;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .signed-out-preview {
