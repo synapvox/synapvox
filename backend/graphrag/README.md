@@ -40,3 +40,22 @@ Graph/Vector DB 스키마 — 노드/엣지 정의. → [`schemas/graph_vector_d
 **레퍼런스**: 팀 스키마와 별개로, 동일 아이디어(세션 간 개념 연결 + GraphRAG)를 end-to-end로 돌려본
 단독 프로토타입 — https://github.com/click6067-ship-it/synapVOX (커스텀판 + Graphiti판). 하이브리드 검색·Neo4j
 적재·시각화·RAG 답변을 실제로 확인해볼 수 있습니다. 가져다 참고용.
+
+---
+
+## `vector_store_supabase.py` — pgvector 구현 추가 (팀 논의: 공통 벡터 스토어로 사용, 리뷰 필요)
+
+`vector_store.py`(Chroma)와 동일한 공개 인터페이스(`add_chunks`/`query`/`reset`, `embed_fn` 주입식)의
+drop-in 대체. Supabase Postgres + pgvector로 구현 — `schemas/graph_vector_db.md`가 애매하게 both
+취급하던 "pgvector(또는 Chroma)" 중 pgvector 경로를 실제로 검증한 결과물.
+
+- 연결: `SUPABASE_DB_URL` 환경변수(Postgres 연결문자열). **Session Pooler 문자열 사용 권장** —
+  Direct connection 호스트(`db.<ref>.supabase.co`)는 IPv6 전용이라 IPv6 미지원 네트워크에서
+  `could not translate host name` 에러로 연결 실패함. 대시보드 Connect → Session pooler에서 복사.
+- 테이블: `chunks`(자동 생성, `CREATE EXTENSION IF NOT EXISTS vector` 포함) — `chunk_id` PK로 upsert.
+- 검증: `backend/graphrag/tests/test_vector_store_supabase.py` 3건 — 실제 Supabase 프로젝트에 대해
+  round-trip 확인(관련 청크가 코사인 거리 기준 상위로 랭크됨, project_id 격리, upsert 덮어쓰기). `SUPABASE_DB_URL`
+  미설정 시 자동 skip(Neo4j 테스트와 동일 패턴).
+
+**아직 안 한 것 — PR 리뷰에서 정할 부분**: `__init__.py`의 기본 export는 여전히 Chroma판이다. 이걸
+Supabase판으로 바꿀지, 당분간 병행할지는 스키마 소유자(용하) 확인 필요 — 여기서 임의로 바꾸지 않았다.
