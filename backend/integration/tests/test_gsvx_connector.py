@@ -122,19 +122,22 @@ def test_split_for_ingest_force_splits_oversized_single_line_with_overlap():
 
 
 class _RecordingClient(GsvxClient):
-    """ingest_text만 가로채 gsvx 응답 형태를 흉내 낸다 — 네트워크 없음."""
+    """ingest_texts만 가로채 Graphiti 벌크 응답 형태를 흉내 낸다."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.calls = []
 
-    def ingest_text(self, text, title, project=None, name=None):
-        self.calls.append({"text": text, "title": title, "project": project})
+    def ingest_texts(self, texts, title, project=None, name=None):
+        for i, text in enumerate(texts):
+            chunk_title = title if len(texts) == 1 else f"{title} ({i + 1}/{len(texts)})"
+            self.calls.append({"text": text, "title": chunk_title, "project": project})
         return {
             "session_key": title,
+            "session_keys": [call["title"] for call in self.calls],
             "stats": {"segments": 1, "mentions": 3,
                       "concepts_total": 10 + len(self.calls),
-                      "concepts_new": 2, "relations_new": 1},
+                      "concepts_new": 2 * len(texts), "relations_new": len(texts)},
             "pipeline": [],
         }
 
@@ -156,14 +159,24 @@ def test_ingest_transcript_explicit_project_overrides_intermediate():
     assert client.calls[0]["project"] == "P-BIO"
 
 
-def test_long_transcript_is_split_into_numbered_sessions():
+def test_long_transcript_is_split_into_numbered_sessions(monkeypatch):
+    monkeypatch.setenv("GRAPHITI_CHUNK_CHARS", "60")
     client = _RecordingClient()
-    client.text_limit = 60
     result = client.ingest_transcript(_intermediate(["긴 발화입니다 " * 3] * 4))
 
     assert result["chunks_ingested"] == len(client.calls) > 1
     assert client.calls[0]["title"].endswith(f"(1/{len(client.calls)})")
     assert result["concepts_new"] == 2 * len(client.calls)
+
+
+def test_transcript_is_ingested_as_one_episode_by_default():
+    client = _RecordingClient()
+    result = client.ingest_transcript(_intermediate(["가" * 500, "나" * 500]))
+
+    assert result["chunks_ingested"] == 1
+    assert len(client.calls) == 1
+    assert "가" * 500 in client.calls[0]["text"]
+    assert "나" * 500 in client.calls[0]["text"]
 
 
 def test_ingest_document_text_rejects_empty():
@@ -192,9 +205,9 @@ def test_ingest_text_maps_gsvx_error_detail(monkeypatch):
         def json():
             return {"detail": "텍스트가 너무 깁니다"}
 
-    monkeypatch.setattr(gsvx_connector.requests, "post", lambda *a, **k: _FakeResponse())
+    monkeypatch.setattr(gsvx_connector.requests, "request", lambda *a, **k: _FakeResponse())
     with pytest.raises(GsvxError) as exc_info:
-        GsvxClient().ingest_text("본문", "제목")
+        GsvxClient().ingest_text("본문", "제목", "P01")
     assert exc_info.value.status_code == 413
     assert "너무 깁니다" in exc_info.value.detail
 
@@ -203,7 +216,46 @@ def test_ingest_text_wraps_connection_failure(monkeypatch):
     def _boom(*args, **kwargs):
         raise gsvx_connector.requests.ConnectionError("refused")
 
-    monkeypatch.setattr(gsvx_connector.requests, "post", _boom)
+    monkeypatch.setattr(gsvx_connector.requests, "request", _boom)
     with pytest.raises(GsvxError) as exc_info:
-        GsvxClient().ingest_text("본문", "제목")
+        GsvxClient().ingest_text("본문", "제목", "P01")
     assert exc_info.value.status_code is None
+
+
+def test_ingest_ask_and_reset_use_official_graphiti_contract(monkeypatch):
+    calls = []
+
+    class _FakeResponse:
+        status_code = 200
+
+        def __init__(self, body):
+            self.body = body
+
+        def json(self):
+            return self.body
+
+    def fake_request(method, url, **kwargs):
+        calls.append((method, url, kwargs.get("params"), kwargs.get("json")))
+        if url.endswith("/search"):
+            return _FakeResponse({"facts": []})
+        return _FakeResponse({"success": True})
+
+    monkeypatch.setattr(gsvx_connector.requests, "request", fake_request)
+    client = GsvxClient(base_url="https://graphiti.example")
+    monkeypatch.setattr(client, "_graph_counts", lambda project: {"concepts": 0, "relations": 0})
+    monkeypatch.setattr(client, "_expansion_for_facts", lambda project, facts: {"nodes": [], "edges": []})
+    monkeypatch.setattr(client, "_answer_from_facts", lambda question, facts: "근거 없음")
+    client.ingest_text("강의 내용", "1주차", "project-uuid")
+    client.ask("project-uuid", "미분이 뭐야", 6)
+    client.reset("project-uuid")
+
+    assert calls[0][0:2] == ("POST", "https://graphiti.example/messages")
+    assert calls[0][3]["group_id"] == "project-uuid"
+    assert calls[0][3]["messages"][0]["content"] == "강의 내용"
+    assert calls[1] == (
+        "POST", "https://graphiti.example/search", None,
+        {"group_ids": ["project-uuid"], "query": "미분이 뭐야", "max_facts": 6},
+    )
+    assert calls[2] == (
+        "DELETE", "https://graphiti.example/group/project-uuid", None, None,
+    )

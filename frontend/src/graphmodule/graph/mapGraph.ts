@@ -24,6 +24,7 @@ export type GraphLink = {
 
 const REL_CLASS: Record<string, RelClass> = {
   SESSION_MENTIONS_CONCEPT: 'mentions',
+  CONCEPT_RELATES_TO: 'expands',
   CONCEPT_CO_OCCURS_WITH: 'cooccur',
   NEXT_SESSION: 'next',
   CONTINUES: 'continues',

@@ -13,7 +13,8 @@
 type Pos = { x: number; y: number };
 type PosMap = Record<string, Pos>;
 
-const keyFor = (project: string): string => `svx.pos.${project}`;
+// Layout v3 starts from the compact semantic-force configuration.
+const keyFor = (project: string): string => `svx.pos.v3.${project}`;
 
 function getStorage(): Storage | null {
   try {

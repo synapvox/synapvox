@@ -8,6 +8,11 @@ from openai import OpenAI
 from backend.graphrag import VectorStore
 
 _MAX_RETRIES = 2
+DEFAULT_REFINEMENT_MODEL = "gpt-5-mini"
+
+
+def refinement_model() -> str:
+    return os.getenv("STT_REFINEMENT_MODEL") or DEFAULT_REFINEMENT_MODEL
 
 
 def _chunk_text(text: str, chunk_size: int = 300) -> list:
@@ -112,11 +117,12 @@ def refine_transcript(
     data: dict,
     material_text: str = None,
     past_meeting_texts: list = None,
-    model: str = "gpt-4o",
+    model: str = None,
 ) -> dict:
     """Apply stage-2 refinement to a 중간 포맷 JSON object (source/mode/segments shape).
     Returns the same shape with segments[].text replaced by the corrected version."""
     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    model = model or refinement_model()
     prompt = build_refinement_prompt(data["segments"], material_text, past_meeting_texts)
     expected_ids = {s["id"] for s in data["segments"]}
 
@@ -125,11 +131,14 @@ def refine_transcript(
     last_error = None
 
     for _ in range(_MAX_RETRIES + 1):
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            response_format={"type": "json_object"},
-        )
+        request = {
+            "model": model,
+            "messages": messages,
+            "response_format": {"type": "json_object"},
+        }
+        if model.startswith("gpt-5"):
+            request["reasoning_effort"] = "minimal"
+        response = client.chat.completions.create(**request)
         content = response.choices[0].message.content
         try:
             corrections = _parse_llm_output(content, expected_ids)
@@ -158,7 +167,7 @@ def main():
         default=[],
         help="Path to a past meeting's transcript text (same project). Repeatable.",
     )
-    parser.add_argument("--model", default="gpt-4o")
+    parser.add_argument("--model", default=refinement_model())
     parser.add_argument("--top-k", type=int, default=5, help="Number of retrieved chunks to keep (default: 5)")
     parser.add_argument(
         "--no-retrieval",

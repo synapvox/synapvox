@@ -33,7 +33,7 @@
 | `keyword_prompt.py` | 키워드 3요소 스코어링(자료 내 빈도 + 과거 빈도·최근성 + 일반 사전 대비 특이도) → STT 프롬프트 |
 | `stt_clova.py` | **ADR-005 정합 경로** — CLOVA Speech 관리형 API, 전사+화자분리 한 번의 호출로 완료 |
 | `stt_normalizer.py` | `wrap_segments()`(CLOVA 등 이미 화자분리된 소스 → 중간 포맷)/`validate()`. **`merge()`는 아래 로컬 검증 전용 도구**(같은 파일에 있지만 용도가 다름) |
-| `refine_transcript.py` | Stage 2: OpenAI(gpt-4o) 기반 RAG 정제. `retrieve_relevant_context()`는 청킹 후 `backend.graphrag.VectorStore`(pgvector, 2026-07-15부터 실제 통합 — 아래 알려진 제약 참고)에 저장/조회 |
+| `refine_transcript.py` | Stage 2: OpenAI(`gpt-5-mini`, `STT_REFINEMENT_MODEL`로 변경 가능) 기반 RAG 정제. `retrieve_relevant_context()`는 청킹 후 `backend.graphrag.VectorStore`(pgvector, 2026-07-15부터 실제 통합 — 아래 알려진 제약 참고)에 저장/조회 |
 | `wer.py` | WER 계산(Levenshtein 기반 단어 단위) — Step 0 품질 검증용 |
 
 ### 로컬 검증 전용 (ADR-005의 의도적·임시 예외 — `synapvox_Local`에서 계속 실험, 운영 미사용)

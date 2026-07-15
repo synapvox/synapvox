@@ -305,8 +305,9 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
       }
       // d3Force returns a callable ForceFn (index-signature typed) — cast via
       // unknown to the d3 force accessors we actually call.
-      // Hub→session links sit a bit longer so sessions orbit the main; concept
-      // links stay tight.
+      // Concept relationships shape the knowledge map. Mention links remain
+      // visible for provenance, but must not pull every concept into a star
+      // around its recording node.
       const link = fg.d3Force('link') as unknown as {
         distance?: (fn: (l: { source: FNode | string; target: FNode | string; relClass?: string }) => number) => unknown
         strength?: (fn: (l: { source: FNode | string; target: FNode | string; relClass?: string }) => number) => unknown
@@ -314,12 +315,25 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
       link?.distance?.((l) => {
         const s = typeof l.source === 'object' ? l.source.type : undefined
         const t = typeof l.target === 'object' ? l.target.type : undefined
-        return s === 'main' || t === 'main' ? 110 : 55
+        if (s === 'main' || t === 'main') return 68
+        if (l.relClass === 'mentions') return 46
+        return 38
+      })
+      link?.strength?.((l) => {
+        const s = typeof l.source === 'object' ? l.source.type : undefined
+        const t = typeof l.target === 'object' ? l.target.type : undefined
+        if (s === 'main' || t === 'main') return 0.1
+        if (l.relClass === 'mentions') return 0.055
+        return 0.22
       })
       const charge = fg.d3Force('charge') as unknown as { strength?: (fn: (n: FNode) => number) => unknown } | undefined
-      charge?.strength?.((n: FNode) => (n.type === 'main' ? -420 : -30 - (n.degree ?? 0) * 8))
+      charge?.strength?.((n: FNode) => {
+        if (n.type === 'main') return -150
+        if (n.type === 'session') return -65
+        return -18 - Math.min(n.degree ?? 0, 8) * 4
+      })
       const center = fg.d3Force('center') as unknown as { strength?: (s: number) => unknown } | undefined
-      center?.strength?.(0.04)
+      center?.strength?.(0.08)
       // Re-apply forces to the running sim (calm reheat — settles ~1.5–2s).
       fg.d3ReheatSimulation()
       // Dev-only test hook: exposes the graph instance + live node data so the
@@ -577,10 +591,10 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
           linkColor={linkColorAccessor}
           linkWidth={(l: LinkObject<FNode, FLink>) =>
             l.relClass === 'next' || l.relClass === 'continues'
-                ? 1.2
+                ? 0.9
                 : l.relClass === 'mentions'
-                  ? 0.45
-                  : 0.85
+                  ? 0.28
+                  : 0.6
           }
           onNodeHover={handleNodeHover}
           onNodeClick={handleNodeClick}

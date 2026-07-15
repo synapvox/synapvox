@@ -1,37 +1,9 @@
-"""gsvx_connector — STT 산출물·회의자료를 gsvx(Graphiti) 그래프 엔진에 넘기는 커넥터.
+"""SynapVox STT/material adapter for the self-hosted official Graphiti service.
 
-■ 연결하는 두 계약
-1) 입력: STT 중간포맷 (stt 소유, schemas/intermediate_format.schema.json)
-     {source, meeting_id, project_id, date, mode,
-      segments: [{id, speaker, start, end, text}, ...]}
-   backend/stt/stt_normalizer.py의 merge()/wrap_segments()가 생성하고,
-   /api/stt/transcribe 응답으로 프론트에도 그대로 내려간다.
-
-2) 출력: gsvx(Graphiti) 엔진 (click6067-ship-it/synapVOX, gsvx/api.py)
-   텍스트가 그래프로 들어가는 유일한 입구는 POST /ingest-text 하나다:
-     헤더  X-API-Key: <키>               (key_map 멤버십 인증)
-     바디  {"text": str,                 (필수, 최대 50,000자 — _MAX_TEXT_CHARS)
-            "title": str,                (에피소드/세션 이름)
-            "project": str,              (Graphiti group_id 네임스페이스, ASCII 슬러그)
-            "name": str}                 (사람이 읽는 프로젝트 표시 이름, 선택)
-   응답: {"session_key", "stats": {"segments", "mentions", "concepts_total",
-          "concepts_new", "relations_new"}, "pipeline": [...]}
-   이후는 gsvx 내부에서 Graphiti add_episode → OpenAI 개념·관계 추출 → Neo4j 적재.
-
-■ 이 모듈이 하는 일 (둘 사이의 변환)
-- 중간포맷 segments 배열 → "화자: 발화" 줄들을 이어붙인 평문 한 덩어리
-  (화자·발화 순서 보존, start/end 타임스탬프는 gsvx가 받지 않으므로 버린다)
-- 회의자료(pdf/pptx/docx/md/txt) → pipeline.extract_text로 평문 추출
-- 50,000자 상한 초과분은 줄 경계로 분할해 "제목 (i/n)" 세션 여러 개로 나눠 넣는다
-- project_id → gsvx project(group_id) 네임스페이스로 전달
-- gsvx에는 meeting_id 필드가 없어서, 자료를 특정 회의(음성 파일)에 스코프하려면 제목에
-  붙인다(document_title) — 전사문은 이미 transcript_title이 항상 meeting_id를 붙임
-
-사용 예:
-    from backend.integration.gsvx_connector import GsvxClient
-    client = GsvxClient()                       # GSVX_BASE_URL/GSVX_API_KEY 환경변수 사용
-    client.ingest_transcript(intermediate_json) # STT 결과 → 그래프
-    client.ingest_document("slides.pptx")       # 회의자료 → 그래프
+STT intermediate JSON and document text are converted into Graphiti episodes.
+Graphiti owns extraction, temporal fact search, and Neo4j persistence. This
+adapter preserves the existing frontend contracts for graph data, details, and
+grounded AI answers while scoping every operation by the project group_id.
 """
 
 from __future__ import annotations
@@ -39,7 +11,9 @@ from __future__ import annotations
 import os
 import sys
 import types
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 import requests
 
@@ -54,7 +28,7 @@ _backend_pkg.__path__ = [str(REPO_ROOT / "backend")]
 _stt_pkg = sys.modules.setdefault("backend.stt", types.ModuleType("backend.stt"))
 _stt_pkg.__path__ = [str(REPO_ROOT / "backend" / "stt")]
 
-from backend.integration.pipeline import extract_text  # noqa: E402
+from backend.integration.pipeline import chunk_document, chunk_transcript, extract_text  # noqa: E402
 from backend.stt.stt_normalizer import validate  # noqa: E402
 
 # gsvx /ingest-text 본문 상한은 50,000자(_MAX_TEXT_CHARS, 초과 시 413) — 여유를 두고 자른다.
@@ -65,7 +39,9 @@ GSVX_TEXT_LIMIT = 48_000
 SPLIT_OVERLAP = 1_000
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8020"
-DEFAULT_API_KEY = "demo-bio"  # gsvx 공개 데모 키 (프론트 .env.example과 동일)
+DEFAULT_API_KEY = ""
+DEFAULT_ANSWER_MODEL = "gpt-4o-mini"
+DEFAULT_GRAPHITI_CHUNK_CHARS = 48_000
 
 
 # ── 변환: STT 중간포맷 → gsvx 입력 텍스트 ────────────────
@@ -157,26 +133,265 @@ class GsvxClient:
         self.timeout = timeout
         self.text_limit = GSVX_TEXT_LIMIT
 
-    def ingest_text(self, text: str, title: str, project: str | None = None,
-                    name: str | None = None) -> dict:
-        """gsvx POST /ingest-text 1회 호출 — 계약은 모듈 docstring 참조."""
-        body: dict = {"text": text, "title": title}
-        if project:
-            body["project"] = project
-        if name:
-            body["name"] = name
+    def _request(self, method: str, path: str, *, params: dict | None = None,
+                 body: dict | None = None) -> dict:
+        """Call the Graphiti service and normalize transport/API failures."""
         try:
-            resp = requests.post(f"{self.base_url}/ingest-text", json=body,
-                                 headers={"X-API-Key": self.api_key}, timeout=self.timeout)
+            headers = {"X-API-Key": self.api_key} if self.api_key else {}
+            resp = requests.request(
+                method,
+                f"{self.base_url}{path}",
+                params=params,
+                json=body,
+                headers=headers,
+                timeout=self.timeout,
+            )
         except requests.RequestException as exc:
-            raise GsvxError(None, f"gsvx에 연결하지 못했습니다 ({self.base_url}): {exc}") from exc
+            raise GsvxError(None, f"Graphiti에 연결하지 못했습니다 ({self.base_url}): {exc}") from exc
         if resp.status_code >= 400:
             try:
                 detail = (resp.json() or {}).get("detail")
             except ValueError:
                 detail = None
-            raise GsvxError(resp.status_code, detail or f"gsvx /ingest-text {resp.status_code}")
-        return resp.json()
+            raise GsvxError(resp.status_code, detail or f"Graphiti {path} {resp.status_code}")
+        try:
+            return resp.json()
+        except ValueError as exc:
+            raise GsvxError(resp.status_code, f"Graphiti {path} 응답이 JSON이 아닙니다.") from exc
+
+    def ingest_text(self, text: str, title: str, project: str | None = None,
+                    name: str | None = None) -> dict:
+        """공식 Graphiti `/messages`에 한 에피소드를 넣는다."""
+        return self.ingest_texts([text], title, project=project, name=name)
+
+    def ingest_texts(self, texts: list[str], title: str, project: str | None = None,
+                     name: str | None = None) -> dict:
+        """여러 청크를 한 요청으로 보내 Graphiti의 벌크 적재 경로를 사용한다."""
+        if not project:
+            raise ValueError("Graphiti 적재에는 project(group_id)가 필요합니다.")
+        texts = [text.strip() for text in texts if text.strip()]
+        if not texts:
+            raise ValueError("빈 텍스트는 그래프에 넣을 수 없습니다.")
+        now = datetime.now(timezone.utc)
+        body = {
+            "group_id": project,
+            "messages": [{
+                "name": title if len(texts) == 1 else f"{title} ({i + 1}/{len(texts)})",
+                "role_type": "system",
+                "role": "SynapVox",
+                "content": text,
+                "timestamp": (now + timedelta(milliseconds=i)).isoformat(),
+                "source_description": name or "SynapVox 강의 자료",
+            } for i, text in enumerate(texts)],
+        }
+        result = self._request("POST", "/messages", body=body)
+        stats = result.get("stats") if isinstance(result.get("stats"), dict) else {}
+        episodes = result.get("episodes") if isinstance(result.get("episodes"), list) else []
+        counts = self._graph_counts(project)
+        return {
+            "session_key": str(episodes[0]) if episodes else "",
+            "session_keys": [str(episode) for episode in episodes],
+            "stats": {
+                "concepts_total": counts["concepts"],
+                "concepts_new": int(stats.get("concepts_new") or 0),
+                "relations_new": int(stats.get("relations_new") or 0),
+            },
+            "accepted": bool(result.get("success", True)),
+        }
+
+    def graph(self, project: str) -> dict:
+        with self._neo4j_driver() as driver:
+            with driver.session(database=self._neo4j_database()) as session:
+                nodes = session.run(
+                    """MATCH (n) WHERE n.group_id = $project AND (n:Entity OR n:Episodic)
+                       RETURN n.uuid AS id,
+                              CASE WHEN n:Episodic THEN 'session' ELSE 'concept' END AS type,
+                              coalesce(n.name, n.uuid) AS label,
+                              {summary: n.summary, source: n.source_description,
+                               created_at: toString(n.created_at)} AS meta""",
+                    project=project,
+                ).data()
+                edges = session.run(
+                    """MATCH (a)-[r]->(b)
+                       WHERE a.group_id = $project AND b.group_id = $project
+                         AND type(r) IN ['MENTIONS', 'RELATES_TO', 'NEXT_EPISODE']
+                       RETURN a.uuid AS src, b.uuid AS dst,
+                              CASE type(r)
+                                WHEN 'MENTIONS' THEN 'SESSION_MENTIONS_CONCEPT'
+                                WHEN 'NEXT_EPISODE' THEN 'NEXT_SESSION'
+                                ELSE 'CONCEPT_RELATES_TO'
+                              END AS rel_type,
+                              CASE WHEN b:Entity THEN b.uuid ELSE null END AS concept_id,
+                              CASE WHEN b:Entity THEN b.name ELSE null END AS concept_label,
+                              1.0 AS weight""",
+                    project=project,
+                ).data()
+        return {"nodes": nodes, "edges": edges}
+
+    def ask(self, project: str, question: str, k: int = 6) -> dict:
+        search = self._request("POST", "/search", body={
+            "group_ids": [project], "query": question, "max_facts": k,
+        })
+        facts = search.get("facts") if isinstance(search.get("facts"), list) else []
+        expansion = self._expansion_for_facts(project, facts)
+        return {
+            "answer": self._answer_from_facts(question, facts),
+            "hits": facts,
+            "expansion": expansion,
+        }
+
+    def concept(self, project: str, concept_id: str) -> dict:
+        with self._neo4j_driver() as driver:
+            with driver.session(database=self._neo4j_database()) as session:
+                record = session.run(
+                    """MATCH (n:Entity {group_id: $project, uuid: $concept_id})
+                       OPTIONAL MATCH (e:Episodic {group_id: $project})-[:MENTIONS]->(n)
+                       RETURN n.uuid AS concept_id, n.name AS label, n.summary AS summary,
+                              collect(DISTINCT {session_id: e.uuid, title: e.name}) AS sessions""",
+                    project=project, concept_id=concept_id,
+                ).single()
+        if record is None:
+            raise GsvxError(404, "개념을 찾지 못했습니다.")
+        data = record.data()
+        data["sessions"] = [
+            item for item in data.get("sessions") or []
+            if item.get("session_id") and item.get("title")
+        ]
+        return data
+
+    def session(self, project: str, session_id: str) -> dict:
+        with self._neo4j_driver() as driver:
+            with driver.session(database=self._neo4j_database()) as session:
+                record = session.run(
+                    """MATCH (e:Episodic {group_id: $project, uuid: $session_id})
+                       OPTIONAL MATCH (e)-[:MENTIONS]->(n:Entity)
+                       RETURN e.uuid AS session_id, e.name AS title, e.content AS text,
+                              collect(DISTINCT {concept_id: n.uuid, label: n.name}) AS concepts""",
+                    project=project, session_id=session_id,
+                ).single()
+        if record is None:
+            raise GsvxError(404, "세션을 찾지 못했습니다.")
+        data = record.data()
+        return {
+            "session_id": session_id,
+            "title": str(data.get("title") or ""),
+            "text": str(data.get("text") or "").strip(),
+            "concepts": [
+                concept for concept in data.get("concepts") or []
+                if concept.get("concept_id")
+            ],
+        }
+
+    def reset(self, project: str) -> dict:
+        return self._request("DELETE", f"/group/{quote(project, safe='')}")
+
+    def delete_episode(self, episode_id: str) -> dict:
+        return self._request("DELETE", f"/episode/{quote(episode_id, safe='')}")
+
+    def find_episode_ids(self, project: str, *, meeting_id: str | None = None,
+                         title: str | None = None) -> list[str]:
+        """이전 적재 데이터의 episode ID를 녹음 ID 또는 원본 자료 제목으로 찾는다."""
+        if not meeting_id and not title:
+            return []
+        with self._neo4j_driver() as driver:
+            with driver.session(database=self._neo4j_database()) as session:
+                rows = session.run(
+                    """MATCH (e:Episodic {group_id: $project})
+                       WHERE ($meeting_id <> '' AND e.name CONTAINS $meeting_marker)
+                          OR ($title <> '' AND (e.name = $title OR e.name STARTS WITH $title_prefix))
+                       RETURN DISTINCT e.uuid AS id""",
+                    project=project,
+                    meeting_id=meeting_id or "",
+                    meeting_marker=f"({meeting_id})" if meeting_id else "",
+                    title=title or "",
+                    title_prefix=f"{title} (" if title else "",
+                ).data()
+        return [str(row["id"]) for row in rows if row.get("id")]
+
+    @staticmethod
+    def _neo4j_database() -> str:
+        return os.getenv("NEO4J_DATABASE") or "neo4j"
+
+    @staticmethod
+    def _neo4j_driver():
+        from neo4j import GraphDatabase
+
+        uri = os.getenv("NEO4J_URI")
+        user = os.getenv("NEO4J_USER") or os.getenv("NEO4J_USERNAME")
+        password = os.getenv("NEO4J_PASSWORD")
+        if not all((uri, user, password)):
+            raise GsvxError(None, "Neo4j 환경변수가 설정되지 않았습니다.")
+        return GraphDatabase.driver(uri, auth=(user, password))
+
+    def _graph_counts(self, project: str) -> dict[str, int]:
+        with self._neo4j_driver() as driver:
+            with driver.session(database=self._neo4j_database()) as session:
+                record = session.run(
+                    """MATCH (n:Entity {group_id: $project})
+                       WITH count(n) AS concepts
+                       OPTIONAL MATCH (:Entity {group_id: $project})-[r:RELATES_TO]->
+                                      (:Entity {group_id: $project})
+                       RETURN concepts, count(r) AS relations""",
+                    project=project,
+                ).single()
+        return {
+            "concepts": int(record["concepts"] if record else 0),
+            "relations": int(record["relations"] if record else 0),
+        }
+
+    def _expansion_for_facts(self, project: str, facts: list[dict]) -> dict:
+        fact_ids = [str(f.get("uuid")) for f in facts if f.get("uuid")]
+        if not fact_ids:
+            return {"nodes": [], "edges": []}
+        with self._neo4j_driver() as driver:
+            with driver.session(database=self._neo4j_database()) as session:
+                rows = session.run(
+                    """MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity)
+                       WHERE r.group_id = $project AND r.uuid IN $fact_ids
+                       RETURN a.uuid AS src, a.name AS src_label,
+                              b.uuid AS dst, b.name AS dst_label, r.uuid AS fact_id""",
+                    project=project, fact_ids=fact_ids,
+                ).data()
+        nodes: dict[str, dict] = {}
+        edges: list[dict] = []
+        for row in rows:
+            nodes[row["src"]] = {
+                "id": row["src"], "type": "concept", "label": row["src_label"], "meta": {},
+            }
+            nodes[row["dst"]] = {
+                "id": row["dst"], "type": "concept", "label": row["dst_label"], "meta": {},
+            }
+            edges.append({
+                "src": row["src"], "dst": row["dst"], "rel_type": "CONCEPT_RELATES_TO",
+                "concept_id": row["dst"], "concept_label": row["dst_label"], "weight": 1.0,
+            })
+        return {"nodes": list(nodes.values()), "edges": edges}
+
+    @staticmethod
+    def _answer_from_facts(question: str, facts: list[dict]) -> str:
+        if not facts:
+            return "현재 과목 자료에서 질문과 관련된 근거를 찾지 못했습니다."
+        from openai import OpenAI
+
+        evidence = "\n".join(
+            f"- {fact.get('fact') or fact.get('name') or ''}" for fact in facts
+        )
+        response = OpenAI(api_key=os.getenv("OPENAI_API_KEY")).chat.completions.create(
+            model=os.getenv("GRAPHITI_ANSWER_MODEL") or DEFAULT_ANSWER_MODEL,
+            temperature=0.2,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "당신은 대학 강의 학습 도우미입니다. 제공된 Graphiti 근거만 사용해 "
+                        "한국어로 정확하게 답하세요. Markdown을 사용하고 수식은 인라인 $...$ 또는 "
+                        "블록 $$...$$ LaTeX로 작성하세요. 근거가 부족하면 명확히 알리세요."
+                    ),
+                },
+                {"role": "user", "content": f"질문: {question}\n\nGraphiti 근거:\n{evidence}"},
+            ],
+        )
+        return response.choices[0].message.content or "답변을 생성하지 못했습니다."
 
     def ingest_transcript(self, im: dict, project: str | None = None) -> dict:
         """STT 중간포맷 dict → gsvx 세션(들). project 미지정 시 중간포맷의 project_id 사용.
@@ -184,9 +399,14 @@ class GsvxClient:
         반환(요약): {chunks_ingested, concepts_total, concepts_new, relations_new, sessions}
         — 프론트 App.tsx가 기대하는 {chunks_ingested, concepts_total}를 포함한다.
         """
-        text = transcript_to_text(im)
-        return self._ingest_parts(text, transcript_title(im),
-                                  project=project or im.get("project_id"))
+        validate(im)
+        max_chars = int(os.getenv("GRAPHITI_CHUNK_CHARS") or DEFAULT_GRAPHITI_CHUNK_CHARS)
+        chunks = chunk_transcript(im, max_chars=max_chars)
+        return self._ingest_chunks(
+            [chunk["text"] for chunk in chunks],
+            transcript_title(im),
+            project=project or im.get("project_id"),
+        )
 
     def ingest_document(self, path: Path | str, project: str | None = None,
                         title: str | None = None, meeting_id: str | None = None) -> dict:
@@ -203,17 +423,27 @@ class GsvxClient:
     def ingest_document_text(self, text: str, title: str, project: str | None = None,
                              meeting_id: str | None = None) -> dict:
         """이미 추출된 자료 평문 → gsvx 세션(들). API 릴레이(api/main.py)가 사용."""
-        return self._ingest_parts(text, document_title(title, meeting_id), project=project)
+        max_chars = int(os.getenv("GRAPHITI_CHUNK_CHARS") or DEFAULT_GRAPHITI_CHUNK_CHARS)
+        chunks = chunk_document(text, title, max_chars=max_chars)
+        return self._ingest_chunks(
+            [chunk["text"] for chunk in chunks],
+            document_title(title, meeting_id),
+            project=project,
+        )
 
-    def _ingest_parts(self, text: str, title: str, project: str | None = None) -> dict:
-        parts = split_for_ingest(text, self.text_limit)
-        if not parts:
+    def _ingest_chunks(self, chunks: list[str], title: str,
+                       project: str | None = None) -> dict:
+        if not chunks:
             raise ValueError("빈 텍스트는 그래프에 넣을 수 없습니다.")
-        results = []
-        for i, part in enumerate(parts):
-            part_title = title if len(parts) == 1 else f"{title} ({i + 1}/{len(parts)})"
-            results.append(self.ingest_text(part, part_title, project=project))
-        return _summarize(results)
+        result = self.ingest_texts(chunks, title, project=project)
+        stats = result.get("stats", {})
+        return {
+            "chunks_ingested": len(chunks),
+            "concepts_total": stats.get("concepts_total", 0),
+            "concepts_new": stats.get("concepts_new", 0),
+            "relations_new": stats.get("relations_new", 0),
+            "sessions": result.get("session_keys", []),
+        }
 
 
 def _summarize(results: list[dict]) -> dict:
