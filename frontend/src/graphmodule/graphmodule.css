@@ -1,44 +1,46 @@
-/* GraphModule — scoped "Archive Graph Studio" tokens + layout. All design tokens
-   live on the module root (NOT :root) so nothing leaks into the team app's global
-   CSS; the ported components (GraphView / AnswerDrawer / DetailDrawer) read these
-   via inheritance. Class names are svx-gm__* prefixed to avoid collisions. */
+/* GraphModule — scoped tokens + layout. Values intentionally mirror the main
+   SynapVox notebook palette so the imported graph module feels native. */
 .svx-graphmodule {
   /* palette */
-  --paper: #F4F0E7;
-  --ink: #181713;
-  --canvas: #07120F;
-  --node-core: #D8FF6A;
-  --session-red: #C84E3A;
-  --rule-blue: #2F6F86;
-  --sub: #5b574d;
-  --rule: #d9d2c4;
-  --rule-canvas: #16241f;
+  --paper: #fffaf0;
+  --paper-soft: #fffdf7;
+  --paper-deep: #f7ecd8;
+  --ink: #322b22;
+  --canvas: #fffaf0;
+  --node-core: #7a8069;
+  --session-red: #9a6e52;
+  --rule-blue: #6d735d;
+  --sub: #8b7b68;
+  --rule: #eadfc9;
+  --rule-strong: #d9c8a8;
+  --rule-canvas: rgba(234, 223, 201, 0.68);
   /* typography (self-hosted via @fontsource, imported in GraphModule.tsx) */
-  --font-display: 'Fraunces Variable', Georgia, serif;
-  --font-ui: 'Atkinson Hyperlegible', system-ui, sans-serif;
+  --font-display: 'Avenir Next', Pretendard, 'Apple SD Gothic Neo', 'Noto Sans KR', system-ui, sans-serif;
+  --font-ui: Pretendard, 'Apple SD Gothic Neo', 'Noto Sans KR', system-ui, sans-serif;
   --font-mono: 'JetBrains Mono Variable', ui-monospace, monospace;
   /* radius / spacing / motion */
-  --r-0: 0; --r-1: 4px; --r-2: 8px;
+  --r-0: 6px; --r-1: 8px; --r-2: 10px;
   --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px; --space-5: 20px; --space-6: 24px;
   --dur-ui: 150ms;
-  --bind: 2px solid var(--ink);
+  --bind: 1px solid var(--rule);
 
   display: flex;
   flex-direction: column;
   height: 100%;
   min-height: 620px;
-  background: var(--canvas);
+  background: var(--paper-soft);
   color: var(--ink);
   font-family: var(--font-ui);
   border: var(--bind);
   border-radius: var(--r-2);
   overflow: hidden;
+  box-shadow: 0 18px 36px rgba(92, 72, 43, 0.045);
 }
 
 .svx-gm--empty {
   align-items: center;
   justify-content: center;
-  color: #9aa39c;
+  color: var(--sub);
   font-size: 14px;
 }
 
@@ -50,19 +52,21 @@
   flex-wrap: wrap;
   gap: var(--space-3);
   padding: var(--space-3) var(--space-4);
-  background: var(--paper);
+  background: rgba(255, 253, 247, 0.92);
   border-bottom: var(--bind);
 }
 .svx-gm__seg {
   display: inline-flex;
   border: 1px solid var(--rule);
-  border-radius: var(--r-1);
+  border-radius: 999px;
   overflow: hidden;
+  background: rgba(255, 250, 240, 0.78);
 }
 .svx-gm__seg button {
-  padding: 6px 12px;
-  font-family: var(--font-mono);
-  font-size: 12px;
+  padding: 7px 13px;
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+  font-weight: 780;
   color: var(--sub);
   background: transparent;
   border: none;
@@ -71,7 +75,7 @@
 }
 .svx-gm__seg button:last-child { border-right: none; }
 .svx-gm__seg button:hover { color: var(--ink); background: rgba(24, 23, 19, 0.05); }
-.svx-gm__seg button.is-active { color: var(--paper); background: var(--rule-blue); }
+.svx-gm__seg button.is-active { color: var(--ink); background: var(--paper-deep); }
 
 .svx-gm__picks {
   display: flex;
@@ -88,8 +92,9 @@
   border: 1px solid var(--rule);
   border-radius: 999px;
   cursor: pointer;
+  background: rgba(255, 250, 240, 0.72);
 }
-.svx-gm__picks label.is-on { border-color: var(--rule-blue); background: rgba(47, 111, 134, 0.08); }
+.svx-gm__picks label.is-on { border-color: var(--moss, #6d735d); background: var(--paper-deep); }
 .svx-gm__picks input { accent-color: var(--rule-blue); }
 
 .svx-gm__count {
@@ -110,12 +115,16 @@
   flex: 1;
   min-width: 0;
   height: 100%;
+  background:
+    linear-gradient(90deg, rgba(234, 223, 201, 0.48) 0 1px, transparent 1px 56px),
+    linear-gradient(180deg, rgba(234, 223, 201, 0.42) 0 1px, transparent 1px 56px),
+    var(--canvas);
 }
 .svx-gm__drawer {
   flex: 0 0 340px;
   max-width: 90%;
   height: 100%;
-  background: var(--paper);
+  background: var(--paper-soft);
   border-left: var(--bind);
   overflow: hidden;
 }
@@ -131,9 +140,10 @@
   gap: var(--space-2);
   width: min(440px, calc(100% - var(--space-4) * 2));
   padding: var(--space-2);
-  background: var(--paper);
+  background: rgba(255, 253, 247, 0.96);
   border: var(--bind);
-  border-radius: var(--r-2);
+  border-radius: 12px;
+  box-shadow: 0 14px 28px rgba(92, 72, 43, 0.08);
 }
 .svx-gm__ask input {
   flex: 1;
@@ -153,10 +163,10 @@
   font-family: var(--font-ui);
   font-size: 13px;
   font-weight: 700;
-  color: var(--paper);
+  color: #fffaf3;
   background: var(--ink);
   border: none;
-  border-radius: var(--r-1);
+  border-radius: 9px;
   transition: opacity var(--dur-ui) ease;
 }
 .svx-gm__ask button:hover:not(:disabled) { opacity: 0.82; }

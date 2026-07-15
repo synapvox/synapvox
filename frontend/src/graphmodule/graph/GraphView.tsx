@@ -28,10 +28,10 @@ import { projectLabel } from './projectMeta'
 import { computeCrossLinks } from './crossLinks'
 import { makeMainRepel } from './mainRepel'
 
-const CROSS_BLUE = '#5FB6D4' // shared-concept bridge ring (matches render.ts)
+const CROSS_BLUE = '#6D735D' // shared-concept bridge ring (matches render.ts)
 
-const CANVAS_BG = '#07120F' // literal hex — canvas ctx can't read a CSS var
-const LABEL_INK = '#F4F0E7' // paper ink — readable label color on the dark canvas
+const CANVAS_BG = '#FFFAF0' // literal hex — canvas ctx can't read a CSS var
+const LABEL_INK = '#322B22'
 // Canvas ctx can't resolve `var(--font-ui)`; use the literal Atkinson stack.
 const LABEL_FONT = "'Atkinson Hyperlegible', system-ui, sans-serif"
 const COLD_START_MS = 6000 // Render free tier can cold-start ~50s; reassure after this
@@ -410,7 +410,7 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
       if (inAsk) {
         ctx.globalAlpha = 1
         ctx.lineWidth = 1.5 / globalScale
-        ctx.strokeStyle = '#2F6F86'
+        ctx.strokeStyle = '#6D735D'
         ctx.beginPath()
         ctx.arc(x, y, r + 3 / globalScale, 0, 2 * Math.PI)
         ctx.stroke()
@@ -448,8 +448,8 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
         ctx.font = `${fontSize}px ${LABEL_FONT}`
         ctx.textAlign = 'center'
         ctx.textBaseline = 'top'
-        ctx.shadowColor = 'rgba(7, 18, 15, 0.9)' // canvas-dark halo for legibility
-        ctx.shadowBlur = 3
+        ctx.shadowColor = 'rgba(255, 250, 240, 0.92)'
+        ctx.shadowBlur = 4
         ctx.fillStyle = LABEL_INK
         ctx.fillText(node.label, x, y + r + 2 / globalScale)
         ctx.restore()
@@ -576,7 +576,17 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
     <div
       ref={wrapRef}
       onMouseMove={handleMouseMove}
-      style={{ position: 'relative', width: '100%', height: '100%', background: CANVAS_BG, overflow: 'hidden' }}
+      style={{
+        position: 'relative',
+        width: '100%',
+        height: '100%',
+        background: `
+          linear-gradient(90deg, rgba(234, 223, 201, 0.48) 0 1px, transparent 1px 56px),
+          linear-gradient(180deg, rgba(234, 223, 201, 0.42) 0 1px, transparent 1px 56px),
+          ${CANVAS_BG}
+        `,
+        overflow: 'hidden',
+      }}
     >
       {showGraph && data && (
         <ForceGraph2D<FNode, FLink>
@@ -637,9 +647,11 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
           zIndex: 5,
           maxWidth: 220,
           padding: '6px 8px',
-          background: 'rgba(7, 18, 15, 0.92)',
-          border: '1px solid #16241f',
-          color: '#F4F0E7',
+          background: 'rgba(255, 253, 247, 0.96)',
+          border: '1px solid #d9c8a8',
+          borderRadius: 8,
+          boxShadow: '0 10px 22px rgba(92, 72, 43, 0.12)',
+          color: '#322B22',
         }}
       >
         {hover && (
@@ -710,12 +722,12 @@ function Overlay({ children }: { children: React.ReactNode }) {
 const overlayTitle: React.CSSProperties = {
   fontFamily: 'var(--font-display)',
   fontSize: 20,
-  color: '#F4F0E7',
+  color: '#322B22',
 }
 const overlaySub: React.CSSProperties = {
   fontFamily: 'var(--font-ui)',
   fontSize: 14,
-  color: '#9aa39c',
+  color: '#8B7B68',
   maxWidth: 360,
 }
 
@@ -724,10 +736,10 @@ const overlayRetry: React.CSSProperties = {
   padding: '8px 18px',
   fontFamily: 'var(--font-ui)',
   fontSize: 13,
-  color: '#D8FF6A',
+  color: '#322B22',
   background: 'transparent',
-  border: '1px solid #D8FF6A',
-  borderRadius: 4,
+  border: '1px solid #D9C8A8',
+  borderRadius: 8,
   cursor: 'pointer',
   pointerEvents: 'auto', // the overlay wrapper is click-through; the button opts back in
 }
@@ -741,7 +753,7 @@ const tooltipLabel: React.CSSProperties = {
 const tooltipMeta: React.CSSProperties = {
   fontFamily: 'var(--font-mono)',
   fontSize: 11,
-  color: '#9aa39c',
+  color: '#8B7B68',
   marginTop: 2,
 }
 

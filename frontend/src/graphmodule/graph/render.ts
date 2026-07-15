@@ -2,10 +2,8 @@
 // link colors. No DOM/canvas/React here so they stay unit-testable; the actual
 // canvas painting lives in GraphView.tsx and calls these.
 //
-// Palette (spec §3, exact hexes):
-//   --node-core  #D8FF6A  (concept core, lime)
-//   --session-red #C84E3A (session core, vermilion)
-//   --rule-blue  #2F6F86  (links / focus / selection)
+// Palette mirrors the main SynapVox notebook UI: warm paper, moss accents,
+// and quiet wood lines instead of the original high-contrast studio colors.
 
 import type { FRelClass } from './buildForceData'
 
@@ -28,10 +26,10 @@ export function nodeRadius(degree: number, type: 'session' | 'concept' | 'main')
 //   session (lecture)      → vermilion
 //   bridge concept (핵심)  → lime (spans ≥2 lectures — the load-bearing ideas)
 //   leaf concept (일반)    → muted teal (a single lecture's concept, recedes)
-const C_MAIN = '#F4F0E7'
-const C_SESSION = '#C84E3A'
-const C_CONCEPT_BRIDGE = '#D8FF6A'
-const C_CONCEPT_LEAF = '#4FA3A0'
+const C_MAIN = '#322B22'
+const C_SESSION = '#9A6E52'
+const C_CONCEPT_BRIDGE = '#6D735D'
+const C_CONCEPT_LEAF = '#B9A17B'
 
 /** Core/stroke color for a node, by hierarchy tier. `bridge` splits concepts into
  * the load-bearing (lime) vs leaf (teal) tiers. Size still encodes degree (see
@@ -46,12 +44,12 @@ export function nodeCoreColor(type: 'session' | 'concept' | 'main', bridge: bool
 // sequential NEXT/CONTINUES spine is slightly brighter (stronger); loose
 // SESSION_MENTIONS_CONCEPT edges are translucent (dimmer) — and drawn dashed
 // in GraphView via linkLineDash.
-const RULE_BLUE = '#2F6F86'
-const RULE_BLUE_STRONG = '#4E90A8'
-const MENTIONS_DIM = 'rgba(47, 111, 134, 0.38)'
+const RULE_BLUE = '#A99572'
+const RULE_BLUE_STRONG = '#7A8069'
+const MENTIONS_DIM = 'rgba(169, 149, 114, 0.34)'
 // Cross-project "shared concept" bridge — brighter rule-blue so it reads across
 // the gap between two topic clusters (drawn dashed in GraphView).
-const CROSS_BLUE = '#5FB6D4'
+const CROSS_BLUE = '#6D735D'
 
 /** Link stroke color by relation class. */
 export function linkColor(relClass: FRelClass): string {

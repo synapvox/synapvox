@@ -107,7 +107,7 @@ export default function GraphModule({ project }: { project: string | null }) {
     ) : null
 
   if (!base) {
-    return <div className="svx-graphmodule svx-gm--empty">과목을 선택하면 지식 그래프가 나타납니다.</div>
+    return <div className="svx-graphmodule svx-gm--empty">프로젝트를 선택하면 지식 그래프가 나타납니다.</div>
   }
 
   return (
@@ -115,7 +115,7 @@ export default function GraphModule({ project }: { project: string | null }) {
       <div className="svx-gm__controls">
         <div className="svx-gm__seg" role="group" aria-label="그래프 범위">
           <button type="button" className={scope === 'project' ? 'is-active' : ''} onClick={() => setScope('project')}>
-            현재 과목
+            현재 프로젝트
           </button>
           <button type="button" className={scope === 'all' ? 'is-active' : ''} onClick={() => setScope('all')}>
             전체
@@ -125,7 +125,7 @@ export default function GraphModule({ project }: { project: string | null }) {
           </button>
         </div>
         {scope === 'cross' ? (
-          <div className="svx-gm__picks" aria-label="함께 볼 과목">
+          <div className="svx-gm__picks" aria-label="함께 볼 프로젝트">
             {projects.map((p) => (
               <label key={p.project} className={selected.has(p.project) ? 'is-on' : ''}>
                 <input type="checkbox" checked={selected.has(p.project)} onChange={() => toggle(p.project)} />
@@ -135,8 +135,8 @@ export default function GraphModule({ project }: { project: string | null }) {
           </div>
         ) : null}
         <span className="svx-gm__count">
-          {multi ? `${showProjects.length}과목 · ` : ''}
-          {meta.nodes} concepts · {meta.edges} edges{meta.cross ? ` · 교차연결 ${meta.cross}` : ''}
+          {multi ? `${showProjects.length}개 프로젝트 · ` : ''}
+          개념 {meta.nodes}개 · 연결 {meta.edges}개{meta.cross ? ` · 교차연결 ${meta.cross}` : ''}
         </span>
       </div>
 
@@ -153,7 +153,7 @@ export default function GraphModule({ project }: { project: string | null }) {
             <input
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
-              placeholder="그래프에 이 강의들에 대해 물어보세요"
+              placeholder="프로젝트 자료와 녹음본에 대해 질문하세요"
               disabled={ask.busy}
               aria-label="그래프에 질문"
             />
