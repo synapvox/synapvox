@@ -58,7 +58,7 @@ wrap_segments = _normalizer.wrap_segments
 _auth_schema_ready = False
 _auth_pool = None
 ADMIN_IDENTIFIER = os.getenv("SYNAPVOX_ADMIN_ID", "root")
-ADMIN_PASSWORD = os.getenv("SYNAPVOX_ADMIN_PASSWORD", "2222")
+ADMIN_PASSWORD = os.getenv("SYNAPVOX_ADMIN_PASSWORD", "222222")
 
 app = FastAPI(title="SynapVox Integration API")
 
