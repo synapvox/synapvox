@@ -1,6 +1,6 @@
-"""graphrag 모듈 테스트. Neo4j가 없으면 skip (CONTRIBUTING: 자기 모듈 변경은 가볍게).
+"""graphrag 모듈 테스트. Neo4j/Supabase가 없으면 skip (CONTRIBUTING: 자기 모듈 변경은 가볍게).
 
-로컬 실행 전제: Neo4j 실행 + 환경변수 NEO4J_URI/USER/PASSWORD.
+로컬 실행 전제: Neo4j 실행 + 환경변수 NEO4J_URI/USER/PASSWORD, VectorStore용 SUPABASE_DB_URL.
   docker run -d --name svx-neo4j -p 7687:7687 -e NEO4J_AUTH=neo4j/synapvox123 neo4j:5.26
 """
 
@@ -55,8 +55,15 @@ def driver():
 
 
 @pytest.fixture(scope="module")
-def loaded(driver):
-    gs, vs = GraphStore(driver), VectorStore()  # 해싱 임베더(오프라인)
+def vector_store():
+    if not os.environ.get("SUPABASE_DB_URL"):
+        pytest.skip("SUPABASE_DB_URL 미설정 → VectorStore(pgvector) 테스트 skip")
+    return VectorStore()  # 해싱 임베더(기본)
+
+
+@pytest.fixture(scope="module")
+def loaded(driver, vector_store):
+    gs, vs = GraphStore(driver), vector_store
     gs.reset(PID); vs.reset(PID)
     for im in INTERMEDIATE:
         mid = gs.load_intermediate(im)
@@ -114,9 +121,21 @@ def test_hybrid_search_expands_and_reranks(loaded, driver):
     assert all(h["meeting_id"] for h in res)   # 회의 매핑
 
 
-def test_vector_store_project_isolation():
-    vs = VectorStore()
+def test_vector_store_project_isolation(vector_store):
+    vs = vector_store
+    vs.reset("P-A"); vs.reset("P-B")
     vs.add_chunks("P-A", "MA", [{"chunk_id": "a1", "text": "결제 모듈 카드 간편결제"}])
     vs.add_chunks("P-B", "MB", [{"chunk_id": "b1", "text": "결제 모듈 카드 간편결제"}])
     hits = vs.query("P-A", "결제", k=5)
     assert hits and all(h["chunk_id"] != "b1" for h in hits)  # 다른 프로젝트 누출 없음
+    vs.reset("P-A"); vs.reset("P-B")
+
+
+def test_vector_store_upsert_overwrites_same_chunk_id(vector_store):
+    vs = vector_store
+    vs.reset("P-UPSERT")
+    vs.add_chunks("P-UPSERT", "M01", [{"chunk_id": "c1", "text": "초안"}])
+    vs.add_chunks("P-UPSERT", "M01", [{"chunk_id": "c1", "text": "수정본"}])
+    hits = vs.query("P-UPSERT", "수정본", k=1)
+    assert hits[0]["text"] == "수정본"
+    vs.reset("P-UPSERT")
