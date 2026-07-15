@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type PointerEvent, type WheelEvent } from 
 import './App.css';
 
 type Project = {
+  id: string;              // gsvx 하위 네임스페이스 키 (X-Project-Id 헤더로 전달, ASCII 슬러그)
   name: string;
   description: string;
   updatedAt: string;
@@ -51,7 +52,24 @@ type TranscriptSegment = {
   text: string;
 };
 
-const initialProjects: Project[] = [];
+const PROJECTS_STORAGE_KEY = 'synapvox-projects';
+
+// 프로젝트 목록을 localStorage에 영속화 — 새로고침해도 프로젝트 id↔그래프(gsvx 네임스페이스) 매핑이 유지된다.
+const loadStoredProjects = (): Project[] => {
+  try {
+    const raw = window.localStorage.getItem(PROJECTS_STORAGE_KEY);
+    if (raw === null) return [];
+    const parsed = JSON.parse(raw) as Project[];
+    return Array.isArray(parsed)
+      ? parsed.filter((project) => typeof project?.id === 'string' && typeof project?.name === 'string')
+      : [];
+  } catch {
+    return [];
+  }
+};
+
+// HTTP 헤더는 ASCII 제약이 있어 프로젝트 이름(한글 가능) 대신 ASCII 슬러그 id를 쓴다.
+const createProjectId = () => `p-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 
 const statusFilters = ['전체', '분석 중', '요약 완료', '자료 필요'];
 const homeSections = ['노트북', '즐겨찾기', '공유됨', '휴지통'];
@@ -68,6 +86,64 @@ type GraphLink = { from: string; to: string; rel: string; label: string };
 
 const initialGraphNodes: GraphNode[] = [];
 const initialGraphLinks: GraphLink[] = [];
+
+// gsvx(Graphiti) 백엔드 — 그래프 엔진 본체(click6067-ship-it/synapVOX).
+// 이 프론트는 D0won/synapvox의 /api(포트 8000, STT)만 프록시하므로, gsvx는 절대경로+
+// X-API-Key로 별도 호출한다(gsvx CORSMiddleware가 이 오리진을 허용하도록 열려 있어야 함).
+// 배포 시 VITE_API_BASE(예: https://synapvox-graphiti.onrender.com)·VITE_API_KEY를 빌드 환경변수로 주입.
+const GSVX_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:8020';
+const GSVX_API_KEY = import.meta.env.VITE_API_KEY ?? 'demo-bio';
+
+type GsvxNode = { id: string; type: 'session' | 'concept'; label: string; meta?: Record<string, unknown> };
+type GsvxEdge = { src: string; dst: string; rel_type: string; concept_label?: string | null; weight?: number };
+
+// gsvx/graph.html처럼 힘-방향 시뮬레이션을 다시 짜는 대신, 세션은 가로 타임라인에,
+// 개념은 그 위 원형으로 배치하는 결정적(deterministic) 레이아웃만 적용한다(빠른 연결 목적).
+const layoutGsvxGraph = (nodes: GsvxNode[], edges: GsvxEdge[]): { graphNodes: GraphNode[]; graphLinks: GraphLink[] } => {
+  const degree: Record<string, number> = {};
+  edges.forEach((edge) => {
+    degree[edge.src] = (degree[edge.src] ?? 0) + 1;
+    degree[edge.dst] = (degree[edge.dst] ?? 0) + 1;
+  });
+
+  const sessions = nodes.filter((node) => node.type === 'session');
+  const concepts = nodes.filter((node) => node.type === 'concept');
+  // 세션(청크)이 수십 개여도 안 뭉개지게 14개씩 줄바꿈, 개념은 16개씩 동심 타원 링으로 배치
+  const perRow = 14;
+  const sessionX = (index: number) => {
+    const col = index % perRow;
+    const rowCount = Math.min(sessions.length - Math.floor(index / perRow) * perRow, perRow);
+    return rowCount <= 1 ? 490 : 60 + (860 * col) / (perRow - 1);
+  };
+  const sessionY = (index: number) => 430 + Math.floor(index / perRow) * 44;
+  const perRing = 16;
+
+  const graphNodes: GraphNode[] = [
+    ...sessions.map((node, index) => ({
+      id: node.id, type: 'session' as const, label: node.label,
+      seq: typeof node.meta?.seq === 'number' ? node.meta.seq : index + 1,
+      x: sessionX(index), y: sessionY(index),
+    })),
+    ...concepts.map((node, index) => {
+      const ring = Math.floor(index / perRing);
+      const posInRing = index % perRing;
+      const angle = (2 * Math.PI * posInRing) / perRing + ring * 0.35;
+      const radius = 110 + ring * 62;
+      return {
+        id: node.id, type: 'concept' as const, label: node.label,
+        detail: typeof node.meta?.summary === 'string' ? node.meta.summary : undefined,
+        r: Math.min(9 + (degree[node.id] ?? 0) * 1.4, 20),
+        x: 490 + radius * Math.cos(angle), y: 200 + radius * 0.55 * Math.sin(angle),
+      };
+    }),
+  ];
+
+  const graphLinks: GraphLink[] = edges.map((edge) => ({
+    from: edge.src, to: edge.dst, rel: edge.rel_type, label: edge.concept_label ?? '',
+  }));
+
+  return { graphNodes, graphLinks };
+};
 
 const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
 const graphRelationClass: Record<string, 'mentions' | 'cooccur' | 'next' | 'continues' | 'expands'> = {
@@ -145,7 +221,7 @@ const mapIntermediateTranscript = (data: IntermediateTranscript): TranscriptSegm
 };
 
 function App() {
-  const [projects, setProjects] = useState(initialProjects);
+  const [projects, setProjects] = useState<Project[]>(loadStoredProjects);
   const [sourceItems, setSourceItems] = useState(initialSourceItems);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [activeProjectIndex, setActiveProjectIndex] = useState<number | null>(null);
@@ -215,8 +291,8 @@ function App() {
     sessionsOnly: false,
   });
   const [selectedGraphNodeId, setSelectedGraphNodeId] = useState<string | null>(null);
-  const [graphNodes] = useState<GraphNode[]>(initialGraphNodes);
-  const [graphLinks] = useState<GraphLink[]>(initialGraphLinks);
+  const [graphNodes, setGraphNodes] = useState<GraphNode[]>(initialGraphNodes);
+  const [graphLinks, setGraphLinks] = useState<GraphLink[]>(initialGraphLinks);
   const getGraphNode = (id: string) => graphNodes.find((node) => node.id === id);
   const [isDetailAudioPlaying, setIsDetailAudioPlaying] = useState(false);
   const [detailAudioTimeLabel, setDetailAudioTimeLabel] = useState('00:00');
@@ -239,6 +315,13 @@ function App() {
   const recordingMediaFileInputRef = useRef<HTMLInputElement | null>(null);
 
   const activeProject = activeProjectIndex === null ? null : projects[activeProjectIndex];
+  const activeProjectId = activeProject?.id ?? null;
+
+  // gsvx 호출 공통 헤더 — 프로젝트가 열려 있으면 X-Project-Id로 하위 네임스페이스를 지정한다.
+  const gsvxHeaders = (projectId: string | null): Record<string, string> => ({
+    'X-API-Key': GSVX_API_KEY,
+    ...(projectId !== null ? { 'X-Project-Id': projectId } : {}),
+  });
   const visibleSourceItems = sourceItems
     .filter((source) => source.category === sourceTab)
     .sort((a, b) => {
@@ -273,7 +356,16 @@ function App() {
     });
 
     if (focusSeedIds.length === 0) {
-      graphNodes.slice(0, 24).forEach((node) => visibleGraphNodeIds.add(node.id));
+      // 대형 문서(청크 수십 개)에서 세션이 표시 상한을 다 차지해 개념이 안 보이던 문제 방지:
+      // 개념(연결 많은 순)을 우선 표시하고 세션은 별도 상한으로 자른다.
+      const concepts = graphNodes.filter((node) => node.type === 'concept');
+      const sessions = graphNodes.filter((node) => node.type === 'session');
+      concepts
+        .slice()
+        .sort((a, b) => (b.r ?? 0) - (a.r ?? 0))
+        .slice(0, 80)
+        .forEach((node) => visibleGraphNodeIds.add(node.id));
+      sessions.slice(0, 56).forEach((node) => visibleGraphNodeIds.add(node.id));
     }
   }
   const visibleGraphLinks = graphLinks.filter((link) => {
@@ -378,6 +470,60 @@ function App() {
     if (detailAudioRef.current !== null) detailAudioRef.current.currentTime = 0;
   }, [selectedSource]);
 
+  const refreshGsvxGraph = async (projectId: string | null) => {
+    try {
+      const response = await fetch(`${GSVX_BASE}/graph`, { headers: gsvxHeaders(projectId) });
+      if (!response.ok) throw new Error(`gsvx /graph ${response.status}`);
+      const data = await response.json() as { nodes: GsvxNode[]; edges: GsvxEdge[] };
+      const { graphNodes: nextNodes, graphLinks: nextLinks } = layoutGsvxGraph(data.nodes ?? [], data.edges ?? []);
+      setGraphNodes(nextNodes);
+      setGraphLinks(nextLinks);
+    } catch (error) {
+      // gsvx가 안 떠 있어도 나머지 화면은 정상 동작해야 하므로 그래프만 조용히 빈 상태로 둔다.
+      console.error('gsvx 그래프를 불러오지 못했습니다:', error);
+    }
+  };
+
+  // 프로젝트 목록 영속화 — id↔gsvx 네임스페이스 매핑이 새로고침 후에도 유지되게.
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(projects));
+    } catch (error) {
+      console.error('프로젝트 목록 저장 실패:', error);
+    }
+  }, [projects]);
+
+  // 프로젝트 전환 시: 그래프를 해당 프로젝트 네임스페이스로 다시 불러오고,
+  // 소스 카드·전사 목록도 프로젝트별로 분리 보관/복원한다(이전 프로젝트 데이터가 새 프로젝트에 안 섞이게).
+  const sourceItemsRef = useRef(sourceItems);
+  sourceItemsRef.current = sourceItems;
+  const transcriptsRef = useRef(transcriptsBySourceId);
+  transcriptsRef.current = transcriptsBySourceId;
+  const projectWorkspacesRef = useRef<Record<string, { sources: SourceItem[]; transcripts: Record<string, TranscriptSegment[]> }>>({});
+  const prevProjectIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    const prev = prevProjectIdRef.current;
+    if (prev !== null && prev !== activeProjectId) {
+      projectWorkspacesRef.current[prev] = {
+        sources: sourceItemsRef.current,
+        transcripts: transcriptsRef.current,
+      };
+    }
+    if (activeProjectId !== null && prev !== activeProjectId) {
+      const saved = projectWorkspacesRef.current[activeProjectId];
+      setSourceItems(saved?.sources ?? []);
+      setTranscriptsBySourceId(saved?.transcripts ?? {});
+      setSelectedSource(null);
+      setGraphNodes([]);
+      setGraphLinks([]);
+      setSelectedGraphNodeId(null);
+      setGraphFocusNodeIds([]);
+      void refreshGsvxGraph(activeProjectId);
+    }
+    prevProjectIdRef.current = activeProjectId;
+  }, [activeProjectId]);
+
   const closeSourceModal = () => {
     isClosingRecordingRef.current = true;
     if (mediaRecorderRef.current?.state === 'recording') {
@@ -462,6 +608,7 @@ function App() {
     const name = projectDraft.name.trim() || '새 프로젝트';
     const description = projectDraft.description.trim() || '녹음본과 자료를 묶을 새 작업 공간';
     const nextProject: Project = {
+      id: createProjectId(),
       name,
       description,
       updatedAt: '방금',
@@ -599,8 +746,39 @@ function App() {
     }));
   };
 
+  // gsvx /ingest-doc이 지원하는 문서 형식 — 이 외(이미지 등)는 카드만 추가하고 그래프 반영은 건너뜀
+  const isGraphIngestibleDocument = (file: File) => /\.(pdf|pptx|docx|md|txt)$/i.test(file.name);
+
+  const uploadMaterialToGsvx = async (file: File, itemId: string, projectId: string | null) => {
+    const markMeta = (suffix: string) => setSourceItems((items) => items.map((source) => (
+      source.id === itemId ? { ...source, meta: `자료 · ${formatFileSize(file.size)} · ${suffix}` } : source
+    )));
+    try {
+      markMeta('그래프 분석 중…');
+      const form = new FormData();
+      form.append('file', file, file.name);
+      const response = await fetch(`${GSVX_BASE}/ingest-doc`, {
+        method: 'POST',
+        headers: gsvxHeaders(projectId),
+        body: form,
+      });
+      if (!response.ok) {
+        const errorBody = await response.json().catch(() => null) as { detail?: string } | null;
+        throw new Error(errorBody?.detail ?? `gsvx /ingest-doc ${response.status}`);
+      }
+      const result = await response.json() as { chunks_ingested: number; concepts_total: number };
+      markMeta(`그래프 반영 완료 (청크 ${result.chunks_ingested}개)`);
+      await refreshGsvxGraph(projectId);
+    } catch (error) {
+      console.error('gsvx 문서 그래프 반영 실패:', error);
+      const message = error instanceof Error ? error.message : '';
+      markMeta(message.includes('이미 등록된') ? '중복 — 이미 등록된 문서라 건너뜀' : '그래프 반영 실패');
+    }
+  };
+
   const addProjectMaterialFiles = (files: FileList | File[]) => {
-    const nextMaterials = createMaterialItems(files, 'material');
+    const fileList = Array.from(files).filter((file) => file.size > 0 || file.name.trim().length > 0);
+    const nextMaterials = createMaterialItems(fileList, 'material');
     if (nextMaterials.length === 0) return 0;
 
     setSourceItems((currentSourceItems) => [
@@ -615,6 +793,11 @@ function App() {
           : project
       )));
     }
+
+    // 문서 형식이면 gsvx로 업로드해 청킹→에피소드→그래프 노드까지 반영(카드 meta로 진행상태 표시)
+    fileList.forEach((file, index) => {
+      if (isGraphIngestibleDocument(file)) void uploadMaterialToGsvx(file, nextMaterials[index].id, activeProjectId);
+    });
 
     return nextMaterials.length;
   };
@@ -827,6 +1010,23 @@ function App() {
       setTranscriptionStep(3);
       const result = await response.json() as IntermediateTranscript;
       const transcriptSegments = mapIntermediateTranscript(result);
+
+      // STT 결과(중간 포맷 JSON)를 gsvx(Graphiti)로 이어서 그래프에 반영한다.
+      // 실패해도 전사 자체는 이미 성공했으니 화면 전체를 막지 않고 그래프만 조용히 스킵.
+      const gsvxProjectId = activeProjectId;
+      void (async () => {
+        try {
+          const ingestResponse = await fetch(`${GSVX_BASE}/ingest-stt`, {
+            method: 'POST',
+            headers: { ...gsvxHeaders(gsvxProjectId), 'Content-Type': 'application/json' },
+            body: JSON.stringify(result),
+          });
+          if (!ingestResponse.ok) throw new Error(`gsvx /ingest-stt ${ingestResponse.status}`);
+          await refreshGsvxGraph(gsvxProjectId);
+        } catch (error) {
+          console.error('gsvx로 STT 결과를 넘기지 못했습니다:', error);
+        }
+      })();
       const savedTranscriptSegments = transcriptSegments;
       const now = new Date();
       const timeLabel = now.toLocaleTimeString('ko-KR', {
@@ -909,27 +1109,43 @@ function App() {
     const query = chatInput.trim();
     if (!query) return;
 
-    const hasRecordings = sourceItems.some((source) => source.category === '녹음본');
-    const hasMaterials = sourceItems.some((source) => source.category === '자료');
-    const hasGraph = graphNodes.length > 0;
-    const assistantText = hasRecordings || hasMaterials
-      ? '추가된 녹음본과 자료를 기준으로 답변을 준비하고 있습니다. 관련 근거가 만들어지면 이 대화와 가운데 그래프에 함께 표시됩니다.'
-      : '아직 참고할 녹음본이나 자료가 없습니다. 먼저 녹음본을 전사하거나 자료를 추가하면, 그 내용을 바탕으로 질문에 답할 수 있습니다.';
-
-    setChatMessages((currentMessages) => [
-      ...currentMessages,
-      { role: 'user', text: query },
-      {
-        role: 'assistant',
-        text: assistantText,
-      },
-    ]);
+    setChatMessages((currentMessages) => [...currentMessages, { role: 'user', text: query }]);
     setChatInput('');
-    if (hasGraph) {
-      setSelectedGraphNodeId(graphNodes[0]?.id ?? null);
-      setGraphFocusNodeIds(graphNodes.slice(0, 4).map((node) => node.id));
-      setGraphViewport({ x: -40, y: 12, scale: 1.12 });
-    }
+
+    void (async () => {
+      let assistantText: string;
+      let hitSessionIds: string[] = [];
+      try {
+        const response = await fetch(`${GSVX_BASE}/ask?q=${encodeURIComponent(query)}&k=6`, {
+          headers: gsvxHeaders(activeProjectId),
+        });
+        if (!response.ok) throw new Error(`gsvx /ask ${response.status}`);
+        const data = await response.json() as {
+          answer: string; hits?: { session_id: string }[];
+          expansion?: { nodes?: { id: string }[] };
+        };
+        assistantText = data.answer;
+        hitSessionIds = (data.expansion?.nodes ?? []).map((node) => node.id);
+      } catch (error) {
+        console.error('gsvx AI 답변을 받아오지 못했습니다:', error);
+        const hasRecordings = sourceItems.some((source) => source.category === '녹음본');
+        const hasMaterials = sourceItems.some((source) => source.category === '자료');
+        assistantText = hasRecordings || hasMaterials
+          ? '추가된 녹음본과 자료를 기준으로 답변을 준비하고 있습니다. 관련 근거가 만들어지면 이 대화와 가운데 그래프에 함께 표시됩니다.'
+          : '아직 참고할 녹음본이나 자료가 없습니다. 먼저 녹음본을 전사하거나 자료를 추가하면, 그 내용을 바탕으로 질문에 답할 수 있습니다.';
+      }
+
+      setChatMessages((currentMessages) => [...currentMessages, { role: 'assistant', text: assistantText }]);
+      if (hitSessionIds.length > 0) {
+        setSelectedGraphNodeId(hitSessionIds[0] ?? null);
+        setGraphFocusNodeIds(hitSessionIds.slice(0, 4));
+        setGraphViewport({ x: -40, y: 12, scale: 1.12 });
+      } else if (graphNodes.length > 0) {
+        setSelectedGraphNodeId(graphNodes[0]?.id ?? null);
+        setGraphFocusNodeIds(graphNodes.slice(0, 4).map((node) => node.id));
+        setGraphViewport({ x: -40, y: 12, scale: 1.12 });
+      }
+    })();
   };
 
   const handleGraphWheel = (event: WheelEvent<HTMLDivElement>) => {
