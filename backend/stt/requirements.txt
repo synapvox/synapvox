@@ -7,3 +7,6 @@ requests
 openai
 pdfplumber
 pymupdf
+# refine_transcript.py가 backend.graphrag.VectorStore를 씀 (backend/graphrag/requirements.txt와 동일)
+psycopg2-binary>=2.9
+neo4j>=5.26

@@ -8,9 +8,7 @@ import pytest
 
 from backend.stt.refine_transcript import (
     _chunk_text,
-    _cosine_similarity,
     _parse_llm_output,
-    _rank_chunks,
     build_refinement_prompt,
     retrieve_relevant_context,
 )
@@ -89,49 +87,28 @@ def test_chunk_text_empty_returns_empty_list():
     assert _chunk_text("   ") == []
 
 
-def test_cosine_similarity_identical_vectors_is_one():
-    assert _cosine_similarity([1.0, 0.0], [1.0, 0.0]) == pytest.approx(1.0)
+class _FakeVectorStore:
+    """retrieve_relevant_context()가 저장 대상으로 넘긴 청크 중, "결제" 청크만 관련 있다고
+    가정하고 되돌려주는 스텁 — 실제 pgvector 쿼리 랭킹 로직은 backend.graphrag 쪽 책임."""
 
+    def __init__(self):
+        self.stored = {}
 
-def test_cosine_similarity_orthogonal_vectors_is_zero():
-    assert _cosine_similarity([1.0, 0.0], [0.0, 1.0]) == pytest.approx(0.0)
+    def add_chunks(self, project_id, meeting_id, chunks):
+        self.stored.setdefault(project_id, []).extend(chunks)
 
-
-def test_rank_chunks_returns_most_similar_first():
-    candidates = [("material", "A"), ("material", "B"), ("material", "C")]
-    embeddings = [[1.0, 0.0], [0.0, 1.0], [0.9, 0.1]]
-    query = [1.0, 0.0]
-
-    ranked = _rank_chunks(candidates, embeddings, query, top_k=2)
-
-    assert ranked == [("material", "A"), ("material", "C")]
-
-
-class _FakeEmbeddingsAPI:
-    def __init__(self, embedding_map):
-        self._embedding_map = embedding_map
-
-    def create(self, model, input):
-        data = [type("EmbeddingObj", (), {"embedding": self._embedding_map[text]})() for text in input]
-        return type("Response", (), {"data": data})()
-
-
-class _FakeClient:
-    def __init__(self, embedding_map):
-        self.embeddings = _FakeEmbeddingsAPI(embedding_map)
+    def query(self, project_id, text, k=8, source_type=None):
+        hits = [c for c in self.stored.get(project_id, []) if "결제" in c["text"]]
+        return [{"chunk_id": c["chunk_id"], "text": c["text"], "score": 1.0,
+                 "meeting_id": None, "source_type": c["source_type"]} for c in hits[:k]]
 
 
 def test_retrieve_relevant_context_keeps_only_top_k_similar_chunks():
     material_text = "결제 모듈 관련 내용입니다.\n\n날씨가 좋은 하루였습니다."
     query_text = "결제 모듈 오류를 논의합니다"
-    embedding_map = {
-        "결제 모듈 관련 내용입니다.": [1.0, 0.0],
-        "날씨가 좋은 하루였습니다.": [0.0, 1.0],
-        query_text: [1.0, 0.0],
-    }
 
     material, past = retrieve_relevant_context(
-        query_text, material_text=material_text, top_k=1, client=_FakeClient(embedding_map),
+        query_text, "P01", "M01", material_text=material_text, top_k=1, vector_store=_FakeVectorStore(),
     )
 
     assert material == "결제 모듈 관련 내용입니다."
@@ -139,7 +116,9 @@ def test_retrieve_relevant_context_keeps_only_top_k_similar_chunks():
 
 
 def test_retrieve_relevant_context_returns_input_unchanged_when_nothing_to_chunk():
-    material, past = retrieve_relevant_context("query", material_text=None, past_meeting_texts=None)
+    material, past = retrieve_relevant_context(
+        "query", "P01", "M01", material_text=None, past_meeting_texts=None,
+    )
 
     assert material is None
     assert past is None

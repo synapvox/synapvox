@@ -5,6 +5,8 @@ from pathlib import Path
 
 from openai import OpenAI
 
+from backend.graphrag import VectorStore
+
 _MAX_RETRIES = 2
 
 
@@ -27,62 +29,37 @@ def _chunk_text(text: str, chunk_size: int = 300) -> list:
     return chunks
 
 
-def _cosine_similarity(a: list, b: list) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = sum(x * x for x in a) ** 0.5
-    norm_b = sum(x * x for x in b) ** 0.5
-    return dot / (norm_a * norm_b) if norm_a and norm_b else 0.0
-
-
-def _rank_chunks(candidates: list, chunk_embeddings: list, query_embedding: list, top_k: int) -> list:
-    """candidates: list of (source_label, chunk_text), parallel to chunk_embeddings.
-    Returns the top_k candidates ranked by cosine similarity to query_embedding, most
-    similar first."""
-    scored = sorted(
-        zip(candidates, chunk_embeddings),
-        key=lambda pair: _cosine_similarity(query_embedding, pair[1]),
-        reverse=True,
-    )
-    return [candidate for candidate, _ in scored[:top_k]]
-
-
 def retrieve_relevant_context(
     query_text: str,
+    project_id: str,
+    meeting_id: str,
     material_text: str = None,
     past_meeting_texts: list = None,
     top_k: int = 5,
-    embedding_model: str = "text-embedding-3-small",
-    client=None,
+    vector_store=None,
 ):
-    """TEMPORARY self-contained stand-in to verify the retrieval concept end-to-end —
-    not the intended long-term integration. Chunks material_text/past_meeting_texts,
-    embeds them + query_text (the raw 1차 전사 text) via OpenAI, keeps only the top_k
-    chunks most similar to the transcript.
-
-    The real integration point is 용하's `backend.graphrag.VectorStore`
-    (`add_chunks(project_id, meeting_id, chunks)` to store, `query(project_id, text, k,
-    source_type)` to retrieve) once he wires in a real embed_fn (currently a hashing
-    stub, see progress.md 2026-07-14). When that's ready, replace this function's body
-    with calls to that store instead of chunking/embedding locally — keep the same
-    (material_text, past_meeting_texts) return shape so refine_transcript()/
-    build_refinement_prompt() don't need to change either way."""
-    candidates = [("material", c) for c in _chunk_text(material_text)]
-    for i, text in enumerate(past_meeting_texts or []):
-        candidates += [(f"past_meeting_{i}", c) for c in _chunk_text(text)]
+    """Stage-2 리트리벌 — `backend.graphrag.VectorStore`(pgvector, PR #10 병합 2026-07-15)로
+    구현. material_text/past_meeting_texts를 청킹해 저장(add_chunks) 후 query_text로 top_k
+    조회(query)해 관련 청크만 material_text/past_meeting_texts 형태로 되돌려준다. chunk_id를
+    project_id/meeting_id로 스코프해 다른 회의 자료와 안 섞이게 함. project_id로 스코프된
+    프로젝트 전체(다른 회의 포함)에서 검색되므로, 과거 회의록도 굳이 별도 인자로 안 넘겨도
+    이미 저장돼 있으면 자동으로 후보에 들어옴 — 다만 지금은 매 호출마다 넘어온 텍스트만 저장."""
+    candidates = [{"chunk_id": f"{project_id}:{meeting_id}:material:{i}", "text": c, "source_type": "material"}
+                  for i, c in enumerate(_chunk_text(material_text))]
+    for pi, text in enumerate(past_meeting_texts or []):
+        candidates += [{"chunk_id": f"{project_id}:{meeting_id}:past_meeting_{pi}:{i}", "text": c,
+                        "source_type": f"past_meeting_{pi}"}
+                       for i, c in enumerate(_chunk_text(text))]
 
     if not candidates:
         return material_text, past_meeting_texts
 
-    client = client or OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-    texts_to_embed = [c[1] for c in candidates] + [query_text]
-    response = client.embeddings.create(model=embedding_model, input=texts_to_embed)
-    embeddings = [d.embedding for d in response.data]
-    chunk_embeddings, query_embedding = embeddings[:-1], embeddings[-1]
+    vs = vector_store or VectorStore()
+    vs.add_chunks(project_id, meeting_id, candidates)
+    hits = vs.query(project_id, query_text, k=top_k)
 
-    top = _rank_chunks(candidates, chunk_embeddings, query_embedding, top_k)
-
-    retrieved_material = "\n\n".join(text for label, text in top if label == "material") or None
-    retrieved_past = [text for label, text in top if label.startswith("past_meeting")] or None
+    retrieved_material = "\n\n".join(h["text"] for h in hits if h["source_type"] == "material") or None
+    retrieved_past = [h["text"] for h in hits if h["source_type"].startswith("past_meeting")] or None
 
     return retrieved_material, retrieved_past
 
@@ -183,7 +160,6 @@ def main():
     )
     parser.add_argument("--model", default="gpt-4o")
     parser.add_argument("--top-k", type=int, default=5, help="Number of retrieved chunks to keep (default: 5)")
-    parser.add_argument("--embedding-model", default="text-embedding-3-small")
     parser.add_argument(
         "--no-retrieval",
         action="store_true",
@@ -199,7 +175,7 @@ def main():
     if not args.no_retrieval and (material_text or past_meeting_texts):
         query_text = " ".join(s["text"] for s in data["segments"])
         material_text, past_meeting_texts = retrieve_relevant_context(
-            query_text, material_text, past_meeting_texts, args.top_k, args.embedding_model
+            query_text, data["project_id"], data["meeting_id"], material_text, past_meeting_texts, args.top_k
         )
 
     result = refine_transcript(data, material_text, past_meeting_texts, args.model)
