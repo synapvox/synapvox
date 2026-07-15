@@ -24,8 +24,8 @@
 |---|---|---|
 | `GET /api/health` | — | 헬스체크 |
 | `POST /api/stt/transcribe` | multipart: `audio` + `materials[]` (+Supabase JWT) | CLOVA 전사 → 화자 라벨링 → (자료+키 있으면) `refine_transcript` 정제 → **중간포맷 JSON 반환** |
-| `POST /ingest-stt` | 중간포맷 JSON body | 검증 후 gsvx로 릴레이 (아래 표) |
-| `POST /ingest-doc` | multipart: `file` 1개 | 텍스트 추출 후 gsvx로 릴레이 (아래 표) |
+| `POST /api/ingest-stt` | 중간포맷 JSON body | 검증 후 gsvx로 릴레이 (아래 표) |
+| `POST /api/ingest-doc` | multipart: `file` 1개 | 텍스트 추출 후 gsvx로 릴레이 (아래 표) |
 
 파일 파싱 헬퍼(`_extract_material_text` 등)와 stt 모듈 경량 로더(`_load_stt_module` —
 `backend/stt/__init__.py`의 무거운 의존성을 건너뛰고 서브모듈만 로드)도 여기 있다.
@@ -55,7 +55,7 @@
 
 ### 릴레이 엔드포인트 계약 (프론트 App.tsx가 쓰는 형태 그대로)
 
-| | `POST /ingest-stt` | `POST /ingest-doc` |
+| | `POST /api/ingest-stt` | `POST /api/ingest-doc` |
 |---|---|---|
 | **바디** | 중간포맷 JSON 통째로 | multipart `file` (pdf/pptx/docx/md/txt) |
 | **헤더** | `X-Project-Id`(→ gsvx project), `X-API-Key`(→ gsvx로 전달, 없으면 서버 환경변수) | 동일 + `X-Meeting-Id`(선택, → 세션 제목에 붙어 특정 회의에 딸린 자료로 스코프. 미지정 시 프로젝트 전역 자료) |
@@ -83,7 +83,7 @@ gsvx(Graphiti) 백엔드다. 이 리포의 STT 산출물이 그 엔진으로 들
               │                                ├▶ OpenAI: 개념·관계 추출 (줄별 발화에서)
               │                                └▶ Neo4j: Entity/Episodic 노드 적재
               ▼
-        api/main.py의 POST /ingest-stt · /ingest-doc  (프론트 App.tsx 계약 릴레이)
+        api/main.py의 POST /api/ingest-stt · /api/ingest-doc  (프론트 App.tsx 계약 릴레이)
 ```
 
 ### 두 계약의 연결
@@ -120,8 +120,8 @@ POST /ingest-text  (헤더: X-API-Key)
 
 ### 사용 경로
 
-1. **API 릴레이** — 프론트(App.tsx)가 쓰는 계약 그대로: `POST /ingest-stt`(중간포맷 JSON),
-   `POST /ingest-doc`(multipart 파일). `X-Project-Id` 헤더 → gsvx `project`,
+1. **API 릴레이** — 프론트(App.tsx)가 쓰는 계약 그대로: `POST /api/ingest-stt`(중간포맷 JSON),
+   `POST /api/ingest-doc`(multipart 파일). `X-Project-Id` 헤더 → gsvx `project`,
    `X-API-Key` 헤더는 gsvx로 전달(없으면 서버 환경변수). 응답은 프론트가 기대하는
    `{chunks_ingested, concepts_total, ...}`.
 2. **모듈 직접 호출** — `GsvxClient().ingest_transcript(중간포맷)` / `.ingest_document(경로)`

@@ -301,7 +301,7 @@ async def transcribe_recording(
 
 # ── gsvx(Graphiti) 릴레이 — STT 결과·자료를 그래프 엔진으로 ──
 #
-# 프론트(App.tsx)는 GSVX_BASE에 POST /ingest-stt(중간포맷 JSON)·/ingest-doc(multipart)를
+# 프론트(App.tsx)는 POST /api/ingest-stt(중간포맷 JSON)·/api/ingest-doc(multipart)를
 # 호출한다. gsvx 본체(click6067-ship-it/synapVOX)에는 이 두 엔드포인트가 없고 텍스트
 # 입구는 /ingest-text 하나뿐이므로, 여기서 같은 계약으로 받아 텍스트로 변환해 릴레이한다.
 # 변환·분할·응답 요약 규칙은 backend/integration/gsvx_connector.py 참조.
@@ -313,7 +313,8 @@ def _gsvx_client(x_api_key: str | None):
     return gsvx_connector.GsvxClient(api_key=x_api_key or None)
 
 
-@app.post("/ingest-stt")
+@app.post("/ingest-stt", include_in_schema=False)
+@app.post("/api/ingest-stt")
 async def ingest_stt_to_graph(
     transcript: dict,
     x_project_id: str | None = Header(None, alias="X-Project-Id"),
@@ -334,7 +335,8 @@ async def ingest_stt_to_graph(
         raise HTTPException(status_code=exc.status_code or 502, detail=exc.detail) from exc
 
 
-@app.post("/ingest-doc")
+@app.post("/ingest-doc", include_in_schema=False)
+@app.post("/api/ingest-doc")
 async def ingest_doc_to_graph(
     file: UploadFile = File(...),
     x_project_id: str | None = Header(None, alias="X-Project-Id"),

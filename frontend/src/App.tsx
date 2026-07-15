@@ -1041,14 +1041,14 @@ function App() {
       markMeta('그래프 분석 중…');
       const form = new FormData();
       form.append('file', file, file.name);
-      const response = await fetch(`${GSVX_BASE}/ingest-doc`, {
+      const response = await fetch('/api/ingest-doc', {
         method: 'POST',
         headers: gsvxHeaders(projectId),
         body: form,
       });
       if (!response.ok) {
         const errorBody = await response.json().catch(() => null) as { detail?: string } | null;
-        throw new Error(errorBody?.detail ?? `gsvx /ingest-doc ${response.status}`);
+        throw new Error(errorBody?.detail ?? `자료 그래프 반영 요청 실패 (${response.status})`);
       }
       const result = await response.json() as { chunks_ingested: number; concepts_total: number };
       markMeta(`그래프 반영 완료 (청크 ${result.chunks_ingested}개)`);
@@ -1287,12 +1287,12 @@ function App() {
       const gsvxProjectId = activeProjectId;
       void (async () => {
         try {
-          const ingestResponse = await fetch(`${GSVX_BASE}/ingest-stt`, {
+          const ingestResponse = await fetch('/api/ingest-stt', {
             method: 'POST',
             headers: { ...gsvxHeaders(gsvxProjectId), 'Content-Type': 'application/json' },
             body: JSON.stringify(result),
           });
-          if (!ingestResponse.ok) throw new Error(`gsvx /ingest-stt ${ingestResponse.status}`);
+          if (!ingestResponse.ok) throw new Error(`전사 그래프 반영 요청 실패 (${ingestResponse.status})`);
         } catch (error) {
           console.error('gsvx로 STT 결과를 넘기지 못했습니다:', error);
         }
