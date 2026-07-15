@@ -1,0 +1,178 @@
+/* GraphModule — scoped "Archive Graph Studio" tokens + layout. All design tokens
+   live on the module root (NOT :root) so nothing leaks into the team app's global
+   CSS; the ported components (GraphView / AnswerDrawer / DetailDrawer) read these
+   via inheritance. Class names are svx-gm__* prefixed to avoid collisions. */
+.svx-graphmodule {
+  /* palette */
+  --paper: #F4F0E7;
+  --ink: #181713;
+  --canvas: #07120F;
+  --node-core: #D8FF6A;
+  --session-red: #C84E3A;
+  --rule-blue: #2F6F86;
+  --sub: #5b574d;
+  --rule: #d9d2c4;
+  --rule-canvas: #16241f;
+  /* typography (self-hosted via @fontsource, imported in GraphModule.tsx) */
+  --font-display: 'Fraunces Variable', Georgia, serif;
+  --font-ui: 'Atkinson Hyperlegible', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono Variable', ui-monospace, monospace;
+  /* radius / spacing / motion */
+  --r-0: 0; --r-1: 4px; --r-2: 8px;
+  --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px; --space-5: 20px; --space-6: 24px;
+  --dur-ui: 150ms;
+  --bind: 2px solid var(--ink);
+
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 620px;
+  background: var(--canvas);
+  color: var(--ink);
+  font-family: var(--font-ui);
+  border: var(--bind);
+  border-radius: var(--r-2);
+  overflow: hidden;
+}
+
+.svx-gm--empty {
+  align-items: center;
+  justify-content: center;
+  color: #9aa39c;
+  font-size: 14px;
+}
+
+/* ── top controls (paper bar) ─────────────────────────────── */
+.svx-gm__controls {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  background: var(--paper);
+  border-bottom: var(--bind);
+}
+.svx-gm__seg {
+  display: inline-flex;
+  border: 1px solid var(--rule);
+  border-radius: var(--r-1);
+  overflow: hidden;
+}
+.svx-gm__seg button {
+  padding: 6px 12px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--sub);
+  background: transparent;
+  border: none;
+  border-right: 1px solid var(--rule);
+  transition: background var(--dur-ui) ease, color var(--dur-ui) ease;
+}
+.svx-gm__seg button:last-child { border-right: none; }
+.svx-gm__seg button:hover { color: var(--ink); background: rgba(24, 23, 19, 0.05); }
+.svx-gm__seg button.is-active { color: var(--paper); background: var(--rule-blue); }
+
+.svx-gm__picks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+.svx-gm__picks label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 9px;
+  font-size: 12.5px;
+  color: var(--ink);
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  cursor: pointer;
+}
+.svx-gm__picks label.is-on { border-color: var(--rule-blue); background: rgba(47, 111, 134, 0.08); }
+.svx-gm__picks input { accent-color: var(--rule-blue); }
+
+.svx-gm__count {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--sub);
+}
+
+/* ── main: dark stage + optional right drawer ─────────────── */
+.svx-gm__main {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+.svx-gm__stage {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+}
+.svx-gm__drawer {
+  flex: 0 0 340px;
+  max-width: 90%;
+  height: 100%;
+  background: var(--paper);
+  border-left: var(--bind);
+  overflow: hidden;
+}
+
+/* ── floating ask bar (paper pill over the canvas) ────────── */
+.svx-gm__ask {
+  position: absolute;
+  left: var(--space-4);
+  bottom: var(--space-4);
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: min(440px, calc(100% - var(--space-4) * 2));
+  padding: var(--space-2);
+  background: var(--paper);
+  border: var(--bind);
+  border-radius: var(--r-2);
+}
+.svx-gm__ask input {
+  flex: 1;
+  min-width: 0;
+  padding: var(--space-2) var(--space-3);
+  font-family: var(--font-ui);
+  font-size: 15px;
+  color: var(--ink);
+  background: transparent;
+  border: none;
+  outline: none;
+}
+.svx-gm__ask input::placeholder { color: var(--sub); }
+.svx-gm__ask button {
+  flex: none;
+  padding: 8px 14px;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--paper);
+  background: var(--ink);
+  border: none;
+  border-radius: var(--r-1);
+  transition: opacity var(--dur-ui) ease;
+}
+.svx-gm__ask button:hover:not(:disabled) { opacity: 0.82; }
+.svx-gm__ask button:disabled { background: var(--sub); opacity: 0.6; cursor: not-allowed; }
+
+@media (max-width: 900px) {
+  .svx-gm__drawer {
+    position: absolute;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    z-index: 40;
+    flex-basis: auto;
+    width: min(340px, 92%);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .svx-graphmodule * { transition-duration: 0.01ms !important; }
+}

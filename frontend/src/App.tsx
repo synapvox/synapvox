@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent, type WheelEvent } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import './App.css';
 import { requireSupabase, supabase } from './supabaseClient';
+import GraphModule from './graphmodule/GraphModule';
 import type { Session } from '@supabase/supabase-js';
 
 type Project = {
@@ -134,82 +135,12 @@ const initialSourceItems: SourceItem[] = [];
 const sourceTabs = ['녹음본', '자료'] as const;
 const sourceSortOptions = ['최신순', '오래된순', '글자순', '종류순'] as const;
 
-type GraphNode = {
-  id: string; type: 'session' | 'concept'; label: string;
-  detail?: string; seq?: number; x: number; y: number; r?: number;
-};
-type GraphLink = { from: string; to: string; rel: string; label: string };
-
-const initialGraphNodes: GraphNode[] = [];
-const initialGraphLinks: GraphLink[] = [];
-
 // gsvx(Graphiti) 백엔드 — 그래프 엔진 본체(click6067-ship-it/synapVOX).
 // 이 프론트는 D0won/synapvox의 /api(포트 8000, STT)만 프록시하므로, gsvx는 절대경로+
 // X-API-Key로 별도 호출한다(gsvx CORSMiddleware가 이 오리진을 허용하도록 열려 있어야 함).
 // 배포 시 VITE_API_BASE(예: https://synapvox-graphiti.onrender.com)·VITE_API_KEY를 빌드 환경변수로 주입.
 const GSVX_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:8020';
 const GSVX_API_KEY = import.meta.env.VITE_API_KEY ?? 'demo-bio';
-
-type GsvxNode = { id: string; type: 'session' | 'concept'; label: string; meta?: Record<string, unknown> };
-type GsvxEdge = { src: string; dst: string; rel_type: string; concept_label?: string | null; weight?: number };
-
-// gsvx/graph.html처럼 힘-방향 시뮬레이션을 다시 짜는 대신, 세션은 가로 타임라인에,
-// 개념은 그 위 원형으로 배치하는 결정적(deterministic) 레이아웃만 적용한다(빠른 연결 목적).
-const layoutGsvxGraph = (nodes: GsvxNode[], edges: GsvxEdge[]): { graphNodes: GraphNode[]; graphLinks: GraphLink[] } => {
-  const degree: Record<string, number> = {};
-  edges.forEach((edge) => {
-    degree[edge.src] = (degree[edge.src] ?? 0) + 1;
-    degree[edge.dst] = (degree[edge.dst] ?? 0) + 1;
-  });
-
-  const sessions = nodes.filter((node) => node.type === 'session');
-  const concepts = nodes.filter((node) => node.type === 'concept');
-  // 세션(청크)이 수십 개여도 안 뭉개지게 14개씩 줄바꿈, 개념은 16개씩 동심 타원 링으로 배치
-  const perRow = 14;
-  const sessionX = (index: number) => {
-    const col = index % perRow;
-    const rowCount = Math.min(sessions.length - Math.floor(index / perRow) * perRow, perRow);
-    return rowCount <= 1 ? 490 : 60 + (860 * col) / (perRow - 1);
-  };
-  const sessionY = (index: number) => 430 + Math.floor(index / perRow) * 44;
-  const perRing = 16;
-
-  const graphNodes: GraphNode[] = [
-    ...sessions.map((node, index) => ({
-      id: node.id, type: 'session' as const, label: node.label,
-      seq: typeof node.meta?.seq === 'number' ? node.meta.seq : index + 1,
-      x: sessionX(index), y: sessionY(index),
-    })),
-    ...concepts.map((node, index) => {
-      const ring = Math.floor(index / perRing);
-      const posInRing = index % perRing;
-      const angle = (2 * Math.PI * posInRing) / perRing + ring * 0.35;
-      const radius = 110 + ring * 62;
-      return {
-        id: node.id, type: 'concept' as const, label: node.label,
-        detail: typeof node.meta?.summary === 'string' ? node.meta.summary : undefined,
-        r: Math.min(9 + (degree[node.id] ?? 0) * 1.4, 20),
-        x: 490 + radius * Math.cos(angle), y: 200 + radius * 0.55 * Math.sin(angle),
-      };
-    }),
-  ];
-
-  const graphLinks: GraphLink[] = edges.map((edge) => ({
-    from: edge.src, to: edge.dst, rel: edge.rel_type, label: edge.concept_label ?? '',
-  }));
-
-  return { graphNodes, graphLinks };
-};
-
-const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
-const graphRelationClass: Record<string, 'mentions' | 'cooccur' | 'next' | 'continues' | 'expands'> = {
-  SESSION_MENTIONS_CONCEPT: 'mentions',
-  CONCEPT_CO_OCCURS_WITH: 'cooccur',
-  NEXT_SESSION: 'next',
-  CONTINUES: 'continues',
-  EXPANDS: 'expands',
-};
-const semanticRelations = new Set(['CONTINUES', 'EXPANDS']);
 
 const formatTranscriptTime = (value = 0) => {
   const seconds = Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
@@ -345,28 +276,8 @@ function App() {
       text: '프로젝트의 녹음본과 자료를 바탕으로 질문에 답변합니다. 궁금한 내용을 입력하면 가운데 그래프에서 관련 노드를 함께 표시할게요.',
     },
   ]);
-  const [graphFocusNodeIds, setGraphFocusNodeIds] = useState<string[]>([]);
-  const [graphViewport, setGraphViewport] = useState({ x: 0, y: 0, scale: 1 });
-  const [graphFilter, setGraphFilter] = useState({
-    mentions: true,
-    cooccur: false,   // 개념-개념 동시출현 엣지는 밀도가 높아 기본 off(필터로 켤 수 있음)
-    next: true,
-    semantic: true,
-    sessionsOnly: false,
-  });
-  const [selectedGraphNodeId, setSelectedGraphNodeId] = useState<string | null>(null);
-  const [graphNodes, setGraphNodes] = useState<GraphNode[]>(initialGraphNodes);
-  const [graphLinks, setGraphLinks] = useState<GraphLink[]>(initialGraphLinks);
-  const getGraphNode = (id: string) => graphNodes.find((node) => node.id === id);
   const [isDetailAudioPlaying, setIsDetailAudioPlaying] = useState(false);
   const [detailAudioTimeLabel, setDetailAudioTimeLabel] = useState('00:00');
-  const [graphDragStart, setGraphDragStart] = useState<{
-    pointerId: number;
-    x: number;
-    y: number;
-    originX: number;
-    originY: number;
-  } | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordingStreamRef = useRef<MediaStream | null>(null);
   const recordingChunksRef = useRef<Blob[]>([]);
@@ -396,53 +307,6 @@ function App() {
       if (sourceSort === '종류순') return a.category.localeCompare(b.category) || a.updatedOrder - b.updatedOrder;
       return a.updatedOrder - b.updatedOrder;
     });
-  const visibleGraphNodeIds = new Set<string>();
-  if (graphFilter.sessionsOnly) {
-    graphNodes
-      .filter((node) => node.type === 'session')
-      .forEach((node) => visibleGraphNodeIds.add(node.id));
-  } else {
-    const focusSeedIds = graphFocusNodeIds.length > 0
-      ? graphFocusNodeIds
-      : selectedGraphNodeId === null
-        ? []
-        : [selectedGraphNodeId];
-
-    graphNodes
-      .filter((node) => node.type === 'session')
-      .forEach((node) => visibleGraphNodeIds.add(node.id));
-
-    focusSeedIds.forEach((id) => visibleGraphNodeIds.add(id));
-
-    graphLinks.forEach((link) => {
-      if (focusSeedIds.includes(link.from) || focusSeedIds.includes(link.to)) {
-        visibleGraphNodeIds.add(link.from);
-        visibleGraphNodeIds.add(link.to);
-      }
-    });
-
-    if (focusSeedIds.length === 0) {
-      // 대형 문서(청크 수십 개)에서 세션이 표시 상한을 다 차지해 개념이 안 보이던 문제 방지:
-      // 개념(연결 많은 순)을 우선 표시하고 세션은 별도 상한으로 자른다.
-      const concepts = graphNodes.filter((node) => node.type === 'concept');
-      const sessions = graphNodes.filter((node) => node.type === 'session');
-      concepts
-        .slice()
-        .sort((a, b) => (b.r ?? 0) - (a.r ?? 0))
-        .slice(0, 80)
-        .forEach((node) => visibleGraphNodeIds.add(node.id));
-      sessions.slice(0, 56).forEach((node) => visibleGraphNodeIds.add(node.id));
-    }
-  }
-  const visibleGraphLinks = graphLinks.filter((link) => {
-    if (!visibleGraphNodeIds.has(link.from) || !visibleGraphNodeIds.has(link.to)) return false;
-    const relationClass = graphRelationClass[link.rel];
-    if (relationClass === 'mentions') return graphFilter.mentions && !graphFilter.sessionsOnly;
-    if (relationClass === 'cooccur') return graphFilter.cooccur && !graphFilter.sessionsOnly;
-    if (relationClass === 'next') return graphFilter.next;
-    if (semanticRelations.has(link.rel)) return graphFilter.semantic;
-    return true;
-  });
   const visibleProjects = projects
     .map((project, index) => ({ ...project, index }))
     .filter((project) => {
@@ -585,20 +449,6 @@ function App() {
     if (detailAudioRef.current !== null) detailAudioRef.current.currentTime = 0;
   }, [selectedSource]);
 
-  const refreshGsvxGraph = async (projectId: string | null) => {
-    try {
-      const response = await fetch(`${GSVX_BASE}/graph`, { headers: gsvxHeaders(projectId) });
-      if (!response.ok) throw new Error(`gsvx /graph ${response.status}`);
-      const data = await response.json() as { nodes: GsvxNode[]; edges: GsvxEdge[] };
-      const { graphNodes: nextNodes, graphLinks: nextLinks } = layoutGsvxGraph(data.nodes ?? [], data.edges ?? []);
-      setGraphNodes(nextNodes);
-      setGraphLinks(nextLinks);
-    } catch (error) {
-      // gsvx가 안 떠 있어도 나머지 화면은 정상 동작해야 하므로 그래프만 조용히 빈 상태로 둔다.
-      console.error('gsvx 그래프를 불러오지 못했습니다:', error);
-    }
-  };
-
   // 프로젝트 목록 영속화 — id↔gsvx 네임스페이스 매핑이 새로고침 후에도 유지되게.
   useEffect(() => {
     if (storageUserId === null) return;
@@ -643,10 +493,6 @@ function App() {
     setHomeSection('노트북');
     setStatusFilter('전체');
     setProjectQuery('');
-    setGraphNodes([]);
-    setGraphLinks([]);
-    setSelectedGraphNodeId(null);
-    setGraphFocusNodeIds([]);
   };
 
   useEffect(() => {
@@ -759,11 +605,6 @@ function App() {
       setSourceItems(saved?.sources ?? []);
       setTranscriptsBySourceId(saved?.transcripts ?? {});
       setSelectedSource(null);
-      setGraphNodes([]);
-      setGraphLinks([]);
-      setSelectedGraphNodeId(null);
-      setGraphFocusNodeIds([]);
-      void refreshGsvxGraph(activeProjectId);
     }
     prevProjectIdRef.current = activeProjectId;
   }, [activeProjectId, persistProjectWorkspaces]);
@@ -1102,7 +943,6 @@ function App() {
       }
       const result = await response.json() as { chunks_ingested: number; concepts_total: number };
       markMeta(`그래프 반영 완료 (청크 ${result.chunks_ingested}개)`);
-      await refreshGsvxGraph(projectId);
     } catch (error) {
       console.error('gsvx 문서 그래프 반영 실패:', error);
       const message = error instanceof Error ? error.message : '';
@@ -1330,7 +1170,6 @@ function App() {
             body: JSON.stringify(result),
           });
           if (!ingestResponse.ok) throw new Error(`gsvx /ingest-stt ${ingestResponse.status}`);
-          await refreshGsvxGraph(gsvxProjectId);
         } catch (error) {
           console.error('gsvx로 STT 결과를 넘기지 못했습니다:', error);
         }
@@ -1422,7 +1261,6 @@ function App() {
 
     void (async () => {
       let assistantText: string;
-      let hitSessionIds: string[] = [];
       try {
         const response = await fetch(`${GSVX_BASE}/ask?q=${encodeURIComponent(query)}&k=6`, {
           headers: gsvxHeaders(activeProjectId),
@@ -1433,7 +1271,6 @@ function App() {
           expansion?: { nodes?: { id: string }[] };
         };
         assistantText = data.answer;
-        hitSessionIds = (data.expansion?.nodes ?? []).map((node) => node.id);
       } catch (error) {
         console.error('gsvx AI 답변을 받아오지 못했습니다:', error);
         const hasRecordings = sourceItems.some((source) => source.category === '녹음본');
@@ -1444,51 +1281,7 @@ function App() {
       }
 
       setChatMessages((currentMessages) => [...currentMessages, { role: 'assistant', text: assistantText }]);
-      if (hitSessionIds.length > 0) {
-        setSelectedGraphNodeId(hitSessionIds[0] ?? null);
-        setGraphFocusNodeIds(hitSessionIds.slice(0, 4));
-        setGraphViewport({ x: -40, y: 12, scale: 1.12 });
-      } else if (graphNodes.length > 0) {
-        setSelectedGraphNodeId(graphNodes[0]?.id ?? null);
-        setGraphFocusNodeIds(graphNodes.slice(0, 4).map((node) => node.id));
-        setGraphViewport({ x: -40, y: 12, scale: 1.12 });
-      }
     })();
-  };
-
-  const handleGraphWheel = (event: WheelEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    const nextScale = clamp(graphViewport.scale + (event.deltaY > 0 ? -0.08 : 0.08), 0.6, 1.8);
-    setGraphViewport((currentViewport) => ({ ...currentViewport, scale: nextScale }));
-  };
-
-  const handleGraphPointerDown = (event: PointerEvent<HTMLDivElement>) => {
-    const target = event.target as Element;
-    if (target.closest('.graph-svg-node')) return;
-
-    event.currentTarget.setPointerCapture(event.pointerId);
-    setGraphDragStart({
-      pointerId: event.pointerId,
-      x: event.clientX,
-      y: event.clientY,
-      originX: graphViewport.x,
-      originY: graphViewport.y,
-    });
-  };
-
-  const handleGraphPointerMove = (event: PointerEvent<HTMLDivElement>) => {
-    if (graphDragStart === null) return;
-    setGraphViewport((currentViewport) => ({
-      ...currentViewport,
-      x: graphDragStart.originX + event.clientX - graphDragStart.x,
-      y: graphDragStart.originY + event.clientY - graphDragStart.y,
-    }));
-  };
-
-  const handleGraphPointerUp = (event: PointerEvent<HTMLDivElement>) => {
-    if (graphDragStart?.pointerId === event.pointerId) {
-      setGraphDragStart(null);
-    }
   };
 
   const isProjectWorkspace = activeProject !== null && !isProfileOpen && !isAdminOpen && !isHelpOpen;
@@ -2443,181 +2236,7 @@ function App() {
               </aside>
 
               <section className="studio-graph">
-              <div className="graph-view-header">
-                <div>
-                  <p className="eyebrow">Graph view</p>
-                  <h2>{activeProject.name}</h2>
-                </div>
-
-                <div className="graph-filters" aria-label="graph filters">
-                  {[
-                    { key: 'mentions', label: '개념 근거' },
-                    { key: 'cooccur', label: '동시출현' },
-                    { key: 'next', label: '다음 세션' },
-                    { key: 'semantic', label: '연속·확장' },
-                  ].map((filter) => (
-                    <label
-                      className={graphFilter.sessionsOnly && ['mentions', 'cooccur'].includes(filter.key) ? 'disabled' : ''}
-                      key={filter.key}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={graphFilter[filter.key as keyof typeof graphFilter]}
-                        disabled={graphFilter.sessionsOnly && ['mentions', 'cooccur'].includes(filter.key)}
-                        onChange={(event) => setGraphFilter((currentFilter) => ({
-                          ...currentFilter,
-                          [filter.key]: event.target.checked,
-                        }))}
-                      />
-                      <span className={`graph-filter-line ${filter.key}`} />
-                      {filter.label}
-                    </label>
-                  ))}
-
-                  <label>
-                    <input
-                      type="checkbox"
-                      checked={graphFilter.sessionsOnly}
-                      onChange={(event) => setGraphFilter((currentFilter) => ({
-                        ...currentFilter,
-                        sessionsOnly: event.target.checked,
-                      }))}
-                    />
-                    세션만
-                  </label>
-                </div>
-
-                <div className="graph-controls">
-                  <button
-                    type="button"
-                    onClick={() => setGraphViewport((currentViewport) => ({
-                      ...currentViewport,
-                      scale: clamp(currentViewport.scale - 0.1, 0.6, 1.8),
-                    }))}
-                  >
-                    -
-                  </button>
-                  <span>{Math.round(graphViewport.scale * 100)}%</span>
-                  <button
-                    type="button"
-                    onClick={() => setGraphViewport((currentViewport) => ({
-                      ...currentViewport,
-                      scale: clamp(currentViewport.scale + 0.1, 0.6, 1.8),
-                    }))}
-                  >
-                    +
-                  </button>
-                  <button type="button" onClick={() => setGraphViewport({ x: 0, y: 0, scale: 1 })}>
-                    초기화
-                  </button>
-                </div>
-              </div>
-
-              <div
-                className={`graph-canvas studio-graph-canvas ${graphDragStart === null ? '' : 'dragging'}`}
-                onWheel={handleGraphWheel}
-                onPointerDown={handleGraphPointerDown}
-                onPointerMove={handleGraphPointerMove}
-                onPointerUp={handleGraphPointerUp}
-                onPointerCancel={handleGraphPointerUp}
-              >
-                {graphNodes.length === 0 && (
-                  <div className="graph-empty-state">
-                    <strong>아직 연결된 그래프가 없습니다.</strong>
-                    <span>녹음본을 전사한 뒤 그래프 생성이 연결되면 여기에 표시됩니다.</span>
-                  </div>
-                )}
-                <svg className="graph-svg" viewBox="0 0 980 580" role="img" aria-label="프로젝트 지식 그래프">
-                  <defs>
-                    <marker id="arrow-next" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-                      <path d="M0,0 L10,5 L0,10 z" />
-                    </marker>
-                    <marker id="arrow-continues" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
-                      <path d="M0,0 L10,5 L0,10 z" />
-                    </marker>
-                    <marker id="arrow-expands" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
-                      <path d="M0,0 L10,5 L0,10 z" />
-                    </marker>
-                  </defs>
-
-                  <g className="graph-stage" transform={`translate(${graphViewport.x} ${graphViewport.y}) scale(${graphViewport.scale})`}>
-                    <g className="graph-edge-layer">
-                      {visibleGraphLinks.map((link, index) => {
-                        const from = getGraphNode(link.from);
-                        const to = getGraphNode(link.to);
-                        if (from === undefined || to === undefined) return null;
-
-                        const relationClass = graphRelationClass[link.rel];
-                        const isFocused = true;
-                        const marker = relationClass === 'next'
-                          ? 'url(#arrow-next)'
-                          : relationClass === 'continues'
-                            ? 'url(#arrow-continues)'
-                            : relationClass === 'expands'
-                              ? 'url(#arrow-expands)'
-                              : undefined;
-
-                        return (
-                          <line
-                            className={`graph-edge ${relationClass} ${isFocused ? 'focused' : 'dimmed'}`}
-                            key={`${link.from}-${link.to}-${link.rel}`}
-                            x1={from.x}
-                            y1={from.y}
-                            x2={to.x}
-                            y2={to.y}
-                            pathLength={1}
-                            markerEnd={marker}
-                            style={{ '--graph-delay': `${Math.min(index * 22 + 180, 900)}ms` } as CSSProperties}
-                          />
-                        );
-                      })}
-                    </g>
-
-                    <g className="graph-node-layer">
-                      {graphNodes.filter((node) => visibleGraphNodeIds.has(node.id)).map((node, index) => {
-                        const isFocused = true;
-
-                        return (
-                          <g
-                            className={`graph-svg-node graph-svg-node-${node.type} ${selectedGraphNodeId === node.id ? 'selected' : ''} ${isFocused ? 'focused' : 'dimmed'}`}
-                            key={node.id}
-                            transform={`translate(${node.x} ${node.y})`}
-                            style={{ '--graph-delay': `${Math.min(index * 28, 700)}ms` } as CSSProperties}
-                            onClick={() => {
-                              setSelectedGraphNodeId(node.id);
-                              setGraphFocusNodeIds([node.id]);
-                            }}
-                          >
-                            {node.type === 'session' ? (
-                              <>
-                                <rect x="-24" y="-18" width="48" height="36" rx="9" />
-                                <text textAnchor="middle" y="5">{node.seq}</text>
-                                <text className="graph-node-caption" textAnchor="middle" y="38">{node.label}</text>
-                              </>
-                            ) : (
-                              <>
-                                <circle r={node.r} />
-                                {/* 고차수(다리) 개념 + 선택 노드만 라벨 → 라벨 겹침 방지 */}
-                                {((node.r ?? 0) >= 11 || selectedGraphNodeId === node.id) && (
-                                  <text textAnchor="middle" y={(node.r ?? 14) + 16}>{node.label}</text>
-                                )}
-                              </>
-                            )}
-                          </g>
-                        );
-                      })}
-                    </g>
-                  </g>
-                </svg>
-
-                <div className="graph-legend">
-                  <div><span className="legend-session" />세션</div>
-                  <div><span className="legend-concept" />개념</div>
-                  <div><span className="legend-line continues" />연속</div>
-                  <div><span className="legend-line expands" />확장</div>
-                  <div><span className="legend-line mentions" />근거</div>
-                </div>
-              </div>
+                <GraphModule project={activeProjectId} />
               </section>
 
               <aside className="studio-chat">
