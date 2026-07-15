@@ -3,6 +3,16 @@ import './App.css';
 import { supabase } from './supabaseClient';
 import GraphModule from './graphmodule/GraphModule';
 import type { Session } from '@supabase/supabase-js';
+import {
+  deleteProjectSource,
+  downloadProjectSource,
+  loadStoredProjectWorkspace,
+  saveRecordingTranscript,
+  updateProjectSourcePayload,
+  updateStoredTranscriptSegments,
+  uploadProjectSource,
+  type StoredSourceRow,
+} from './sourceStorage';
 
 type Project = {
   id: string;              // 그래프/벡터 저장소의 프로젝트 네임스페이스 키
@@ -29,6 +39,10 @@ type SourceItem = {
   durationLabel?: string;
   attachedMaterials?: SourceItem[];
   mediaKind?: 'audio' | 'video';
+  recordingId?: string;
+  storagePath?: string;
+  mimeType?: string;
+  sizeBytes?: number;
 };
 
 type ProjectMaterialFile = {
@@ -212,6 +226,42 @@ const mapIntermediateTranscript = (data: IntermediateTranscript): TranscriptSegm
     });
 };
 
+const sourcePayloadForStorage = (source: SourceItem): Record<string, unknown> => {
+  const { audioUrl: _audioUrl, attachedMaterials, ...payload } = source;
+  return {
+    ...payload,
+    attachedMaterials: attachedMaterials?.map((material) => sourcePayloadForStorage(material)) ?? [],
+  };
+};
+
+const hydrateStoredSource = (row: StoredSourceRow, signedAudioUrl?: string): SourceItem => {
+  const payload = row.source_payload as Partial<SourceItem>;
+  return {
+    id: row.id,
+    title: typeof payload.title === 'string' ? payload.title : row.original_name,
+    type: typeof payload.type === 'string' ? payload.type : row.kind === 'audio' ? '녹음' : '자료',
+    category: row.kind === 'audio' ? '녹음본' : '자료',
+    meta: typeof payload.meta === 'string' ? payload.meta : row.kind === 'audio' ? '전사 완료' : '자료',
+    updatedOrder: typeof payload.updatedOrder === 'number' ? payload.updatedOrder : 0,
+    materialScope: row.scope,
+    audioUrl: signedAudioUrl,
+    durationLabel: typeof payload.durationLabel === 'string' ? payload.durationLabel : undefined,
+    attachedMaterials: Array.isArray(payload.attachedMaterials)
+      ? payload.attachedMaterials as SourceItem[]
+      : [],
+    mediaKind: payload.mediaKind === 'video' ? 'video' : row.kind === 'audio' ? 'audio' : undefined,
+    recordingId: row.recording_id ?? undefined,
+    storagePath: row.storage_path,
+    mimeType: row.mime_type ?? undefined,
+    sizeBytes: row.size_bytes,
+  };
+};
+
+const durationLabelToSeconds = (durationLabel: string) => {
+  const [minutes = '0', seconds = '0'] = durationLabel.split(':');
+  return (Number(minutes) * 60) + Number(seconds);
+};
+
 function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [sourceItems, setSourceItems] = useState(initialSourceItems);
@@ -301,14 +351,15 @@ function App() {
   const projectMaterialFilesRef = useRef<Record<string, ProjectMaterialFile[]>>({});
   const shouldSeedDemoRecordingRef = useRef(window.location.search.includes('demoRecording'));
   const sessionUserIdRef = useRef<string | null | undefined>(undefined);
+  const workspaceLoadRequestRef = useRef(0);
 
   const activeProject = activeProjectIndex === null ? null : projects[activeProjectIndex];
   const activeProjectId = activeProject?.id ?? null;
   const storageUserId = currentUser?.id ?? null;
-  const projectMaterialFiles = activeProjectId === null
-    ? []
-    : projectMaterialFilesRef.current[activeProjectId] ?? [];
-  const projectMaterialCount = projectMaterialFiles.length;
+  const projectMaterialSources = sourceItems.filter((source) => (
+    source.category === '자료' && source.materialScope === 'project'
+  ));
+  const projectMaterialCount = projectMaterialSources.length;
   const recordingMaterialCount = recordingMaterialFiles.length;
   const totalTranscriptionMaterialCount = projectMaterialCount + recordingMaterialCount;
 
@@ -706,6 +757,43 @@ function App() {
   }, [activeProjectId, persistProjectWorkspaces]);
 
   useEffect(() => {
+    if (supabase === null || currentUser === null || activeProjectId === null) return;
+    const projectId = activeProjectId;
+    const requestId = workspaceLoadRequestRef.current + 1;
+    workspaceLoadRequestRef.current = requestId;
+
+    void loadStoredProjectWorkspace(supabase, projectId).then(({ sources, transcripts, signedUrls }) => {
+      if (workspaceLoadRequestRef.current !== requestId || activeProjectId !== projectId) return;
+      const restoredSources = sources.map((row, index) => ({
+        ...hydrateStoredSource(row, signedUrls.get(row.storage_path)),
+        updatedOrder: index,
+      }));
+      const restoredTranscripts = Object.fromEntries(transcripts.map((row) => [
+        row.recording_id,
+        Array.isArray(row.segments) ? row.segments as TranscriptSegment[] : [],
+      ]));
+      setSourceItems(restoredSources);
+      setTranscriptsBySourceId(restoredTranscripts);
+      projectWorkspacesRef.current[projectId] = {
+        sources: restoredSources,
+        transcripts: restoredTranscripts,
+      };
+      persistProjectWorkspaces();
+      setProjects((currentProjects) => currentProjects.map((project) => (
+        project.id === projectId
+          ? {
+              ...project,
+              recordings: restoredSources.filter((source) => source.category === '녹음본').length,
+              materials: restoredSources.filter((source) => source.category === '자료').length,
+            }
+          : project
+      )));
+    }).catch((error) => {
+      console.error('Supabase 프로젝트 소스 복원 실패:', error);
+    });
+  }, [activeProjectId, currentUser, persistProjectWorkspaces]);
+
+  useEffect(() => {
     if (!isAdminOpen) return;
     void refreshAdminQuality();
     void refreshAdminSystemHealth();
@@ -991,29 +1079,48 @@ function App() {
     }));
   };
 
+  const toggleTranscriptEditing = () => {
+    if (isTranscriptEditing && selectedSource !== null && supabase !== null) {
+      void updateStoredTranscriptSegments(supabase, selectedSource.id, selectedTranscriptSegments)
+        .catch((error) => console.error('Supabase 전사문 수정 저장 실패:', error));
+    }
+    setIsTranscriptEditing((value) => !value);
+  };
+
   const removeSourceItem = (sourceId: string) => {
     const targetSource = sourceItems.find((source) => source.id === sourceId);
+    const recordingBundleId = targetSource?.category === '녹음본'
+      ? targetSource.recordingId ?? targetSource.id
+      : undefined;
+    const removedSources = recordingBundleId === undefined
+      ? sourceItems.filter((source) => source.id === sourceId)
+      : sourceItems.filter((source) => source.id === sourceId || source.recordingId === recordingBundleId);
+    const removedSourceIds = new Set(removedSources.map((source) => source.id));
     if (targetSource?.audioUrl !== undefined) {
       savedAudioUrlsRef.current.delete(targetSource.audioUrl);
       URL.revokeObjectURL(targetSource.audioUrl);
     }
-    setSourceItems((currentSourceItems) => currentSourceItems.filter((source) => source.id !== sourceId));
+    setSourceItems((currentSourceItems) => currentSourceItems.filter((source) => !removedSourceIds.has(source.id)));
     if (activeProjectId !== null) {
       projectMaterialFilesRef.current[activeProjectId] = (projectMaterialFilesRef.current[activeProjectId] ?? [])
-        .filter((entry) => entry.source.id !== sourceId);
+        .filter((entry) => !removedSourceIds.has(entry.source.id));
     }
     if (targetSource !== undefined && activeProjectIndex !== null) {
+      const removedRecordingCount = removedSources.filter((source) => source.category === '녹음본').length;
+      const removedMaterialCount = removedSources.filter((source) => source.category === '자료').length;
       setProjects((currentProjects) => currentProjects.map((project, projectIndex) => {
         if (projectIndex !== activeProjectIndex) return project;
-        if (targetSource.category === '녹음본') {
-          return { ...project, recordings: Math.max(0, project.recordings - 1), updatedAt: '방금' };
-        }
-        return { ...project, materials: Math.max(0, project.materials - 1), updatedAt: '방금' };
+        return {
+          ...project,
+          recordings: Math.max(0, project.recordings - removedRecordingCount),
+          materials: Math.max(0, project.materials - removedMaterialCount),
+          updatedAt: '방금',
+        };
       }));
     }
     setTranscriptsBySourceId((currentTranscripts) => {
       const nextTranscripts = { ...currentTranscripts };
-      delete nextTranscripts[sourceId];
+      removedSourceIds.forEach((id) => delete nextTranscripts[id]);
       return nextTranscripts;
     });
     if (selectedSource?.id === sourceId) {
@@ -1021,6 +1128,14 @@ function App() {
       setIsSourceFullscreen(false);
     }
     if (lastTranscribedSourceId === sourceId) setLastTranscribedSourceId(null);
+    if (supabase !== null && targetSource?.storagePath !== undefined) {
+      void deleteProjectSource(
+        supabase,
+        sourceId,
+        targetSource.storagePath,
+        recordingBundleId,
+      ).catch((error) => console.error('Supabase 소스 삭제 실패:', error));
+    }
   };
 
   const renameSourceItem = (sourceId: string) => {
@@ -1029,13 +1144,18 @@ function App() {
     const nextTitle = window.prompt('녹음본 이름을 입력하세요.', targetSource.title)?.trim();
     if (!nextTitle) return;
 
+    const renamedSource = { ...targetSource, title: nextTitle, meta: targetSource.meta.replace(/^이름 변경 전 · /, '') };
     setSourceItems((currentSourceItems) => currentSourceItems.map((source) => (
-      source.id === sourceId ? { ...source, title: nextTitle, meta: source.meta.replace(/^이름 변경 전 · /, '') } : source
+      source.id === sourceId ? renamedSource : source
     )));
     setSelectedSource((currentSource) => (
       currentSource?.id === sourceId ? { ...currentSource, title: nextTitle } : currentSource
     ));
     setIsRecordingMenuOpen(false);
+    if (supabase !== null && targetSource.storagePath !== undefined) {
+      void updateProjectSourcePayload(supabase, sourceId, sourcePayloadForStorage(renamedSource))
+        .catch((error) => console.error('Supabase 소스 이름 저장 실패:', error));
+    }
   };
 
   const createMaterialItems = (
@@ -1095,6 +1215,57 @@ function App() {
     }
   };
 
+  const persistMaterialFile = async (
+    file: File,
+    source: SourceItem,
+    projectId: string,
+    scope: 'project' | 'recording',
+    recordingId?: string,
+  ) => {
+    if (supabase === null || currentUser === null) return source;
+    const row = await uploadProjectSource({
+      client: supabase,
+      userId: currentUser.id,
+      projectId,
+      sourceId: source.id,
+      recordingId,
+      scope,
+      kind: 'document',
+      file,
+      fileName: file.name,
+      mimeType: file.type,
+      sourcePayload: sourcePayloadForStorage({ ...source, recordingId }),
+    });
+    const persistedSource: SourceItem = {
+      ...source,
+      recordingId,
+      storagePath: row.storage_path,
+      mimeType: row.mime_type ?? undefined,
+      sizeBytes: row.size_bytes,
+    };
+    setSourceItems((items) => items.map((item) => item.id === source.id ? persistedSource : item));
+    return persistedSource;
+  };
+
+  const getProjectMaterialsForTranscription = async (projectId: string) => {
+    const localMaterials = projectMaterialFilesRef.current[projectId] ?? [];
+    if (supabase === null) return localMaterials;
+    const client = supabase;
+    const localIds = new Set(localMaterials.map(({ source }) => source.id));
+    const storedMaterials = sourceItems.filter((source) => (
+      source.category === '자료'
+      && source.materialScope === 'project'
+      && source.storagePath !== undefined
+      && !localIds.has(source.id)
+    ));
+    const downloadedMaterials = await Promise.all(storedMaterials.map(async (source) => {
+      const blob = await downloadProjectSource(client, source.storagePath ?? '');
+      const file = new File([blob], source.title, { type: source.mimeType ?? blob.type });
+      return { source, file };
+    }));
+    return [...localMaterials, ...downloadedMaterials];
+  };
+
   const addProjectMaterialFiles = (files: FileList | File[]) => {
     const fileList = Array.from(files).filter((file) => file.size > 0 || file.name.trim().length > 0);
     const nextMaterials = createMaterialItems(fileList, 'material', 'project');
@@ -1121,8 +1292,19 @@ function App() {
       )));
     }
 
-    // 문서 형식이면 내부 API로 업로드해 청킹→Neo4j 적재까지 반영한다.
+    // 원본은 Supabase Storage에 보존하고, 분석 가능한 문서는 Neo4j에도 반영한다.
     fileList.forEach((file, index) => {
+      if (projectId !== null) {
+        void persistMaterialFile(file, nextMaterials[index], projectId, 'project').then((persistedSource) => {
+          projectMaterialFilesRef.current[projectId] = (projectMaterialFilesRef.current[projectId] ?? [])
+            .map((entry) => entry.source.id === persistedSource.id ? { ...entry, source: persistedSource } : entry);
+        }).catch((error) => {
+          console.error('프로젝트 자료 저장 실패:', error);
+          setSourceItems((items) => items.map((source) => source.id === nextMaterials[index].id
+            ? { ...source, meta: `${source.meta} · 저장 실패` }
+            : source));
+        });
+      }
       if (isGraphIngestibleDocument(file)) void uploadMaterialToGraph(file, nextMaterials[index].id, activeProjectId);
     });
 
@@ -1283,28 +1465,32 @@ function App() {
       setTranscriptionError('전사할 녹음 파일이 없습니다.');
       return;
     }
+    if (activeProjectId === null) {
+      setTranscriptionError('프로젝트를 먼저 선택해주세요.');
+      return;
+    }
 
     setTranscriptionError(null);
     setTranscriptionState('transcribing');
     setTranscriptionStep(1);
-
-    const body = new FormData();
-    body.append('audio', recordedAudioBlob, recordedAudioFileName ?? `synapvox-recording-${Date.now()}.webm`);
-    const projectMaterialsForTranscription = activeProjectId === null
-      ? []
-      : projectMaterialFilesRef.current[activeProjectId] ?? [];
-    projectMaterialsForTranscription.forEach(({ file }) => {
-      body.append('materials', file, file.name);
-    });
-    recordingMaterialFiles.forEach((file) => {
-      body.append('materials', file, file.name);
-    });
-    const graphProjectId = activeProjectId ?? 'local-project';
-    const meetingId = `meeting-${Date.now()}`;
-    body.append('project_id', graphProjectId);
-    body.append('meeting_id', meetingId);
+    const now = new Date();
+    const recordingId = `recording-${now.getTime()}`;
+    const meetingId = `meeting-${now.getTime()}`;
+    const audioFileName = recordedAudioFileName ?? `synapvox-recording-${now.getTime()}.webm`;
 
     try {
+      const projectMaterialsForTranscription = await getProjectMaterialsForTranscription(activeProjectId);
+      const body = new FormData();
+      body.append('audio', recordedAudioBlob, audioFileName);
+      projectMaterialsForTranscription.forEach(({ file }) => {
+        body.append('materials', file, file.name);
+      });
+      recordingMaterialFiles.forEach((file) => {
+        body.append('materials', file, file.name);
+      });
+      body.append('project_id', activeProjectId);
+      body.append('meeting_id', meetingId);
+
       await new Promise((resolve) => window.setTimeout(resolve, 250));
       setTranscriptionStep(2);
       const response = await fetch('/api/stt/transcribe', {
@@ -1345,20 +1531,30 @@ function App() {
         console.error('전사 결과를 그래프에 반영하지 못했습니다:', error);
       }
       const savedTranscriptSegments = transcriptSegments;
-      const now = new Date();
       const timeLabel = now.toLocaleTimeString('ko-KR', {
         hour: '2-digit',
         minute: '2-digit',
         hour12: false,
       });
-      const recordingId = `recording-${now.getTime()}`;
+      let persistedRecordingMaterials = recordingAttachedMaterials;
+      if (supabase !== null && currentUser !== null) {
+        persistedRecordingMaterials = await Promise.all(recordingMaterialFiles.map((file, index) => (
+          persistMaterialFile(
+            file,
+            recordingAttachedMaterials[index],
+            activeProjectId,
+            'recording',
+            recordingId,
+          )
+        )));
+      }
       const linkedMaterials = [
         ...projectMaterialsForTranscription.map((entry) => entry.source),
-        ...recordingAttachedMaterials,
+        ...persistedRecordingMaterials,
       ].filter((material, index, materials) => (
         materials.findIndex((candidate) => candidate.id === material.id) === index
       ));
-      const savedRecording: SourceItem = {
+      let savedRecording: SourceItem = {
         id: recordingId,
         title: getRecordingTitle(recordedAudioFileName, `녹음본 ${timeLabel}`),
         type: recordedAudioFileName === null ? '녹음' : '파일',
@@ -1369,7 +1565,39 @@ function App() {
         durationLabel: recordedAudioDurationLabel,
         attachedMaterials: linkedMaterials,
         mediaKind: recordedMediaKind,
+        recordingId,
       };
+      if (supabase !== null && currentUser !== null) {
+        const audioRow = await uploadProjectSource({
+          client: supabase,
+          userId: currentUser.id,
+          projectId: activeProjectId,
+          sourceId: recordingId,
+          recordingId,
+          scope: 'recording',
+          kind: 'audio',
+          file: recordedAudioBlob,
+          fileName: audioFileName,
+          mimeType: recordedAudioBlob.type,
+          durationSeconds: durationLabelToSeconds(recordedAudioDurationLabel),
+          sourcePayload: sourcePayloadForStorage(savedRecording),
+        });
+        savedRecording = {
+          ...savedRecording,
+          storagePath: audioRow.storage_path,
+          mimeType: audioRow.mime_type ?? undefined,
+          sizeBytes: audioRow.size_bytes,
+        };
+        await saveRecordingTranscript({
+          client: supabase,
+          userId: currentUser.id,
+          projectId: activeProjectId,
+          recordingId,
+          meetingId,
+          intermediateJson: result as unknown as Record<string, unknown>,
+          segments: savedTranscriptSegments,
+        });
+      }
       if (recordedAudioUrl !== null) savedAudioUrlsRef.current.add(recordedAudioUrl);
       setSourceItems((currentSourceItems) => [
         savedRecording,
@@ -1393,6 +1621,10 @@ function App() {
       setTranscriptionState('done');
       setTranscriptionStep(3);
     } catch (error) {
+      if (supabase !== null) {
+        void deleteProjectSource(supabase, recordingId, undefined, recordingId)
+          .catch((cleanupError) => console.error('실패한 녹음 저장 정리 실패:', cleanupError));
+      }
       setTranscriptionState('idle');
       setTranscriptionStep(0);
       setTranscriptionError(error instanceof Error ? error.message : '전사 중 문제가 발생했습니다.');
@@ -2774,9 +3006,9 @@ function App() {
                     </p>
                   </div>
                 )}
-                {(projectMaterialFiles.length > 0 || recordingAttachedMaterials.length > 0) && (
+                {(projectMaterialSources.length > 0 || recordingAttachedMaterials.length > 0) && (
                   <div className="record-attached-list" aria-label="이 녹음본에 연결된 자료">
-                    {projectMaterialFiles.map(({ source }) => (
+                    {projectMaterialSources.map((source) => (
                       <span key={source.id}>
                         <b>공통</b>
                         {source.title}
@@ -3000,7 +3232,7 @@ function App() {
                         <div>
                           <button
                             type="button"
-                            onClick={() => setIsTranscriptEditing((value) => !value)}
+                            onClick={toggleTranscriptEditing}
                             disabled={selectedTranscriptSegments.length === 0}
                           >
                             {isTranscriptEditing ? '완료' : '편집'}
