@@ -6,7 +6,7 @@ integration 계층(D)이 소비하는 공개 API:
     from backend.graphrag import GraphStore, VectorStore, HybridSearch, timeline, meetings_by_topic
 
     driver = GraphDatabase.driver(uri, auth=(user, pw))
-    gs, vs = GraphStore(driver), VectorStore(embed_fn=my_openai_embed)  # embed_fn 미지정 시 해싱(오프라인)
+    gs, vs = GraphStore(driver), VectorStore()  # embed_fn 미지정 시 OpenAI text-embedding-3-small(임시, SUPABASE_DB_URL 필요)
 
     gs.load_intermediate(intermediate_format)          # STT 중간포맷 → Project·Meeting
     gs.load_chunks(pid, mid, chunks)                   # chunking 청크 → Chunk (+벡터)
@@ -18,9 +18,9 @@ integration 계층(D)이 소비하는 공개 API:
 """
 
 from .graph_store import GraphStore
-from .vector_store import VectorStore, hashing_embed
+from .vector_store import VectorStore, hashing_embed, openai_embed
 from .search import HybridSearch
 from .queries import timeline, meetings_by_topic, decision_history
 
-__all__ = ["GraphStore", "VectorStore", "hashing_embed", "HybridSearch",
+__all__ = ["GraphStore", "VectorStore", "hashing_embed", "openai_embed", "HybridSearch",
            "timeline", "meetings_by_topic", "decision_history"]

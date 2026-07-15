@@ -1,14 +1,19 @@
 """VectorStore — 청크 임베딩 저장/검색 (Supabase Postgres + pgvector).
 
 schemas/graph_vector_db.md: "청크 임베딩 + 메타데이터. 메타데이터 필터: project_id, meeting_id, source_type."
-임베딩은 주입식(embed_fn). 기본은 의존성 없는 결정론적 해싱 임베더(테스트용) —
-실서비스는 OpenAI 등 embed_fn을 주입한다. chunk_id로 Graph DB의 Chunk.vector_ref와 교차 참조.
+임베딩은 주입식(embed_fn). chunk_id로 Graph DB의 Chunk.vector_ref와 교차 참조.
 
 **2026-07-15부터 Chroma에서 pgvector로 전환** (팀 결정 — 공통 벡터 스토어로 Supabase 채택).
 연결은 SUPABASE_DB_URL 환경변수(Postgres 연결문자열)로 주입한다. **Session Pooler 문자열을
 쓸 것** — Direct connection 호스트(`db.<ref>.supabase.co`)는 IPv6 전용이라 IPv6 미지원
 네트워크에서 `could not translate host name` 에러로 연결이 실패한다. 대시보드 Connect →
 Session pooler에서 복사.
+
+**기본 embed_fn은 OpenAI `text-embedding-3-small`(임시, 사용자 지시 — 팀 확정 사항 아님, 추후
+바뀔 수 있음)** — `backend/stt/refine_transcript.py`가 이미 같은 모델(1536차원)을 쓰고 있어서
+그쪽과 호환. OPENAI_API_KEY 필요. 오프라인/결정론적 테스트가 필요하면 `embed_fn=hashing_embed`로
+주입해서 대체 가능(여전히 export됨) — 단, 같은 테이블 안에서 embed_fn을 섞어 쓰면 벡터 차원이
+달라 조회가 깨지니 주의.
 """
 
 import hashlib
@@ -17,9 +22,11 @@ import os
 import psycopg2
 from psycopg2.extras import execute_values
 
+_openai_client = None
+
 
 def hashing_embed(text: str, dim: int = 256) -> list[float]:
-    """의존성 없는 결정론적 임베더 (문자 n-gram 해싱). 실서비스는 embed_fn 주입으로 대체."""
+    """의존성 없는 결정론적 임베더 (문자 n-gram 해싱). 오프라인 테스트용 — embed_fn으로 주입해서 사용."""
     v = [0.0] * dim
     t = " ".join((text or "").split())
     for n in (2, 3):
@@ -30,9 +37,18 @@ def hashing_embed(text: str, dim: int = 256) -> list[float]:
     return [x / norm for x in v] if norm else v
 
 
+def openai_embed(text: str, model: str = "text-embedding-3-small") -> list[float]:
+    """VectorStore의 기본 embed_fn (임시 — 모델 선택은 팀 확정 전, 추후 변경될 수 있음)."""
+    global _openai_client
+    if _openai_client is None:
+        from openai import OpenAI
+        _openai_client = OpenAI()
+    return _openai_client.embeddings.create(model=model, input=text or "").data[0].embedding
+
+
 class VectorStore:
     def __init__(self, embed_fn=None, dsn: str | None = None, table: str = "chunks"):
-        self.embed_fn = embed_fn or hashing_embed
+        self.embed_fn = embed_fn or openai_embed
         self.table = table
         self.conn = psycopg2.connect(dsn or os.environ["SUPABASE_DB_URL"])
         self._init_schema()

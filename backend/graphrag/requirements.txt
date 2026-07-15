@@ -1,3 +1,4 @@
 # graphrag 모듈 의존성
 neo4j>=5.26
 psycopg2-binary>=2.9
+openai>=1.0

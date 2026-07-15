@@ -1,6 +1,7 @@
-"""graphrag 모듈 테스트. Neo4j/Supabase가 없으면 skip (CONTRIBUTING: 자기 모듈 변경은 가볍게).
+"""graphrag 모듈 테스트. Neo4j/Supabase/OpenAI 크리덴셜이 없으면 skip (CONTRIBUTING: 자기 모듈 변경은 가볍게).
 
-로컬 실행 전제: Neo4j 실행 + 환경변수 NEO4J_URI/USER/PASSWORD, VectorStore용 SUPABASE_DB_URL.
+로컬 실행 전제: Neo4j 실행 + 환경변수 NEO4J_URI/USER/PASSWORD, VectorStore용 SUPABASE_DB_URL +
+OPENAI_API_KEY(기본 embed_fn이 OpenAI라 실제 API 호출 발생).
   docker run -d --name svx-neo4j -p 7687:7687 -e NEO4J_AUTH=neo4j/synapvox123 neo4j:5.26
 """
 
@@ -58,7 +59,9 @@ def driver():
 def vector_store():
     if not os.environ.get("SUPABASE_DB_URL"):
         pytest.skip("SUPABASE_DB_URL 미설정 → VectorStore(pgvector) 테스트 skip")
-    return VectorStore()  # 해싱 임베더(기본)
+    if not os.environ.get("OPENAI_API_KEY"):
+        pytest.skip("OPENAI_API_KEY 미설정 → VectorStore 기본 embed_fn(OpenAI) 테스트 skip")
+    return VectorStore()  # 기본 embed_fn = openai_embed(임시)
 
 
 @pytest.fixture(scope="module")
