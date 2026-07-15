@@ -196,6 +196,15 @@ def _topic_id(project_id: str, name: str) -> str:
     return f"topic-{digest}"
 
 
+def _document_digest(project_id: str, title: str) -> str:
+    return hashlib.sha1(f"{project_id}\x1f{title}".encode("utf-8")).hexdigest()[:16]
+
+
+def document_chunk_prefix(project_id: str, title: str) -> str:
+    """Return the deterministic chunk prefix used for one project document."""
+    return f"doc-{_document_digest(project_id, title)}-d"
+
+
 def extract_chunk_topics(project_id: str, chunk: dict, top_n: int = 7) -> dict:
     """기존 키워드 추출기를 llm_extraction 계약의 Topic 형태로 변환한다."""
     topics = [
@@ -245,9 +254,10 @@ def ingest_document_text(
     vector_store=None,
     meeting_id: str | None = None,
     max_chars: int = 800,
+    document_id: str | None = None,
 ) -> dict:
     """이미 추출된 프로젝트 자료를 기존 적재 파이프라인으로 저장한다."""
-    doc_digest = hashlib.sha1(f"{project_id}\x1f{title}".encode("utf-8")).hexdigest()[:16]
+    doc_digest = _document_digest(project_id, document_id or title)
     mid = meeting_id or f"document-{doc_digest}"
     intermediate = {
         "source": title,

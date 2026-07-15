@@ -68,24 +68,27 @@ def test_api_ingest_stt_uses_active_project(monkeypatch):
 def test_api_ingest_doc_stores_text_file(monkeypatch):
     import backend.graphrag as graphrag
     from backend.integration import pipeline
+    captured = {}
     monkeypatch.setattr(api_main, "_graph_runtime", lambda: (None, object(), None))
     monkeypatch.setattr(api_main, "_optional_vector_store", lambda: None)
     monkeypatch.setattr(graphrag, "graph_data", lambda driver, project, database: {
         "nodes": [{"id": "t1", "type": "concept", "label": "graph", "meta": {}}], "edges": [],
     })
-    monkeypatch.setattr(
-        pipeline, "ingest_document_text",
-        lambda text, title, project, store, vector, meeting: {
+    def fake_ingest(text, title, project, store, vector, meeting, document_id=None):
+        captured["document_id"] = document_id
+        return {
             "project_id": project, "meeting_id": meeting, "chunks": [{"chunk_id": "c1"}],
             "topic_ids": ["t1"], "relations": 0,
-        },
-    )
+        }
+
+    monkeypatch.setattr(pipeline, "ingest_document_text", fake_ingest)
 
     response = TestClient(app).post(
         "/api/ingest-doc",
         headers={
             "X-Project-Id": "project-uuid",
             "X-Meeting-Id": "lecture-01",
+            "X-Source-Id": "material-123",
             "X-API-Key": "test-key",
         },
         files={"file": ("notes.txt", b"graph theory notes", "text/plain")},
@@ -101,6 +104,7 @@ def test_api_ingest_doc_stores_text_file(monkeypatch):
         "concepts_total": 1,
         "relations_new": 0,
     }
+    assert captured["document_id"] == "material-123"
 
 
 def test_api_graph_and_ask_use_current_project(monkeypatch):
@@ -136,3 +140,72 @@ def test_api_graph_and_ask_use_current_project(monkeypatch):
     assert graph.json()["nodes"][0]["id"] == "project-uuid"
     assert answer.status_code == 200
     assert answer.json()["answer"] == "질문"
+
+
+def test_delete_recording_source_removes_graph_meeting_and_vectors(monkeypatch):
+    calls = []
+
+    class _GraphStore:
+        def delete_meeting(self, project, meeting):
+            calls.append(("graph", project, meeting))
+            return 3
+
+    class _VectorStore:
+        def delete_meeting(self, project, meeting):
+            calls.append(("vector", project, meeting))
+            return 3
+
+    monkeypatch.setattr(api_main, "_owned_source_record", lambda user, source: {
+        "id": source,
+        "project_id": "project-uuid",
+        "recording_id": "recording-123",
+        "kind": "audio",
+        "original_name": "lecture.webm",
+        "source_payload": {"graphMeetingId": "meeting-123"},
+    })
+    monkeypatch.setattr(api_main, "_graph_runtime", lambda: (object(), _GraphStore(), "neo4j"))
+    monkeypatch.setattr(api_main, "_vector_store", lambda: _VectorStore())
+
+    response = TestClient(app).delete("/api/source-graph", params={"source_id": "recording-123"})
+
+    assert response.status_code == 200
+    assert response.json()["graph_chunks_deleted"] == 3
+    assert calls == [
+        ("graph", "project-uuid", "meeting-123"),
+        ("vector", "project-uuid", "meeting-123"),
+    ]
+
+
+def test_delete_document_source_removes_only_its_chunk_prefix(monkeypatch):
+    calls = []
+
+    class _GraphStore:
+        def delete_chunks_by_prefix(self, project, prefix):
+            calls.append(("graph", project, prefix))
+            return 2
+
+    class _VectorStore:
+        def delete_chunks_by_prefix(self, project, prefix):
+            calls.append(("vector", project, prefix))
+            return 2
+
+    monkeypatch.setattr(api_main, "_owned_source_record", lambda user, source: {
+        "id": source,
+        "project_id": "project-uuid",
+        "recording_id": "recording-123",
+        "kind": "document",
+        "original_name": "lecture-notes.pdf",
+        "source_payload": {},
+    })
+    monkeypatch.setattr(api_main, "_graph_runtime", lambda: (object(), _GraphStore(), "neo4j"))
+    monkeypatch.setattr(api_main, "_vector_store", lambda: _VectorStore())
+
+    response = TestClient(app).delete("/api/source-graph", params={"source_id": "material-123"})
+
+    assert response.status_code == 200
+    prefix = response.json()["chunk_prefix"]
+    assert prefix.startswith("doc-") and prefix.endswith("-d")
+    assert calls == [
+        ("graph", "project-uuid", prefix),
+        ("vector", "project-uuid", prefix),
+    ]

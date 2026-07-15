@@ -40,6 +40,7 @@ type SourceItem = {
   attachedMaterials?: SourceItem[];
   mediaKind?: 'audio' | 'video';
   recordingId?: string;
+  graphMeetingId?: string;
   storagePath?: string;
   mimeType?: string;
   sizeBytes?: number;
@@ -251,6 +252,7 @@ const hydrateStoredSource = (row: StoredSourceRow, signedAudioUrl?: string): Sou
       : [],
     mediaKind: payload.mediaKind === 'video' ? 'video' : row.kind === 'audio' ? 'audio' : undefined,
     recordingId: row.recording_id ?? undefined,
+    graphMeetingId: typeof payload.graphMeetingId === 'string' ? payload.graphMeetingId : undefined,
     storagePath: row.storage_path,
     mimeType: row.mime_type ?? undefined,
     sizeBytes: row.size_bytes,
@@ -293,6 +295,9 @@ function App() {
   });
   const [isProjectTitleEditing, setIsProjectTitleEditing] = useState(false);
   const [isSourceEditing, setIsSourceEditing] = useState(false);
+  const [pendingSourceDeletion, setPendingSourceDeletion] = useState<SourceItem | null>(null);
+  const [sourceDeletionState, setSourceDeletionState] = useState<'idle' | 'deleting'>('idle');
+  const [sourceDeletionError, setSourceDeletionError] = useState<string | null>(null);
   const [projectEditDraft, setProjectEditDraft] = useState({
     name: '',
     description: '',
@@ -752,6 +757,8 @@ function App() {
       setSourceItems(saved?.sources ?? []);
       setTranscriptsBySourceId(saved?.transcripts ?? {});
       setSelectedSource(null);
+      setPendingSourceDeletion(null);
+      setSourceDeletionError(null);
     }
     prevProjectIdRef.current = activeProjectId;
   }, [activeProjectId, persistProjectWorkspaces]);
@@ -1087,7 +1094,7 @@ function App() {
     setIsTranscriptEditing((value) => !value);
   };
 
-  const removeSourceItem = (sourceId: string) => {
+  const removeSourceItem = async (sourceId: string) => {
     const targetSource = sourceItems.find((source) => source.id === sourceId);
     const recordingBundleId = targetSource?.category === '녹음본'
       ? targetSource.recordingId ?? targetSource.id
@@ -1096,6 +1103,14 @@ function App() {
       ? sourceItems.filter((source) => source.id === sourceId)
       : sourceItems.filter((source) => source.id === sourceId || source.recordingId === recordingBundleId);
     const removedSourceIds = new Set(removedSources.map((source) => source.id));
+    if (supabase !== null && targetSource?.storagePath !== undefined) {
+      await deleteProjectSource(
+        supabase,
+        sourceId,
+        targetSource.storagePath,
+        recordingBundleId,
+      );
+    }
     if (targetSource?.audioUrl !== undefined) {
       savedAudioUrlsRef.current.delete(targetSource.audioUrl);
       URL.revokeObjectURL(targetSource.audioUrl);
@@ -1128,13 +1143,42 @@ function App() {
       setIsSourceFullscreen(false);
     }
     if (lastTranscribedSourceId === sourceId) setLastTranscribedSourceId(null);
-    if (supabase !== null && targetSource?.storagePath !== undefined) {
-      void deleteProjectSource(
-        supabase,
-        sourceId,
-        targetSource.storagePath,
-        recordingBundleId,
-      ).catch((error) => console.error('Supabase 소스 삭제 실패:', error));
+  };
+
+  const requestSourceDeletion = (source: SourceItem) => {
+    setPendingSourceDeletion(source);
+    setSourceDeletionError(null);
+    setSourceDeletionState('idle');
+  };
+
+  const confirmSourceDeletion = async () => {
+    if (pendingSourceDeletion === null || sourceDeletionState === 'deleting') return;
+    setSourceDeletionState('deleting');
+    setSourceDeletionError(null);
+    try {
+      if (supabase !== null && pendingSourceDeletion.storagePath === undefined) {
+        throw new Error('소스 저장이 끝난 뒤 다시 시도해주세요.');
+      }
+      if (pendingSourceDeletion.storagePath !== undefined) {
+        const response = await fetch(
+          `/api/source-graph?source_id=${encodeURIComponent(pendingSourceDeletion.id)}`,
+          {
+            method: 'DELETE',
+            headers: await apiHeaders(activeProjectId),
+          },
+        );
+        if (!response.ok) {
+          const errorBody = await response.json().catch(() => null) as { detail?: string } | null;
+          throw new Error(errorBody?.detail ?? '그래프 데이터 삭제에 실패했습니다.');
+        }
+      }
+      await removeSourceItem(pendingSourceDeletion.id);
+      setPendingSourceDeletion(null);
+      setSourceDeletionState('idle');
+      setGraphReloadKey((value) => value + 1);
+    } catch (error) {
+      setSourceDeletionState('idle');
+      setSourceDeletionError(error instanceof Error ? error.message : '삭제 중 문제가 발생했습니다.');
     }
   };
 
@@ -1196,7 +1240,10 @@ function App() {
       form.append('file', file, file.name);
       const response = await fetch('/api/ingest-doc', {
         method: 'POST',
-        headers: await apiHeaders(projectId, meetingId),
+        headers: {
+          ...(await apiHeaders(projectId, meetingId)),
+          'X-Source-Id': itemId,
+        },
         body: form,
       });
       if (!response.ok) {
@@ -1221,6 +1268,7 @@ function App() {
     projectId: string,
     scope: 'project' | 'recording',
     recordingId?: string,
+    graphMeetingId?: string,
   ) => {
     if (supabase === null || currentUser === null) return source;
     const row = await uploadProjectSource({
@@ -1234,11 +1282,12 @@ function App() {
       file,
       fileName: file.name,
       mimeType: file.type,
-      sourcePayload: sourcePayloadForStorage({ ...source, recordingId }),
+      sourcePayload: sourcePayloadForStorage({ ...source, recordingId, graphMeetingId }),
     });
     const persistedSource: SourceItem = {
       ...source,
       recordingId,
+      graphMeetingId,
       storagePath: row.storage_path,
       mimeType: row.mime_type ?? undefined,
       sizeBytes: row.size_bytes,
@@ -1545,6 +1594,7 @@ function App() {
             activeProjectId,
             'recording',
             recordingId,
+            meetingId,
           )
         )));
       }
@@ -1566,6 +1616,7 @@ function App() {
         attachedMaterials: linkedMaterials,
         mediaKind: recordedMediaKind,
         recordingId,
+        graphMeetingId: meetingId,
       };
       if (supabase !== null && currentUser !== null) {
         const audioRow = await uploadProjectSource({
@@ -2629,7 +2680,7 @@ function App() {
                           className="source-delete-button"
                           type="button"
                           aria-label={`${source.title} 삭제`}
-                          onClick={() => removeSourceItem(source.id)}
+                          onClick={() => requestSourceDeletion(source)}
                         >
                           <svg viewBox="0 0 24 24" aria-hidden="true">
                             <path d="M3 6h18" />
@@ -2649,10 +2700,51 @@ function App() {
                   )}
                 </div>
 
+                {pendingSourceDeletion !== null && (
+                  <div className="source-delete-confirm-backdrop" role="presentation">
+                    <div
+                      className="source-delete-confirm"
+                      role="alertdialog"
+                      aria-modal="true"
+                      aria-labelledby="source-delete-confirm-title"
+                    >
+                      <strong id="source-delete-confirm-title">삭제하시겠습니까?</strong>
+                      <p title={pendingSourceDeletion.title}>{pendingSourceDeletion.title}</p>
+                      {sourceDeletionError !== null && (
+                        <span className="source-delete-error">{sourceDeletionError}</span>
+                      )}
+                      <div>
+                        <button
+                          type="button"
+                          disabled={sourceDeletionState === 'deleting'}
+                          onClick={() => {
+                            setPendingSourceDeletion(null);
+                            setSourceDeletionError(null);
+                          }}
+                        >
+                          취소
+                        </button>
+                        <button
+                          className="danger"
+                          type="button"
+                          disabled={sourceDeletionState === 'deleting'}
+                          onClick={() => void confirmSourceDeletion()}
+                        >
+                          {sourceDeletionState === 'deleting' ? '삭제 중…' : '삭제'}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
                 <button
                   className={`source-edit-toggle ${isSourceEditing ? 'editing' : ''}`}
                   type="button"
-                  onClick={() => setIsSourceEditing((value) => !value)}
+                  onClick={() => {
+                    setIsSourceEditing((value) => !value);
+                    setPendingSourceDeletion(null);
+                    setSourceDeletionError(null);
+                  }}
                 >
                   {isSourceEditing ? '완료' : '편집하기'}
                 </button>
@@ -3185,7 +3277,9 @@ function App() {
                         className="danger"
                         type="button"
                         onClick={() => {
-                          removeSourceItem(selectedSource.id);
+                          requestSourceDeletion(selectedSource);
+                          setSelectedSource(null);
+                          setIsSourceFullscreen(false);
                           setIsRecordingMenuOpen(false);
                         }}
                       >

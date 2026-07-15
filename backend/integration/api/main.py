@@ -341,6 +341,27 @@ def _optional_vector_store():
         return None
 
 
+def _owned_source_record(user_id: str, source_id: str) -> dict | None:
+    """Read deletion metadata only when the authenticated user owns the source."""
+    import psycopg2
+
+    with psycopg2.connect(os.environ["SUPABASE_DB_URL"]) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT id, project_id, recording_id, kind, original_name, source_payload
+                   FROM public.project_sources
+                   WHERE id = %s AND owner_id = %s""",
+                (source_id, user_id),
+            )
+            row = cursor.fetchone()
+    if row is None:
+        return None
+    return dict(zip(
+        ("id", "project_id", "recording_id", "kind", "original_name", "source_payload"),
+        row,
+    ))
+
+
 def _answer_from_hits(question: str, hits: list[dict]) -> str:
     if not hits:
         return "아직 이 프로젝트에서 질문과 관련된 자료나 전사문을 찾지 못했습니다."
@@ -401,6 +422,7 @@ async def ingest_doc_to_graph(
     file: UploadFile = File(...),
     x_project_id: str | None = Header(None, alias="X-Project-Id"),
     x_meeting_id: str | None = Header(None, alias="X-Meeting-Id"),
+    x_source_id: str | None = Header(None, alias="X-Source-Id"),
     user: dict = Depends(require_user),
 ) -> dict:
     """자료 텍스트를 현재 프로젝트에 적재한다. X-Meeting-Id가 있으면 해당 녹음본에 연결한다."""
@@ -428,9 +450,23 @@ async def ingest_doc_to_graph(
         try:
             from backend.integration.pipeline import ingest_document_text
             driver, graph_store, database = _graph_runtime()
-            result = await run_in_threadpool(
-                ingest_document_text, text, title, x_project_id, graph_store,
-                _optional_vector_store(), x_meeting_id)
+            if x_source_id:
+                from functools import partial
+                ingest = partial(
+                    ingest_document_text,
+                    text,
+                    title,
+                    x_project_id,
+                    graph_store,
+                    _optional_vector_store(),
+                    x_meeting_id,
+                    document_id=x_source_id,
+                )
+                result = await run_in_threadpool(ingest)
+            else:
+                result = await run_in_threadpool(
+                    ingest_document_text, text, title, x_project_id, graph_store,
+                    _optional_vector_store(), x_meeting_id)
             from backend.graphrag import graph_data
             graph = await run_in_threadpool(graph_data, driver, x_project_id, database)
             return {
@@ -444,6 +480,62 @@ async def ingest_doc_to_graph(
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
+
+
+@app.delete("/api/source-graph")
+async def delete_source_graph(
+    source_id: str = Query(..., min_length=1),
+    user: dict = Depends(require_user),
+) -> dict:
+    """Delete the Neo4j and pgvector data belonging to one owned source."""
+    user_id = str(user.get("sub") or "")
+    source = await run_in_threadpool(_owned_source_record, user_id, source_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="source not found")
+
+    project_id = source["project_id"]
+    _, graph_store, _ = _graph_runtime()
+    try:
+        vector_store = _vector_store()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"vector database is not configured: {exc}") from exc
+    if source["kind"] == "audio":
+        payload = source.get("source_payload") or {}
+        meeting_id = payload.get("graphMeetingId") if isinstance(payload, dict) else None
+        if not meeting_id:
+            meeting_id = source.get("recording_id") or source_id
+            if meeting_id.startswith("recording-"):
+                meeting_id = meeting_id.replace("recording-", "meeting-", 1)
+        graph_deleted = await run_in_threadpool(graph_store.delete_meeting, project_id, meeting_id)
+        vector_deleted = await run_in_threadpool(vector_store.delete_meeting, project_id, meeting_id)
+        return {
+            "source_id": source_id,
+            "project_id": project_id,
+            "meeting_id": meeting_id,
+            "graph_chunks_deleted": graph_deleted,
+            "vector_chunks_deleted": vector_deleted,
+        }
+
+    from backend.integration.pipeline import document_chunk_prefix
+    chunk_prefix = document_chunk_prefix(project_id, source_id)
+    graph_deleted = await run_in_threadpool(
+        graph_store.delete_chunks_by_prefix, project_id, chunk_prefix)
+    if graph_deleted == 0:
+        title = Path(source["original_name"]).stem or source["original_name"]
+        legacy_prefix = document_chunk_prefix(project_id, title)
+        if legacy_prefix != chunk_prefix:
+            chunk_prefix = legacy_prefix
+            graph_deleted = await run_in_threadpool(
+                graph_store.delete_chunks_by_prefix, project_id, chunk_prefix)
+    vector_deleted = await run_in_threadpool(
+        vector_store.delete_chunks_by_prefix, project_id, chunk_prefix)
+    return {
+        "source_id": source_id,
+        "project_id": project_id,
+        "chunk_prefix": chunk_prefix,
+        "graph_chunks_deleted": graph_deleted,
+        "vector_chunks_deleted": vector_deleted,
+    }
 
 
 @app.get("/api/graph")

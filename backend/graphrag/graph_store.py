@@ -112,3 +112,83 @@ class GraphStore:
     def reset(self, project_id):
         with self._session() as s:
             s.run("MATCH (n {project_id:$pid}) DETACH DELETE n", pid=project_id)
+
+    def _prune_orphans(self, session, project_id: str):
+        session.run(
+            f"MATCH (m:{S.MEETING} {{project_id:$pid}})-[r:{S.DISCUSSES}]->(t:{S.TOPIC} {{project_id:$pid}}) "
+            f"WHERE NOT EXISTS {{ MATCH (m)-[:{S.HAS_CHUNK}]->(:{S.CHUNK})-[:{S.DISCUSSES}]->(t) }} "
+            "DELETE r",
+            pid=project_id,
+        )
+        session.run(
+            f"MATCH (t:{S.TOPIC} {{project_id:$pid}}) "
+            f"WHERE NOT EXISTS {{ MATCH (:{S.CHUNK} {{project_id:$pid}})-[:{S.DISCUSSES}]->(t) }} "
+            "DETACH DELETE t",
+            pid=project_id,
+        )
+        session.run(
+            f"MATCH (d:{S.DECISION} {{project_id:$pid}}) "
+            f"WHERE NOT (d)-[:{S.DECIDED_IN}]->(:{S.MEETING}) DETACH DELETE d",
+            pid=project_id,
+        )
+        session.run(
+            f"MATCH (a:{S.ACTION_ITEM} {{project_id:$pid}}) "
+            f"WHERE NOT (a)-[:{S.RAISED_IN}]->(:{S.MEETING}) DETACH DELETE a",
+            pid=project_id,
+        )
+
+    def delete_meeting(self, project_id: str, meeting_id: str) -> int:
+        """Delete one recording/session and all graph nodes owned by its chunks."""
+        with self._session() as s:
+            record = s.run(
+                f"MATCH (m:{S.MEETING} {{project_id:$pid, meeting_id:$mid}}) "
+                f"OPTIONAL MATCH (m)-[:{S.HAS_CHUNK}]->(c:{S.CHUNK}) "
+                "RETURN count(DISTINCT c) AS chunks",
+                pid=project_id,
+                mid=meeting_id,
+            ).single()
+            deleted = int(record["chunks"] if record else 0)
+            s.run(
+                f"MATCH (m:{S.MEETING} {{project_id:$pid, meeting_id:$mid}})-[:{S.HAS_CHUNK}]->(c:{S.CHUNK}) "
+                "DETACH DELETE c",
+                pid=project_id,
+                mid=meeting_id,
+            )
+            s.run(
+                f"MATCH (m:{S.MEETING} {{project_id:$pid, meeting_id:$mid}}) DETACH DELETE m",
+                pid=project_id,
+                mid=meeting_id,
+            )
+            self._prune_orphans(s, project_id)
+        self._rebuild_follows(project_id)
+        return deleted
+
+    def delete_chunks_by_prefix(self, project_id: str, chunk_prefix: str) -> int:
+        """Delete one document's chunks while preserving other sources in the same meeting."""
+        with self._session() as s:
+            record = s.run(
+                f"MATCH (m:{S.MEETING} {{project_id:$pid}})-[:{S.HAS_CHUNK}]->"
+                f"(c:{S.CHUNK} {{project_id:$pid}}) "
+                "WHERE c.chunk_id STARTS WITH $prefix "
+                "RETURN collect(DISTINCT m.meeting_id) AS meetings, count(DISTINCT c) AS chunks",
+                pid=project_id,
+                prefix=chunk_prefix,
+            ).single()
+            meeting_ids = list(record["meetings"] or []) if record else []
+            deleted = int(record["chunks"] if record else 0)
+            s.run(
+                f"MATCH (c:{S.CHUNK} {{project_id:$pid}}) WHERE c.chunk_id STARTS WITH $prefix "
+                "DETACH DELETE c",
+                pid=project_id,
+                prefix=chunk_prefix,
+            )
+            for meeting_id in meeting_ids:
+                s.run(
+                    f"MATCH (m:{S.MEETING} {{project_id:$pid, meeting_id:$mid}}) "
+                    f"WHERE NOT (m)-[:{S.HAS_CHUNK}]->(:{S.CHUNK}) DETACH DELETE m",
+                    pid=project_id,
+                    mid=meeting_id,
+                )
+            self._prune_orphans(s, project_id)
+        self._rebuild_follows(project_id)
+        return deleted
