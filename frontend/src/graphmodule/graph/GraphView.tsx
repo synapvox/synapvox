@@ -229,7 +229,7 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
     // Fetch the primary project + any galaxy extras; each becomes a main-hub
     // cluster. Sub-nodes (sessions + concepts) render hollow, hubs filled, and
     // the hubs repel each other strongly (mainRepel) → far-apart topic clusters.
-    const toFetch = [project, ...(alsoShow ?? [])].filter((p, i, a) => !!p && a.indexOf(p) === i)
+    const toFetch = [project, ...alsoKey.split(',').filter(Boolean)].filter((p, i, a) => !!p && a.indexOf(p) === i)
     const multi = toFetch.length > 1
     Promise.all(toFetch.map((p) => getGraph(p).then((raw) => ({ p, built: buildForceData(mapGraph(raw)) }))))
       .then((results) => {
@@ -293,7 +293,7 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
       cancelled = true
       clearTimeout(coldTimer)
     }
-  }, [project, alsoKey, reloadKey, retryTick, onGraphMeta])
+  }, [project, alsoKey, reloadKey, retryTick, onGraphMeta, onSessions])
 
   // ── Tune d3-force like Obsidian, once per data load ───────────────────────
   // Runs after the graph mounts. Because ForceGraph2D only mounts once dims are
