@@ -36,7 +36,7 @@ Graph/Vector DB 스키마 — 노드/엣지 정의. → [`schemas/graph_vector_d
 `schemas/`에 명시하면 맞추겠습니다. `schemas/graph_vector_db.md`는 손대지 않았습니다(draft 그대로 구현).
 
 **레퍼런스**: 팀 스키마와 별개로, 동일 아이디어(세션 간 개념 연결 + GraphRAG)를 end-to-end로 돌려본
-단독 프로토타입 — https://github.com/click6067-ship-it/synapVOX (커스텀판 + Graphiti판). 하이브리드 검색·Neo4j
+단독 프로토타입 — https://github.com/synapvox/synapvox (커스텀판 + Graphiti판). 하이브리드 검색·Neo4j
 적재·시각화·RAG 답변을 실제로 확인해볼 수 있습니다. 가져다 참고용.
 
 ---

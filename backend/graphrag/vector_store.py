@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """VectorStore — 청크 임베딩 저장/검색 (Supabase Postgres + pgvector).
 
 schemas/graph_vector_db.md: "청크 임베딩 + 메타데이터. 메타데이터 필터: project_id, meeting_id, source_type."

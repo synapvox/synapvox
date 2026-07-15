@@ -5,17 +5,24 @@ import sys
 import tempfile
 import types
 import importlib.util
+import base64
+import hashlib
+import hmac
 import json
 import re
+import secrets
 import zipfile
-from datetime import date
+from contextlib import contextmanager
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+from pydantic import BaseModel, EmailStr
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
@@ -46,6 +53,8 @@ def _load_stt_module(module_name: str):
 _normalizer = _load_stt_module("stt_normalizer")
 validate = _normalizer.validate
 wrap_segments = _normalizer.wrap_segments
+_auth_schema_ready = False
+_auth_pool = None
 
 app = FastAPI(title="SynapVox Integration API")
 
@@ -56,6 +65,225 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+def warm_auth_database() -> None:
+    if os.getenv("SUPABASE_DB_URL"):
+        _prepare_auth_database()
+
+
+@app.on_event("shutdown")
+def close_auth_pool() -> None:
+    global _auth_pool
+    if _auth_pool is not None:
+        _auth_pool.closeall()
+        _auth_pool = None
+
+
+class SignupPayload(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
+
+
+class LoginPayload(BaseModel):
+    identifier: str
+    password: str
+
+
+class LogoutPayload(BaseModel):
+    token: Optional[str] = None
+
+
+def _load_psycopg2():
+    try:
+        import psycopg2
+        from psycopg2.pool import SimpleConnectionPool
+        from psycopg2.extras import RealDictCursor
+        from psycopg2.errors import UniqueViolation
+    except ModuleNotFoundError as exc:
+        raise HTTPException(status_code=503, detail="database driver is not installed.") from exc
+    return psycopg2, SimpleConnectionPool, RealDictCursor, UniqueViolation
+
+
+def _get_auth_pool():
+    global _auth_pool
+    if _auth_pool is not None:
+        return _auth_pool
+    dsn = os.getenv("SUPABASE_DB_URL")
+    if not dsn:
+        raise HTTPException(status_code=503, detail="SUPABASE_DB_URL is required for auth.")
+    _, SimpleConnectionPool, _, _ = _load_psycopg2()
+    max_connections = int(os.getenv("AUTH_DB_POOL_MAX", "4"))
+    _auth_pool = SimpleConnectionPool(1, max(1, max_connections), dsn)
+    return _auth_pool
+
+
+@contextmanager
+def _auth_connection():
+    pool = _get_auth_pool()
+    conn = pool.getconn()
+    try:
+        yield conn
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.rollback()
+        pool.putconn(conn)
+
+
+def _prepare_auth_database() -> None:
+    with _auth_connection() as conn:
+        _ensure_auth_schema(conn)
+
+
+def _ensure_auth_schema(conn) -> None:
+    global _auth_schema_ready
+    if _auth_schema_ready:
+        return
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS app_users (
+                id UUID PRIMARY KEY,
+                email TEXT NOT NULL UNIQUE,
+                display_name TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS auth_sessions (
+                token_hash TEXT PRIMARY KEY,
+                user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                expires_at TIMESTAMPTZ NOT NULL
+            );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS auth_sessions_user_id_idx ON auth_sessions (user_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS auth_sessions_expires_at_idx ON auth_sessions (expires_at);")
+    conn.commit()
+    _auth_schema_ready = True
+
+
+def _password_hash(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    iterations = 210_000
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return "pbkdf2_sha256${}${}${}".format(
+        iterations,
+        base64.b64encode(salt).decode("ascii"),
+        base64.b64encode(digest).decode("ascii"),
+    )
+
+
+def _verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        algorithm, iterations, salt, digest = stored_hash.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        expected = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            base64.b64decode(salt),
+            int(iterations),
+        )
+        return hmac.compare_digest(expected, base64.b64decode(digest))
+    except Exception:
+        return False
+
+
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _public_user(row: dict) -> dict:
+    return {
+        "id": str(row["id"]),
+        "email": row["email"],
+        "name": row["display_name"],
+        "role": row["role"],
+    }
+
+
+def _create_session(conn, user_id: str) -> dict:
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.now(timezone.utc) + timedelta(days=30)
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO auth_sessions (token_hash, user_id, expires_at) VALUES (%s, %s, %s)",
+            (_hash_token(token), user_id, expires_at),
+        )
+    conn.commit()
+    return {"token": token, "expiresAt": expires_at.isoformat()}
+
+
+def _signup_user(payload: SignupPayload) -> dict:
+    name = payload.name.strip()
+    email = payload.email.lower().strip()
+    password = payload.password
+    if len(name) < 1:
+        raise HTTPException(status_code=400, detail="이름을 입력해주세요.")
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="비밀번호는 6자 이상이어야 합니다.")
+
+    _, _, RealDictCursor, UniqueViolation = _load_psycopg2()
+    with _auth_connection() as conn:
+        _ensure_auth_schema(conn)
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    INSERT INTO app_users (id, email, display_name, password_hash)
+                    VALUES (%s, %s, %s, %s)
+                    RETURNING id, email, display_name, role
+                    """,
+                    (str(uuid4()), email, name, _password_hash(password)),
+                )
+                user = dict(cur.fetchone())
+            session = _create_session(conn, str(user["id"]))
+        except UniqueViolation as exc:
+            conn.rollback()
+            raise HTTPException(status_code=409, detail="이미 가입된 이메일입니다.") from exc
+    return {"user": _public_user(user), "session": session}
+
+
+def _login_user(payload: LoginPayload) -> dict:
+    identifier = payload.identifier.lower().strip()
+    if not identifier or not payload.password:
+        raise HTTPException(status_code=400, detail="아이디와 비밀번호를 입력해주세요.")
+
+    _, _, RealDictCursor, _ = _load_psycopg2()
+    with _auth_connection() as conn:
+        _ensure_auth_schema(conn)
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, email, display_name, password_hash, role
+                FROM app_users
+                WHERE email = %s
+                """,
+                (identifier,),
+            )
+            user = cur.fetchone()
+        if user is None or not _verify_password(payload.password, user["password_hash"]):
+            raise HTTPException(status_code=401, detail="아이디 또는 비밀번호가 올바르지 않습니다.")
+        session = _create_session(conn, str(user["id"]))
+    return {"user": _public_user(dict(user)), "session": session}
+
+
+def _logout_user(payload: LogoutPayload) -> dict:
+    if not payload.token:
+        return {"ok": True}
+    with _auth_connection() as conn:
+        _ensure_auth_schema(conn)
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM auth_sessions WHERE token_hash = %s", (_hash_token(payload.token),))
+        conn.commit()
+    return {"ok": True}
 
 
 def _extension(filename: str | None, content_type: str | None) -> str:
@@ -211,6 +439,21 @@ def _transcribe_with_clova(audio_path: str, source: str, project_id: str, meetin
 @app.get("/api/health")
 def health() -> dict:
     return {"ok": True}
+
+
+@app.post("/api/auth/signup")
+async def signup(payload: SignupPayload) -> dict:
+    return await run_in_threadpool(_signup_user, payload)
+
+
+@app.post("/api/auth/login")
+async def login(payload: LoginPayload) -> dict:
+    return await run_in_threadpool(_login_user, payload)
+
+
+@app.post("/api/auth/logout")
+async def logout(payload: LogoutPayload) -> dict:
+    return await run_in_threadpool(_logout_user, payload)
 
 
 @app.post("/api/stt/transcribe")
