@@ -737,6 +737,12 @@ button {
   color: #a79a87;
 }
 
+.auth-error {
+  margin: -4px 0 0;
+  color: #c0392b;
+  font-size: 13px;
+}
+
 .auth-submit {
   height: 44px;
   margin-top: 4px;
@@ -745,6 +751,10 @@ button {
   background: var(--ink);
   color: #fffaf3;
   font-weight: 800;
+}
+
+.auth-submit:disabled {
+  opacity: 0.6;
 }
 
 .auth-switch {

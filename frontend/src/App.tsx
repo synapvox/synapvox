@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type PointerEvent, type WheelEvent } from 'react';
 import './App.css';
+import { supabase } from './lib/supabaseClient';
 
 type Project = {
   id: string;              // gsvx 하위 네임스페이스 키 (X-Project-Id 헤더로 전달, ASCII 슬러그)
@@ -226,7 +227,12 @@ function App() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [activeProjectIndex, setActiveProjectIndex] = useState<number | null>(null);
   const [isProfileOpen, setIsProfileOpen] = useState(false);
-  const [isLoggedIn, setIsLoggedIn] = useState(true);
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authName, setAuthName] = useState('');
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [authLoading, setAuthLoading] = useState(false);
   const [projectQuery, setProjectQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState('전체');
   const [projectSort, setProjectSort] = useState('최근 수정순');
@@ -399,6 +405,18 @@ function App() {
   const profileProjectCount = projects.filter((project) => !project.trashed).length;
   const profileRecordingCount = sourceItems.filter((source) => source.category === '녹음본').length;
   const profileMaterialCount = sourceItems.filter((source) => source.category === '자료').length;
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => {
+      setIsLoggedIn(data.session !== null);
+    });
+
+    const { data: subscription } = supabase.auth.onAuthStateChange((_event, session) => {
+      setIsLoggedIn(session !== null);
+    });
+
+    return () => subscription.subscription.unsubscribe();
+  }, []);
 
   useEffect(() => {
     window.history.replaceState({ view: 'home' }, '', window.location.pathname);
@@ -582,16 +600,51 @@ function App() {
   };
 
   const logout = () => {
+    void supabase.auth.signOut();
     setIsLoggedIn(false);
     setIsProfileOpen(false);
     setIsAccountMenuOpen(false);
     setAuthMode(null);
   };
 
+  const closeAuthModal = () => {
+    setAuthMode(null);
+    setAuthEmail('');
+    setAuthPassword('');
+    setAuthName('');
+    setAuthError(null);
+  };
+
   const completeAuth = () => {
     setIsLoggedIn(true);
     setIsAccountMenuOpen(false);
-    setAuthMode(null);
+    closeAuthModal();
+  };
+
+  const submitAuth = async () => {
+    setAuthError(null);
+    setAuthLoading(true);
+    try {
+      if (authMode === 'signup') {
+        const { error } = await supabase.auth.signUp({
+          email: authEmail,
+          password: authPassword,
+          options: { data: { name: authName } },
+        });
+        if (error) throw error;
+      } else {
+        const { error } = await supabase.auth.signInWithPassword({
+          email: authEmail,
+          password: authPassword,
+        });
+        if (error) throw error;
+      }
+      completeAuth();
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : '인증에 실패했습니다.');
+    } finally {
+      setAuthLoading(false);
+    }
   };
 
   const openCreateProjectModal = () => {
@@ -2041,7 +2094,7 @@ function App() {
       </main>
 
       {authMode !== null && (
-        <div className="auth-modal-backdrop" role="presentation" onMouseDown={() => setAuthMode(null)}>
+        <div className="auth-modal-backdrop" role="presentation" onMouseDown={closeAuthModal}>
           <section
             className="auth-modal"
             role="dialog"
@@ -2049,7 +2102,7 @@ function App() {
             aria-labelledby="auth-modal-title"
             onMouseDown={(event) => event.stopPropagation()}
           >
-            <button className="auth-close" type="button" aria-label="닫기" onClick={() => setAuthMode(null)}>
+            <button className="auth-close" type="button" aria-label="닫기" onClick={closeAuthModal}>
               ×
             </button>
 
@@ -2065,18 +2118,31 @@ function App() {
 
             <form className="auth-form" onSubmit={(event) => {
               event.preventDefault();
-              completeAuth();
+              void submitAuth();
             }}>
               {authMode === 'signup' && (
                 <label>
                   이름
-                  <input type="text" placeholder="도원" autoComplete="name" />
+                  <input
+                    type="text"
+                    placeholder="도원"
+                    autoComplete="name"
+                    value={authName}
+                    onChange={(event) => setAuthName(event.target.value)}
+                  />
                 </label>
               )}
 
               <label>
                 이메일
-                <input type="email" placeholder="you@synapvox.com" autoComplete="email" />
+                <input
+                  type="email"
+                  placeholder="you@synapvox.com"
+                  autoComplete="email"
+                  required
+                  value={authEmail}
+                  onChange={(event) => setAuthEmail(event.target.value)}
+                />
               </label>
 
               <label>
@@ -2085,17 +2151,26 @@ function App() {
                   type="password"
                   placeholder="비밀번호"
                   autoComplete={authMode === 'login' ? 'current-password' : 'new-password'}
+                  required
+                  minLength={6}
+                  value={authPassword}
+                  onChange={(event) => setAuthPassword(event.target.value)}
                 />
               </label>
 
-              <button className="auth-submit" type="submit">
-                {authMode === 'login' ? '로그인' : '회원가입'}
+              {authError && <p className="auth-error">{authError}</p>}
+
+              <button className="auth-submit" type="submit" disabled={authLoading}>
+                {authLoading ? '처리 중…' : authMode === 'login' ? '로그인' : '회원가입'}
               </button>
 
               <button
                 className="auth-switch"
                 type="button"
-                onClick={() => setAuthMode(authMode === 'login' ? 'signup' : 'login')}
+                onClick={() => {
+                  setAuthError(null);
+                  setAuthMode(authMode === 'login' ? 'signup' : 'login');
+                }}
               >
                 {authMode === 'login' ? '계정이 없나요? 회원가입' : '이미 계정이 있나요? 로그인'}
               </button>

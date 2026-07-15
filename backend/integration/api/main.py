@@ -12,10 +12,12 @@ from datetime import date
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+
+from .auth import require_user
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
@@ -219,6 +221,7 @@ async def transcribe_recording(
     materials: list[UploadFile] = File(default=[]),
     project_id: str = Form("local-project"),
     meeting_id: str = Form("local-meeting"),
+    user: dict = Depends(require_user),
 ) -> dict:
     if not audio.content_type or not (audio.content_type.startswith("audio/") or audio.content_type.startswith("video/")):
         raise HTTPException(status_code=400, detail="audio or video file is required")
