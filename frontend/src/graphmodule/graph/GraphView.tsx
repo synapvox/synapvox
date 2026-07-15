@@ -315,9 +315,9 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
       link?.distance?.((l) => {
         const s = typeof l.source === 'object' ? l.source.type : undefined
         const t = typeof l.target === 'object' ? l.target.type : undefined
-        if (s === 'main' || t === 'main') return 68
-        if (l.relClass === 'mentions') return 46
-        return 38
+        if (s === 'main' || t === 'main') return 60
+        if (l.relClass === 'mentions') return 40
+        return 33
       })
       link?.strength?.((l) => {
         const s = typeof l.source === 'object' ? l.source.type : undefined
