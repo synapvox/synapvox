@@ -2699,7 +2699,7 @@ function App() {
               )}
 
               <label>
-                {authMode === 'login' ? '이메일 또는 관리자 코드' : '이메일'}
+                이메일
                 <input
                   type={authMode === 'login' ? 'text' : 'email'}
                   placeholder="you@synapvox.com"

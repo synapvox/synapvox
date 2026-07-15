@@ -18,7 +18,7 @@ export const supabase = hasSupabaseConfig
 
 export const requireSupabase = () => {
   if (supabase === null) {
-    throw new Error('프론트 Supabase 환경변수(VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY)가 필요합니다.');
+    throw new Error('로그인 설정을 확인하고 있습니다. 잠시 후 다시 시도해주세요.');
   }
   return supabase;
 };
