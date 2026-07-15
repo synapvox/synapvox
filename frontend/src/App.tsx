@@ -7,15 +7,19 @@ import {
   deleteStoredChatSession,
   deleteProjectSource,
   downloadProjectSource,
+  loadStoredProjects,
   loadStoredChatSessions,
   loadStoredProjectWorkspace,
+  saveStoredProject,
   saveStoredChatSession,
   saveRecordingTranscript,
   updateProjectSourcePayload,
+  updateStoredProject,
   updateStoredTranscriptSegments,
   uploadProjectSource,
   type StoredSourceRow,
   type StoredChatMessage,
+  type StoredProjectRow,
 } from './sourceStorage';
 
 type Project = {
@@ -167,7 +171,7 @@ const authUserFromSession = (session: Session | null): AuthUser | null => {
 };
 
 // 프로젝트 목록을 localStorage에 영속화 — 새로고침해도 프로젝트 id↔그래프 매핑이 유지된다.
-const loadStoredProjects = (userId: string | null): Project[] => {
+const loadLocalProjects = (userId: string | null): Project[] => {
   try {
     const raw = window.localStorage.getItem(scopedStorageKey(PROJECTS_STORAGE_KEY, userId));
     if (raw === null) return [];
@@ -179,6 +183,19 @@ const loadStoredProjects = (userId: string | null): Project[] => {
     return [];
   }
 };
+
+const projectFromStoredRow = (row: StoredProjectRow): Project => ({
+  id: row.id,
+  name: row.name,
+  description: row.description,
+  updatedAt: new Date(row.updated_at).toLocaleDateString('ko-KR'),
+  recordings: row.recordings,
+  materials: row.materials,
+  status: row.status,
+  favorite: row.favorite,
+  shared: row.shared,
+  trashed: row.trashed_at !== null,
+});
 
 const loadStoredWorkspaces = (userId: string | null): Record<string, ProjectWorkspace> => {
   try {
@@ -804,7 +821,7 @@ function App() {
   }, [storageUserId]);
 
   const switchProjectStorage = (userId: string | null, restoreActiveProject = true) => {
-    const nextProjects = userId === null ? [] : loadStoredProjects(userId);
+    const nextProjects = userId === null ? [] : loadLocalProjects(userId);
     const storedActiveProjectId = userId === null || !restoreActiveProject
       ? null
       : window.localStorage.getItem(scopedStorageKey(ACTIVE_PROJECT_STORAGE_KEY, userId));
@@ -860,6 +877,30 @@ function App() {
 
     return () => subscription.subscription.unsubscribe();
   }, []);
+
+  useEffect(() => {
+    if (supabase === null || currentUser === null || currentUser.role === 'admin') return;
+    let cancelled = false;
+    void loadStoredProjects(supabase)
+      .then((rows) => {
+        if (cancelled) return;
+        const nextProjects = rows.map(projectFromStoredRow);
+        const storedActiveProjectId = window.localStorage.getItem(
+          scopedStorageKey(ACTIVE_PROJECT_STORAGE_KEY, currentUser.id),
+        );
+        const restoredIndex = storedActiveProjectId === null
+          ? -1
+          : nextProjects.findIndex((project) => (
+            project.id === storedActiveProjectId && !project.trashed
+          ));
+        setProjects(nextProjects);
+        setActiveProjectIndex(restoredIndex >= 0 ? restoredIndex : null);
+      })
+      .catch((error) => console.error('Supabase 프로젝트 목록 복원 실패:', error));
+    return () => {
+      cancelled = true;
+    };
+  }, [currentUser]);
 
   useEffect(() => {
     if (!shouldSeedDemoRecordingRef.current) return;
@@ -1179,7 +1220,7 @@ function App() {
     setIsProjectModalOpen(true);
   };
 
-  const createProject = () => {
+  const createProject = async () => {
     if (!isLoggedIn) {
       setAuthMode('login');
       return;
@@ -1199,6 +1240,22 @@ function App() {
       materials: 0,
       status: '자료 필요',
     };
+
+    if (supabase === null || currentUser === null) return;
+    try {
+      await saveStoredProject(supabase, {
+        id: nextProject.id,
+        ownerId: currentUser.id,
+        name: nextProject.name,
+        description: nextProject.description,
+        status: nextProject.status,
+        recordings: nextProject.recordings,
+        materials: nextProject.materials,
+      });
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '프로젝트 저장에 실패했습니다.');
+      return;
+    }
 
     setProjects((currentProjects) => [nextProject, ...currentProjects]);
     setIsProjectModalOpen(false);
@@ -1226,11 +1283,7 @@ function App() {
     if (activeProjectIndex === null) return;
     const name = projectEditDraft.name.trim() || activeProject?.name || '새 프로젝트';
     const description = projectEditDraft.description.trim() || '녹음본과 자료를 묶을 작업 공간';
-    setProjects((currentProjects) => currentProjects.map((project, projectIndex) => (
-      projectIndex === activeProjectIndex
-        ? { ...project, name, description, updatedAt: '방금' }
-        : project
-    )));
+    updateProject(activeProjectIndex, { name, description, updatedAt: '방금' });
     setIsProjectTitleEditing(false);
   };
 
@@ -1929,19 +1982,103 @@ function App() {
   };
 
   const updateProject = (index: number, updates: Partial<(typeof projects)[number]>) => {
+    const target = projects[index];
+    if (target === undefined) return;
     setProjects((currentProjects) => currentProjects.map((project, projectIndex) => (
       projectIndex === index ? { ...project, ...updates } : project
     )));
     setOpenProjectMenuIndex(null);
+
+    if (supabase === null || currentUser === null) return;
+    const storageClient = supabase;
+    const persist = async () => {
+      if (updates.trashed !== undefined) {
+        const response = await fetch(`/api/projects/${encodeURIComponent(target.id)}/trash`, {
+          method: 'PATCH',
+          headers: {
+            ...await apiHeaders(target.id),
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ trashed: updates.trashed }),
+        });
+        if (!response.ok) {
+          const body = await response.json().catch(() => null) as { detail?: string } | null;
+          throw new Error(body?.detail ?? '휴지통 상태 변경에 실패했습니다.');
+        }
+      }
+      const storedUpdates: Parameters<typeof updateStoredProject>[2] = {};
+      if (updates.name !== undefined) storedUpdates.name = updates.name;
+      if (updates.description !== undefined) storedUpdates.description = updates.description;
+      if (updates.status !== undefined) storedUpdates.status = updates.status;
+      if (updates.recordings !== undefined) storedUpdates.recordings = updates.recordings;
+      if (updates.materials !== undefined) storedUpdates.materials = updates.materials;
+      if (updates.favorite !== undefined) storedUpdates.favorite = updates.favorite;
+      if (updates.shared !== undefined) storedUpdates.shared = updates.shared;
+      if (Object.keys(storedUpdates).length > 0) {
+        await updateStoredProject(storageClient, target.id, storedUpdates);
+      }
+    };
+    void persist().catch((error) => {
+      console.error('프로젝트 변경 저장 실패:', error);
+      setProjects((currentProjects) => currentProjects.map((project) => (
+        project.id === target.id ? target : project
+      )));
+      window.alert(error instanceof Error ? error.message : '프로젝트 변경에 실패했습니다.');
+    });
   };
 
   const deleteProject = (index: number) => {
     updateProject(index, { trashed: true });
   };
 
-  const emptyTrash = () => {
-    setProjects((currentProjects) => currentProjects.filter((project) => !project.trashed));
+  const permanentlyDeleteProjects = async (targets: Project[]) => {
+    for (const project of targets) {
+      const response = await fetch(`/api/projects/${encodeURIComponent(project.id)}`, {
+        method: 'DELETE',
+        headers: await apiHeaders(project.id),
+      });
+      const body = await response.json().catch(() => null) as {
+        detail?: string;
+        storage_paths?: string[];
+      } | null;
+      if (!response.ok) throw new Error(body?.detail ?? '프로젝트 영구 삭제에 실패했습니다.');
+      if (supabase !== null && (body?.storage_paths?.length ?? 0) > 0) {
+        const { error } = await supabase.storage.from('project-files').remove(body?.storage_paths ?? []);
+        if (error) console.error('삭제된 프로젝트 파일 정리 실패:', error);
+      }
+    }
+    const deletedIds = new Set(targets.map((project) => project.id));
+    setProjects((currentProjects) => currentProjects.filter((project) => !deletedIds.has(project.id)));
+    targets.forEach((project) => {
+      delete projectWorkspacesRef.current[project.id];
+      window.localStorage.removeItem(
+        `${scopedStorageKey(CHAT_SESSIONS_STORAGE_KEY, currentUser?.id ?? null)}:${project.id}`,
+      );
+    });
+    persistProjectWorkspaces();
     setOpenProjectMenuIndex(null);
+  };
+
+  const permanentlyDeleteProject = async (index: number) => {
+    const target = projects[index];
+    if (target === undefined || !target.trashed) return;
+    if (!window.confirm(`'${target.name}' 프로젝트를 영구 삭제할까요?`)) return;
+    try {
+      await permanentlyDeleteProjects([target]);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '프로젝트 영구 삭제에 실패했습니다.');
+    }
+  };
+
+  const emptyTrash = async () => {
+    const targets = projects.filter((project) => project.trashed);
+    if (targets.length === 0) return;
+    if (!window.confirm(`휴지통의 프로젝트 ${targets.length}개를 모두 영구 삭제할까요?`)) return;
+    try {
+      await permanentlyDeleteProjects(targets);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '휴지통 비우기에 실패했습니다.');
+    }
   };
 
   const submitProjectChat = (presetQuery?: string) => {
@@ -2830,7 +2967,12 @@ function App() {
                           {project.favorite ? '즐겨찾기 해제' : '즐겨찾기'}
                         </button>
                         {project.trashed ? (
-                          <button type="button" onClick={() => updateProject(project.index, { trashed: false })}>복원</button>
+                          <>
+                            <button type="button" onClick={() => updateProject(project.index, { trashed: false })}>복원</button>
+                            <button className="danger" type="button" onClick={() => void permanentlyDeleteProject(project.index)}>
+                              영구 삭제
+                            </button>
+                          </>
                         ) : (
                           <button className="danger" type="button" onClick={() => deleteProject(project.index)}>삭제</button>
                         )}

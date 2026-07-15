@@ -20,6 +20,60 @@ def test_graph_ingest_routes_use_api_prefix():
     assert "/api/ingest-stt" in documented_post_routes
 
 
+def test_project_can_move_to_and_restore_from_trash(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        api_main,
+        "_set_project_trashed",
+        lambda user, project, trashed: calls.append((user, project, trashed)) or {
+            "id": project, "trashed": trashed,
+        },
+    )
+    client = TestClient(app)
+
+    trashed = client.patch("/api/projects/p-1/trash", json={"trashed": True})
+    restored = client.patch("/api/projects/p-1/trash", json={"trashed": False})
+
+    assert trashed.status_code == 200 and trashed.json()["trashed"] is True
+    assert restored.status_code == 200 and restored.json()["trashed"] is False
+    assert calls == [("test-user", "p-1", True), ("test-user", "p-1", False)]
+
+
+def test_permanent_project_delete_resets_graphiti_before_database(monkeypatch):
+    calls = []
+
+    class _Graphiti:
+        def reset(self, project):
+            calls.append(("graphiti", project))
+            return {"ok": True}
+
+    monkeypatch.setattr(api_main, "_owned_project_record", lambda user, project: {
+        "id": project, "name": "강의", "trashed_at": "2026-07-16",
+    })
+    monkeypatch.setattr(api_main, "_gsvx_client", lambda: _Graphiti())
+    monkeypatch.setattr(
+        api_main,
+        "_delete_project_rows",
+        lambda user, project: calls.append(("database", project)) or ["user/project/file.pdf"],
+    )
+
+    response = TestClient(app).delete("/api/projects/p-1")
+
+    assert response.status_code == 200
+    assert response.json()["storage_paths"] == ["user/project/file.pdf"]
+    assert calls == [("graphiti", "p-1"), ("database", "p-1")]
+
+
+def test_permanent_project_delete_requires_trash(monkeypatch):
+    monkeypatch.setattr(api_main, "_owned_project_record", lambda user, project: {
+        "id": project, "name": "강의", "trashed_at": None,
+    })
+
+    response = TestClient(app).delete("/api/projects/p-1")
+
+    assert response.status_code == 409
+
+
 def test_legacy_graph_ingest_routes_remain_as_hidden_aliases():
     hidden_post_routes = {
         route.path

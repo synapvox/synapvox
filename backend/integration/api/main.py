@@ -401,6 +401,97 @@ class AskStreamRequest(BaseModel):
     history: list[ChatHistoryMessage] = Field(default_factory=list, max_length=30)
 
 
+class ProjectTrashRequest(BaseModel):
+    trashed: bool
+
+
+def _set_project_trashed(user_id: str, project_id: str, trashed: bool) -> dict | None:
+    import psycopg2
+
+    with psycopg2.connect(os.environ["SUPABASE_DB_URL"]) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """UPDATE public.projects
+                   SET trashed_at = CASE WHEN %s THEN now() ELSE NULL END,
+                       updated_at = now()
+                   WHERE id = %s AND owner_id = %s
+                   RETURNING id, trashed_at""",
+                (trashed, project_id, user_id),
+            )
+            row = cursor.fetchone()
+    return None if row is None else {"id": row[0], "trashed": row[1] is not None}
+
+
+def _delete_project_rows(user_id: str, project_id: str) -> list[str]:
+    """Delete one owned project and return object-storage paths for client cleanup."""
+    import psycopg2
+
+    with psycopg2.connect(os.environ["SUPABASE_DB_URL"]) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT storage_path FROM public.project_sources
+                   WHERE project_id = %s AND owner_id = %s""",
+                (project_id, user_id),
+            )
+            storage_paths = [str(row[0]) for row in cursor.fetchall()]
+            cursor.execute(
+                "DELETE FROM public.recording_transcripts WHERE project_id = %s AND owner_id = %s",
+                (project_id, user_id),
+            )
+            cursor.execute(
+                "DELETE FROM public.chat_sessions WHERE project_id = %s AND owner_id = %s",
+                (project_id, user_id),
+            )
+            cursor.execute(
+                "DELETE FROM public.project_sources WHERE project_id = %s AND owner_id = %s",
+                (project_id, user_id),
+            )
+            cursor.execute(
+                "DELETE FROM public.projects WHERE id = %s AND owner_id = %s",
+                (project_id, user_id),
+            )
+            if cursor.rowcount != 1:
+                raise LookupError("project not found")
+    return storage_paths
+
+
+@app.patch("/api/projects/{project_id}/trash")
+async def set_project_trash_state(
+    project_id: str,
+    request: ProjectTrashRequest,
+    user: dict = Depends(require_user),
+) -> dict:
+    result = await run_in_threadpool(
+        _set_project_trashed, str(user.get("sub") or ""), project_id, request.trashed)
+    if result is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    return result
+
+
+@app.delete("/api/projects/{project_id}")
+async def permanently_delete_project(
+    project_id: str,
+    user: dict = Depends(require_user),
+) -> dict:
+    user_id = str(user.get("sub") or "")
+    project = await run_in_threadpool(_owned_project_record, user_id, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    if project["trashed_at"] is None:
+        raise HTTPException(status_code=409, detail="휴지통으로 이동한 프로젝트만 영구 삭제할 수 있습니다.")
+
+    try:
+        await run_in_threadpool(_gsvx_client().reset, project_id)
+    except Exception as exc:
+        raise _graphiti_error(exc) from exc
+
+    try:
+        storage_paths = await run_in_threadpool(_delete_project_rows, user_id, project_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="project not found") from exc
+    return {"id": project_id, "deleted": True, "storage_paths": storage_paths}
+
+
 @app.post("/ingest-stt", include_in_schema=False)
 @app.post("/api/ingest-stt")
 async def ingest_stt_to_graph(

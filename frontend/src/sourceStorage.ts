@@ -2,6 +2,21 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 
 const SOURCE_BUCKET = 'project-files';
 
+export type StoredProjectRow = {
+  id: string;
+  owner_id: string;
+  name: string;
+  description: string;
+  status: string;
+  recordings: number;
+  materials: number;
+  favorite: boolean;
+  shared: boolean;
+  trashed_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 export type StoredSourceRow = {
   id: string;
   owner_id: string;
@@ -54,6 +69,57 @@ type UploadSourceInput = {
   mimeType?: string;
   durationSeconds?: number;
   sourcePayload: Record<string, unknown>;
+};
+
+export const loadStoredProjects = async (client: SupabaseClient) => {
+  const { data, error } = await client
+    .from('projects')
+    .select('*')
+    .order('updated_at', { ascending: false });
+  if (error) throw error;
+  return (data ?? []) as StoredProjectRow[];
+};
+
+export const saveStoredProject = async (
+  client: SupabaseClient,
+  project: {
+    id: string;
+    ownerId: string;
+    name: string;
+    description: string;
+    status: string;
+    recordings: number;
+    materials: number;
+    favorite?: boolean;
+    shared?: boolean;
+  },
+) => {
+  const { error } = await client.from('projects').upsert({
+    id: project.id,
+    owner_id: project.ownerId,
+    name: project.name,
+    description: project.description,
+    status: project.status,
+    recordings: project.recordings,
+    materials: project.materials,
+    favorite: project.favorite ?? false,
+    shared: project.shared ?? false,
+    updated_at: new Date().toISOString(),
+  }, { onConflict: 'id' });
+  if (error) throw error;
+};
+
+export const updateStoredProject = async (
+  client: SupabaseClient,
+  projectId: string,
+  updates: Partial<Pick<StoredProjectRow,
+    'name' | 'description' | 'status' | 'recordings' | 'materials' | 'favorite' | 'shared'>>,
+) => {
+  const { error } = await client.from('projects').update({
+    ...updates,
+    updated_at: new Date().toISOString(),
+  }).eq('id', projectId);
+  if (error) throw error;
 };
 
 const safePathPart = (value: string) => (
