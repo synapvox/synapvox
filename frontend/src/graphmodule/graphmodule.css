@@ -27,7 +27,7 @@
   display: flex;
   flex-direction: column;
   height: 100%;
-  min-height: 620px;
+  min-height: 0;
   background: var(--paper-soft);
   color: var(--ink);
   font-family: var(--font-ui);
@@ -55,47 +55,18 @@
   background: rgba(255, 253, 247, 0.92);
   border-bottom: var(--bind);
 }
-.svx-gm__seg {
-  display: inline-flex;
-  border: 1px solid var(--rule);
-  border-radius: 999px;
-  overflow: hidden;
-  background: rgba(255, 250, 240, 0.78);
-}
-.svx-gm__seg button {
-  padding: 7px 13px;
-  font-family: var(--font-ui);
-  font-size: 12.5px;
-  font-weight: 780;
-  color: var(--sub);
-  background: transparent;
-  border: none;
-  border-right: 1px solid var(--rule);
-  transition: background var(--dur-ui) ease, color var(--dur-ui) ease;
-}
-.svx-gm__seg button:last-child { border-right: none; }
-.svx-gm__seg button:hover { color: var(--ink); background: rgba(24, 23, 19, 0.05); }
-.svx-gm__seg button.is-active { color: var(--ink); background: var(--paper-deep); }
-
-.svx-gm__picks {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-2);
-}
-.svx-gm__picks label {
+.svx-gm__scope-label {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  padding: 4px 9px;
-  font-size: 12.5px;
+  min-height: 30px;
+  padding: 6px 11px;
   color: var(--ink);
+  font-size: 12.5px;
+  font-weight: 780;
   border: 1px solid var(--rule);
-  border-radius: 999px;
-  cursor: pointer;
-  background: rgba(255, 250, 240, 0.72);
+  border-radius: var(--r-1);
+  background: var(--paper-deep);
 }
-.svx-gm__picks label.is-on { border-color: var(--moss, #6d735d); background: var(--paper-deep); }
-.svx-gm__picks input { accent-color: var(--rule-blue); }
 
 .svx-gm__count {
   margin-left: auto;

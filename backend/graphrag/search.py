@@ -8,13 +8,14 @@ from . import schema as S
 
 
 class HybridSearch:
-    def __init__(self, driver, vector_store):
+    def __init__(self, driver, vector_store, database: str | None = None):
         self.driver = driver
         self.vec = vector_store
+        self.database = database
 
     def _expand(self, project_id, chunk_id):
         """청크 1-hop 확장: 주제·소속 회의."""
-        with self.driver.session() as s:
+        with self.driver.session(database=self.database) as s:
             rec = s.run(
                 f"MATCH (c:{S.CHUNK} {{project_id:$pid, chunk_id:$cid}}) "
                 f"OPTIONAL MATCH (c)-[:{S.DISCUSSES}]->(t:{S.TOPIC}) "

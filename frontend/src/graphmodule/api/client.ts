@@ -1,7 +1,7 @@
 import type { AskResult, ConceptDetail, GraphData, Project, SessionDetail } from './types'
+import { supabase } from '../../supabaseClient'
 
-const BASE = (import.meta.env.VITE_API_BASE ?? 'https://synapvox-graphiti.onrender.com').replace(/\/$/, '')
-const KEY = import.meta.env.VITE_API_KEY ?? 'demo-bio'
+const BASE = '/api'
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 /** A non-2xx API response. `status` lets callers special-case caps/limits
@@ -22,10 +22,15 @@ async function req(path: string, opts: RequestInit = {}, method = 'GET'): Promis
     if (a > 0) await sleep(backoff[a - 1])
     let r: Response
     try {
+      const token = (await supabase?.auth.getSession())?.data.session?.access_token
       r = await fetch(`${BASE}${path}`, {
         ...opts,
         method,
-        headers: { 'X-API-Key': KEY, ...(opts.body ? { 'Content-Type': 'application/json' } : {}), ...opts.headers },
+        headers: {
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          ...(opts.body ? { 'Content-Type': 'application/json' } : {}),
+          ...opts.headers,
+        },
       })
     } catch (e) {
       if (method === 'GET' && a < backoff.length) continue

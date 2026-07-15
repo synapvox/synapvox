@@ -24,11 +24,6 @@ import { nodeRadius, nodeCoreColor, linkColor } from './render'
 import { labelOpacity } from './lod'
 import { mergeSubgraph } from './growth'
 import { GrowthRing, type GrowthPulse } from './GrowthRing'
-import { projectLabel } from './projectMeta'
-import { computeCrossLinks } from './crossLinks'
-import { makeMainRepel } from './mainRepel'
-
-const CROSS_MOSS = '#5F766B' // shared-concept bridge ring (matches render.ts)
 
 const CANVAS_BG = '#FFFAF0' // literal hex — canvas ctx can't read a CSS var
 const LABEL_INK = '#322B22'
@@ -93,10 +88,8 @@ function roundedSquare(
 type GraphData = { nodes: FNode[]; links: FLink[] }
 type FGRef = ForceGraphMethods<NodeObject<FNode>, LinkObject<FNode, FLink>>
 
-/** Inject ONE synthetic "main" hub for a project, linked to every session node,
- * and mutate sessions' degree/neighbors so hover/LOD stay correct. The hub id is
- * namespaced by project so multiple projects can coexist in one galaxy view.
- * Sub-nodes (sessions + concepts) render hollow; the hub renders filled. */
+/** Inject one synthetic project hub, linked to every session node, and mutate
+ * sessions' degree/neighbors so hover/LOD stay correct. */
 function addMainNode(data: GraphData, label: string, project = ''): void {
   const sessions = data.nodes.filter((n) => n.type === 'session')
   if (sessions.length === 0) return
@@ -125,10 +118,10 @@ export type GraphViewHandle = {
 
 export type GraphViewProps = {
   project: string
-  alsoShow?: string[] // other projects to render as additional main-hub clusters (galaxy)
+  projectName?: string
   reloadKey?: number // bump → refetch
   onSelectNode?: (n: FNode) => void
-  onGraphMeta?: (m: { nodes: number; edges: number; settled: boolean; cross?: number }) => void
+  onGraphMeta?: (m: { nodes: number; edges: number; settled: boolean }) => void
   onSessions?: (sessions: FNode[]) => void // primary project's session nodes → sidebar list
   highlightId?: string | null // external highlight (e.g. sidebar hover) → same focus/dim as hover
   askExpansionIds?: Set<string> | null // P2 seam: temp RAG expansion subgraph highlight
@@ -137,9 +130,7 @@ export type GraphViewProps = {
 type Status = 'loading' | 'error' | 'ready'
 
 export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function GraphView(props, ref) {
-  const { project, alsoShow, reloadKey, onGraphMeta, onSelectNode, onSessions, highlightId } = props
-  // Stable key so the fetch effect re-runs only when the actual set changes.
-  const alsoKey = (alsoShow ?? []).slice().sort().join(',')
+  const { project, projectName, reloadKey, onGraphMeta, onSelectNode, onSessions, highlightId } = props
 
   const wrapRef = useRef<HTMLDivElement | null>(null)
   const fgRef = useRef<FGRef | undefined>(undefined)
@@ -156,7 +147,6 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
   const highlightNodesRef = useRef<Set<string>>(new Set())
   const highlightLinksRef = useRef<Set<FLink>>(new Set())
   const askIdsRef = useRef<Set<string> | null>(null) // RAG expansion nodes → persistent highlight
-  const crossIdsRef = useRef<Set<string> | null>(null) // concepts shared across projects (교차연결)
   const pointerRef = useRef({ x: 0, y: 0 })
   const tooltipRef = useRef<HTMLDivElement | null>(null)
   const pulseCounterRef = useRef(0) // monotonic id so each growth fires a fresh ring
@@ -258,60 +248,33 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
       if (!cancelled) setColdStart(true)
     }, COLD_START_MS)
 
-    // Fetch the primary project + any galaxy extras; each becomes a main-hub
-    // cluster. Sub-nodes (sessions + concepts) render hollow, hubs filled, and
-    // the hubs repel each other strongly (mainRepel) → far-apart topic clusters.
-    const toFetch = [project, ...alsoKey.split(',').filter(Boolean)].filter((p, i, a) => !!p && a.indexOf(p) === i)
-    const multi = toFetch.length > 1
-    Promise.all(toFetch.map((p) => getGraph(p).then((raw) => ({ p, built: buildForceData(mapGraph(raw)) }))))
-      .then((results) => {
+    getGraph(project)
+      .then((raw) => {
         if (cancelled) return
-        const merged: GraphData = { nodes: [], links: [] }
-        let realNodes = 0
-        let realEdges = 0
-        let primarySessions: FNode[] = []
-        for (const { p, built } of results) {
-          realNodes += built.nodes.length // real (pre-hub) counts → accurate HUD
-          realEdges += built.links.length
-          if (p === project) primarySessions = built.nodes.filter((n) => n.type === 'session')
-          for (const n of built.nodes) n.project = p // tag for cross-project matching
-          // One hub per project (namespaced when multiple coexist).
-          addMainNode(built, projectLabel(p), multi ? p : '')
-          merged.nodes.push(...built.nodes)
-          merged.links.push(...built.links)
-        }
-        // 교차연결: when ≥2 projects are shown together, bridge concepts that
-        // appear in both (normalized-label exact match) with 'cross' links.
-        let crossCount = 0
-        crossIdsRef.current = null
-        if (multi) {
-          const cross = computeCrossLinks(merged.nodes)
-          if (cross.links.length) {
-            merged.links.push(...cross.links)
-            crossIdsRef.current = cross.crossIds
-            crossCount = cross.links.length
-          }
-        }
-        // Seed cached positions only in single-project mode (multi lets physics
-        // place the clusters). Nodes stay FREE (no fx/fy).
-        if (!multi) {
-          const cached = loadPositions(project)
-          if (cached) {
-            for (const n of merged.nodes) {
-              const c = cached[n.id]
-              if (c && Number.isFinite(c.x) && Number.isFinite(c.y)) {
-                n.x = c.x
-                n.y = c.y
-              }
+        const built = buildForceData(mapGraph(raw))
+        const realNodes = built.nodes.length
+        const realEdges = built.links.length
+        const sessions = built.nodes.filter((n) => n.type === 'session')
+        for (const node of built.nodes) node.project = project
+        addMainNode(built, projectName || project)
+
+        const cached = loadPositions(project)
+        if (cached) {
+          for (const node of built.nodes) {
+            const position = cached[node.id]
+            if (position && Number.isFinite(position.x) && Number.isFinite(position.y)) {
+              node.x = position.x
+              node.y = position.y
             }
           }
         }
-        dataRef.current = merged
-        maxDegreeRef.current = merged.nodes.reduce((m, n) => Math.max(m, n.degree), 1)
-        setData(merged)
+
+        dataRef.current = built
+        maxDegreeRef.current = built.nodes.reduce((m, n) => Math.max(m, n.degree), 1)
+        setData(built)
         setStatus('ready')
-        onGraphMeta?.({ nodes: realNodes, edges: realEdges, settled: false, cross: crossCount })
-        onSessions?.(primarySessions)
+        onGraphMeta?.({ nodes: realNodes, edges: realEdges, settled: false })
+        onSessions?.(sessions)
       })
       .catch((e: unknown) => {
         if (cancelled) return
@@ -325,7 +288,7 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
       cancelled = true
       clearTimeout(coldTimer)
     }
-  }, [project, alsoKey, reloadKey, retryTick, onGraphMeta, onSessions])
+  }, [project, projectName, reloadKey, retryTick, onGraphMeta, onSessions])
 
   // ── Tune d3-force like Obsidian, once per data load ───────────────────────
   // Runs after the graph mounts. Because ForceGraph2D only mounts once dims are
@@ -349,38 +312,14 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
         strength?: (fn: (l: { source: FNode | string; target: FNode | string; relClass?: string }) => number) => unknown
       } | undefined
       link?.distance?.((l) => {
-        if (l.relClass === 'cross') return 260 // long bridge across the cluster gap
         const s = typeof l.source === 'object' ? l.source.type : undefined
         const t = typeof l.target === 'object' ? l.target.type : undefined
         return s === 'main' || t === 'main' ? 110 : 55
       })
-      // Cross links must be a WEAK, decorative bridge — strong enough to hint the
-      // connection, too weak to yank the clusters together. Real links keep d3's
-      // exact default strength (1/min(incident count)); we replicate it so their
-      // tuned elasticity is untouched. Only applied when a cross link exists.
-      const hasCross = data.links.some((l) => l.relClass === 'cross')
-      if (hasCross) {
-        const count: Record<string, number> = {}
-        for (const l of data.links) {
-          const s = endpointId(l.source)
-          const t = endpointId(l.target)
-          count[s] = (count[s] ?? 0) + 1
-          count[t] = (count[t] ?? 0) + 1
-        }
-        link?.strength?.((l) => {
-          if (l.relClass === 'cross') return 0.04
-          const s = endpointId(l.source)
-          const t = endpointId(l.target)
-          return 1 / Math.min(count[s] ?? 1, count[t] ?? 1)
-        })
-      }
       const charge = fg.d3Force('charge') as unknown as { strength?: (fn: (n: FNode) => number) => unknown } | undefined
-      // Main hubs push hard (their clusters spread apart); sub-nodes as before.
-      charge?.strength?.((n: FNode) => (n.type === 'main' ? -1400 : -30 - (n.degree ?? 0) * 8))
+      charge?.strength?.((n: FNode) => (n.type === 'main' ? -420 : -30 - (n.degree ?? 0) * 8))
       const center = fg.d3Force('center') as unknown as { strength?: (s: number) => unknown } | undefined
       center?.strength?.(0.04)
-      // Custom force: keep the main hubs VERY far apart (galaxy of topics).
-      ;(fg.d3Force as unknown as (name: string, force: unknown) => void)('mainRepel', makeMainRepel())
       // Re-apply forces to the running sim (calm reheat — settles ~1.5–2s).
       fg.d3ReheatSimulation()
       // Dev-only test hook: exposes the graph instance + live node data so the
@@ -459,17 +398,6 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
         ctx.strokeStyle = '#66715B'
         ctx.beginPath()
         ctx.arc(x, y, r + 3.5 / globalScale, 0, 2 * Math.PI)
-        ctx.stroke()
-      }
-      // 교차연결 marker: a dotted moss ring on concepts shared across projects
-      // (the "연결점" between two topics). Dims with the node on hover/ask.
-      if (!inAsk && crossIdsRef.current?.has(node.id)) {
-        ctx.globalAlpha = nodeAlpha
-        ctx.lineWidth = 1.4 / globalScale
-        ctx.strokeStyle = CROSS_MOSS
-        ctx.setLineDash([2.5 / globalScale, 2.5 / globalScale])
-        ctx.beginPath()
-        ctx.arc(x, y, r + 3 / globalScale, 0, 2 * Math.PI)
         ctx.stroke()
       }
       ctx.restore()
@@ -586,11 +514,7 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
     [onSelectNode],
   )
 
-  // Release behavior differs by tier:
-  //   • main hub → PIN where dropped (keep fx/fy). The user arranges topic
-  //     clusters by hand and they stay put; mainRepel skips pinned hubs, so
-  //     dragging one hub never shoves the others (the reported bug).
-  //   • sub-node → clear the pin so it re-settles elastically (Obsidian feel).
+  // Keep the project hub where the user drops it; sub-nodes re-settle freely.
   const handleDragEnd = useCallback((node: NodeObject<FNode>) => {
     if (node.type === 'main') {
       node.fx = node.x
@@ -652,16 +576,11 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
           nodePointerAreaPaint={paintPointer}
           linkColor={linkColorAccessor}
           linkWidth={(l: LinkObject<FNode, FLink>) =>
-            l.relClass === 'cross'
-              ? 1.15
-              : l.relClass === 'next' || l.relClass === 'continues'
+            l.relClass === 'next' || l.relClass === 'continues'
                 ? 1.2
                 : l.relClass === 'mentions'
                   ? 0.45
                   : 0.85
-          }
-          linkLineDash={(l: LinkObject<FNode, FLink>) =>
-            l.relClass === 'cross' ? [5, 4] : null
           }
           onNodeHover={handleNodeHover}
           onNodeClick={handleNodeClick}

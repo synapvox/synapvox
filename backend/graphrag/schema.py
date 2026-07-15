@@ -29,8 +29,8 @@ CONSTRAINTS = [
 ]
 
 
-def apply_schema(driver):
+def apply_schema(driver, database: str | None = None):
     """제약/인덱스 생성 (idempotent)."""
-    with driver.session() as s:
+    with driver.session(database=database) as s:
         for c in CONSTRAINTS:
             s.run(c)

@@ -117,3 +117,23 @@ class VectorStore:
         with self.conn.cursor() as cur:
             cur.execute(f"DELETE FROM {self.table} WHERE project_id = %s", (project_id,))
         self.conn.commit()
+
+    def delete_meeting(self, project_id: str, meeting_id: str) -> int:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                f"DELETE FROM {self.table} WHERE project_id = %s AND meeting_id = %s",
+                (project_id, meeting_id),
+            )
+            deleted = cur.rowcount
+        self.conn.commit()
+        return deleted
+
+    def delete_chunks_by_prefix(self, project_id: str, chunk_prefix: str) -> int:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                f"DELETE FROM {self.table} WHERE project_id = %s AND chunk_id LIKE %s",
+                (project_id, f"{chunk_prefix}%"),
+            )
+            deleted = cur.rowcount
+        self.conn.commit()
+        return deleted

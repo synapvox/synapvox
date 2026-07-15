@@ -3685,6 +3685,7 @@ h3 {
 
 .studio-sources,
 .studio-chat {
+  position: relative;
   display: flex;
   flex-direction: column;
 }
@@ -3694,8 +3695,14 @@ h3 {
 }
 
 .studio-graph {
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  display: block;
+}
+
+.studio-graph > .svx-graphmodule {
+  height: 100%;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
 }
 
 .studio-panel-head {
@@ -4055,6 +4062,80 @@ h3 {
   stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
+}
+
+.source-delete-confirm-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgba(51, 43, 32, 0.18);
+  backdrop-filter: blur(2px);
+}
+
+.source-delete-confirm {
+  box-sizing: border-box;
+  width: min(230px, 100%);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--page);
+  box-shadow: 0 16px 36px rgba(51, 43, 32, 0.18);
+  padding: 18px;
+  text-align: center;
+}
+
+.source-delete-confirm strong {
+  display: block;
+  color: var(--ink);
+  font-size: 0.98rem;
+}
+
+.source-delete-confirm p {
+  overflow: hidden;
+  margin-top: 7px;
+  color: var(--muted);
+  font-size: 0.76rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.source-delete-confirm > div {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+  margin-top: 16px;
+}
+
+.source-delete-confirm button {
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: rgba(255, 253, 247, 0.9);
+  color: var(--ink);
+  font-weight: 850;
+}
+
+.source-delete-confirm button.danger {
+  border-color: #8a493e;
+  background: #8a493e;
+  color: #fff;
+}
+
+.source-delete-confirm button:disabled {
+  cursor: wait;
+  opacity: 0.58;
+}
+
+.source-delete-error {
+  display: block;
+  margin-top: 10px;
+  color: #8a493e;
+  font-size: 0.7rem;
+  font-weight: 750;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
 }
 
 .source-card:hover,

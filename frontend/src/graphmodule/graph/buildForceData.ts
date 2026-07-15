@@ -18,9 +18,7 @@ export type FNode = {
   y?: number
 }
 
-// 'cross' is a frontend-synthetic relation (shared concept across two projects),
-// not emitted by the backend — hence the widening beyond RelClass.
-export type FRelClass = RelClass | 'cross'
+export type FRelClass = RelClass
 
 export type FLink = {
   source: string

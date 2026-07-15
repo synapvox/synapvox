@@ -45,14 +45,9 @@ const RULE_WOOD = 'rgba(165, 147, 120, 0.34)'
 const RULE_MOSS = 'rgba(102, 113, 91, 0.48)'
 const RULE_STRONG = '#7E7867'
 const MENTIONS_DIM = 'rgba(126, 120, 103, 0.18)'
-// Cross-project shared-concept bridge; drawn dashed in GraphView.
-const CROSS_MOSS = '#5F766B'
-
 /** Link stroke color by relation class. */
 export function linkColor(relClass: FRelClass): string {
   switch (relClass) {
-    case 'cross':
-      return CROSS_MOSS
     case 'mentions':
       return MENTIONS_DIM
     case 'next':

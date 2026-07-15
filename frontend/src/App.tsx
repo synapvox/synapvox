@@ -3,9 +3,19 @@ import './App.css';
 import { supabase } from './supabaseClient';
 import GraphModule from './graphmodule/GraphModule';
 import type { Session } from '@supabase/supabase-js';
+import {
+  deleteProjectSource,
+  downloadProjectSource,
+  loadStoredProjectWorkspace,
+  saveRecordingTranscript,
+  updateProjectSourcePayload,
+  updateStoredTranscriptSegments,
+  uploadProjectSource,
+  type StoredSourceRow,
+} from './sourceStorage';
 
 type Project = {
-  id: string;              // gsvx 하위 네임스페이스 키 (X-Project-Id 헤더로 전달, ASCII 슬러그)
+  id: string;              // 그래프/벡터 저장소의 프로젝트 네임스페이스 키
   name: string;
   description: string;
   updatedAt: string;
@@ -29,6 +39,11 @@ type SourceItem = {
   durationLabel?: string;
   attachedMaterials?: SourceItem[];
   mediaKind?: 'audio' | 'video';
+  recordingId?: string;
+  graphMeetingId?: string;
+  storagePath?: string;
+  mimeType?: string;
+  sizeBytes?: number;
 };
 
 type ProjectMaterialFile = {
@@ -75,6 +90,7 @@ type AuthUser = {
 
 const PROJECTS_STORAGE_KEY = 'synapvox-projects';
 const WORKSPACES_STORAGE_KEY = 'synapvox-project-workspaces';
+const ACTIVE_PROJECT_STORAGE_KEY = 'synapvox-active-project';
 const SUPABASE_ADMIN_EMAIL = 'root@synapvox.local';
 const scopedStorageKey = (baseKey: string, userId: string | null) => `${baseKey}:${userId ?? 'guest'}`;
 
@@ -95,7 +111,7 @@ const authUserFromSession = (session: Session | null): AuthUser | null => {
   };
 };
 
-// 프로젝트 목록을 localStorage에 영속화 — 새로고침해도 프로젝트 id↔그래프(gsvx 네임스페이스) 매핑이 유지된다.
+// 프로젝트 목록을 localStorage에 영속화 — 새로고침해도 프로젝트 id↔그래프 매핑이 유지된다.
 const loadStoredProjects = (userId: string | null): Project[] => {
   try {
     const raw = window.localStorage.getItem(scopedStorageKey(PROJECTS_STORAGE_KEY, userId));
@@ -145,13 +161,6 @@ const projectSortOptions = ['최근 수정순', '이름순', '녹음 많은 순'
 const initialSourceItems: SourceItem[] = [];
 const sourceTabs = ['녹음본', '자료'] as const;
 const sourceSortOptions = ['최신순', '오래된순', '글자순', '종류순'] as const;
-
-// gsvx(Graphiti) 백엔드 — 그래프 엔진 본체(click6067-ship-it/synapVOX).
-// 이 프론트는 D0won/synapvox의 /api(포트 8000, STT)만 프록시하므로, gsvx는 절대경로+
-// X-API-Key로 별도 호출한다(gsvx CORSMiddleware가 이 오리진을 허용하도록 열려 있어야 함).
-// 배포 시 VITE_API_BASE(예: https://synapvox-graphiti.onrender.com)·VITE_API_KEY를 빌드 환경변수로 주입.
-const GSVX_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:8020';
-const GSVX_API_KEY = import.meta.env.VITE_API_KEY ?? 'demo-bio';
 
 const formatTranscriptTime = (value = 0) => {
   const seconds = Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
@@ -218,6 +227,43 @@ const mapIntermediateTranscript = (data: IntermediateTranscript): TranscriptSegm
     });
 };
 
+const sourcePayloadForStorage = (source: SourceItem): Record<string, unknown> => {
+  const { audioUrl: _audioUrl, attachedMaterials, ...payload } = source;
+  return {
+    ...payload,
+    attachedMaterials: attachedMaterials?.map((material) => sourcePayloadForStorage(material)) ?? [],
+  };
+};
+
+const hydrateStoredSource = (row: StoredSourceRow, signedAudioUrl?: string): SourceItem => {
+  const payload = row.source_payload as Partial<SourceItem>;
+  return {
+    id: row.id,
+    title: typeof payload.title === 'string' ? payload.title : row.original_name,
+    type: typeof payload.type === 'string' ? payload.type : row.kind === 'audio' ? '녹음' : '자료',
+    category: row.kind === 'audio' ? '녹음본' : '자료',
+    meta: typeof payload.meta === 'string' ? payload.meta : row.kind === 'audio' ? '전사 완료' : '자료',
+    updatedOrder: typeof payload.updatedOrder === 'number' ? payload.updatedOrder : 0,
+    materialScope: row.scope,
+    audioUrl: signedAudioUrl,
+    durationLabel: typeof payload.durationLabel === 'string' ? payload.durationLabel : undefined,
+    attachedMaterials: Array.isArray(payload.attachedMaterials)
+      ? payload.attachedMaterials as SourceItem[]
+      : [],
+    mediaKind: payload.mediaKind === 'video' ? 'video' : row.kind === 'audio' ? 'audio' : undefined,
+    recordingId: row.recording_id ?? undefined,
+    graphMeetingId: typeof payload.graphMeetingId === 'string' ? payload.graphMeetingId : undefined,
+    storagePath: row.storage_path,
+    mimeType: row.mime_type ?? undefined,
+    sizeBytes: row.size_bytes,
+  };
+};
+
+const durationLabelToSeconds = (durationLabel: string) => {
+  const [minutes = '0', seconds = '0'] = durationLabel.split(':');
+  return (Number(minutes) * 60) + Number(seconds);
+};
+
 function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [sourceItems, setSourceItems] = useState(initialSourceItems);
@@ -249,6 +295,9 @@ function App() {
   });
   const [isProjectTitleEditing, setIsProjectTitleEditing] = useState(false);
   const [isSourceEditing, setIsSourceEditing] = useState(false);
+  const [pendingSourceDeletion, setPendingSourceDeletion] = useState<SourceItem | null>(null);
+  const [sourceDeletionState, setSourceDeletionState] = useState<'idle' | 'deleting'>('idle');
+  const [sourceDeletionError, setSourceDeletionError] = useState<string | null>(null);
   const [projectEditDraft, setProjectEditDraft] = useState({
     name: '',
     description: '',
@@ -290,6 +339,8 @@ function App() {
       text: '프로젝트의 녹음본과 자료를 바탕으로 질문에 답변합니다. 궁금한 내용을 입력하면 가운데 그래프에서 관련 노드를 함께 표시할게요.',
     },
   ]);
+  const [graphReloadKey, setGraphReloadKey] = useState(0);
+  const [chatGraphExpansion, setChatGraphExpansion] = useState<Set<string> | null>(null);
   const [isDetailAudioPlaying, setIsDetailAudioPlaying] = useState(false);
   const [detailAudioTimeLabel, setDetailAudioTimeLabel] = useState('00:00');
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -304,22 +355,27 @@ function App() {
   const recordingMediaFileInputRef = useRef<HTMLInputElement | null>(null);
   const projectMaterialFilesRef = useRef<Record<string, ProjectMaterialFile[]>>({});
   const shouldSeedDemoRecordingRef = useRef(window.location.search.includes('demoRecording'));
+  const sessionUserIdRef = useRef<string | null | undefined>(undefined);
+  const workspaceLoadRequestRef = useRef(0);
 
   const activeProject = activeProjectIndex === null ? null : projects[activeProjectIndex];
   const activeProjectId = activeProject?.id ?? null;
   const storageUserId = currentUser?.id ?? null;
-  const projectMaterialFiles = activeProjectId === null
-    ? []
-    : projectMaterialFilesRef.current[activeProjectId] ?? [];
-  const projectMaterialCount = projectMaterialFiles.length;
+  const projectMaterialSources = sourceItems.filter((source) => (
+    source.category === '자료' && source.materialScope === 'project'
+  ));
+  const projectMaterialCount = projectMaterialSources.length;
   const recordingMaterialCount = recordingMaterialFiles.length;
   const totalTranscriptionMaterialCount = projectMaterialCount + recordingMaterialCount;
 
-  // gsvx 호출 공통 헤더 — 프로젝트가 열려 있으면 X-Project-Id로 하위 네임스페이스를 지정한다.
-  const gsvxHeaders = (projectId: string | null): Record<string, string> => ({
-    'X-API-Key': GSVX_API_KEY,
-    ...(projectId !== null ? { 'X-Project-Id': projectId } : {}),
-  });
+  const apiHeaders = async (projectId: string | null, meetingId?: string): Promise<Record<string, string>> => {
+    const token = (await supabase?.auth.getSession())?.data.session?.access_token;
+    return {
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(projectId !== null ? { 'X-Project-Id': projectId } : {}),
+      ...(meetingId ? { 'X-Meeting-Id': meetingId } : {}),
+    };
+  };
   const visibleSourceItems = sourceItems
     .filter((source) => source.category === sourceTab)
     .sort((a, b) => {
@@ -515,7 +571,7 @@ function App() {
   };
 
 
-  // 프로젝트 목록 영속화 — id↔gsvx 네임스페이스 매핑이 새로고침 후에도 유지되게.
+  // 프로젝트 목록 영속화 — id↔그래프 네임스페이스 매핑이 새로고침 후에도 유지되게.
   useEffect(() => {
     if (storageUserId === null) return;
     try {
@@ -524,6 +580,21 @@ function App() {
       console.error('프로젝트 목록 저장 실패:', error);
     }
   }, [projects, storageUserId]);
+
+  useEffect(() => {
+    if (storageUserId === null) return;
+    const key = scopedStorageKey(ACTIVE_PROJECT_STORAGE_KEY, storageUserId);
+    if (activeProjectId === null) {
+      window.localStorage.removeItem(key);
+      return;
+    }
+    window.localStorage.setItem(key, activeProjectId);
+    window.history.replaceState(
+      { view: 'project', projectIndex: activeProjectIndex, projectId: activeProjectId },
+      '',
+      window.location.pathname,
+    );
+  }, [activeProjectId, activeProjectIndex, storageUserId]);
 
   // 프로젝트 전환 시: 그래프를 해당 프로젝트 네임스페이스로 다시 불러오고,
   // 소스 카드·전사 목록도 프로젝트별로 분리 보관/복원한다(이전 프로젝트 데이터가 새 프로젝트에 안 섞이게).
@@ -546,15 +617,22 @@ function App() {
     }
   }, [storageUserId]);
 
-  const switchProjectStorage = (userId: string | null) => {
-    setProjects(userId === null ? [] : loadStoredProjects(userId));
+  const switchProjectStorage = (userId: string | null, restoreActiveProject = true) => {
+    const nextProjects = userId === null ? [] : loadStoredProjects(userId);
+    const storedActiveProjectId = userId === null || !restoreActiveProject
+      ? null
+      : window.localStorage.getItem(scopedStorageKey(ACTIVE_PROJECT_STORAGE_KEY, userId));
+    const restoredProjectIndex = storedActiveProjectId === null
+      ? -1
+      : nextProjects.findIndex((project) => project.id === storedActiveProjectId && !project.trashed);
+    setProjects(nextProjects);
     projectWorkspacesRef.current = userId === null ? {} : loadStoredWorkspaces(userId);
     projectMaterialFilesRef.current = {};
     prevProjectIdRef.current = null;
     setSourceItems([]);
     setTranscriptsBySourceId({});
     setSelectedSource(null);
-    setActiveProjectIndex(null);
+    setActiveProjectIndex(restoredProjectIndex >= 0 ? restoredProjectIndex : null);
     setHomeSection('노트북');
     setStatusFilter('전체');
     setProjectQuery('');
@@ -571,10 +649,15 @@ function App() {
 
     const syncSession = (session: Session | null) => {
       const user = authUserFromSession(session);
+      const nextUserId = user?.id ?? null;
+      const userChanged = sessionUserIdRef.current !== nextUserId;
       setIsLoggedIn(user !== null);
       setCurrentUser(user);
       setIsAdminOpen(user?.role === 'admin');
-      switchProjectStorage(user?.id ?? null);
+      if (userChanged) {
+        sessionUserIdRef.current = nextUserId;
+        switchProjectStorage(nextUserId, user?.role !== 'admin');
+      }
       setIsAuthReady(true);
     };
 
@@ -674,9 +757,48 @@ function App() {
       setSourceItems(saved?.sources ?? []);
       setTranscriptsBySourceId(saved?.transcripts ?? {});
       setSelectedSource(null);
+      setPendingSourceDeletion(null);
+      setSourceDeletionError(null);
     }
     prevProjectIdRef.current = activeProjectId;
   }, [activeProjectId, persistProjectWorkspaces]);
+
+  useEffect(() => {
+    if (supabase === null || currentUser === null || activeProjectId === null) return;
+    const projectId = activeProjectId;
+    const requestId = workspaceLoadRequestRef.current + 1;
+    workspaceLoadRequestRef.current = requestId;
+
+    void loadStoredProjectWorkspace(supabase, projectId).then(({ sources, transcripts, signedUrls }) => {
+      if (workspaceLoadRequestRef.current !== requestId || activeProjectId !== projectId) return;
+      const restoredSources = sources.map((row, index) => ({
+        ...hydrateStoredSource(row, signedUrls.get(row.storage_path)),
+        updatedOrder: index,
+      }));
+      const restoredTranscripts = Object.fromEntries(transcripts.map((row) => [
+        row.recording_id,
+        Array.isArray(row.segments) ? row.segments as TranscriptSegment[] : [],
+      ]));
+      setSourceItems(restoredSources);
+      setTranscriptsBySourceId(restoredTranscripts);
+      projectWorkspacesRef.current[projectId] = {
+        sources: restoredSources,
+        transcripts: restoredTranscripts,
+      };
+      persistProjectWorkspaces();
+      setProjects((currentProjects) => currentProjects.map((project) => (
+        project.id === projectId
+          ? {
+              ...project,
+              recordings: restoredSources.filter((source) => source.category === '녹음본').length,
+              materials: restoredSources.filter((source) => source.category === '자료').length,
+            }
+          : project
+      )));
+    }).catch((error) => {
+      console.error('Supabase 프로젝트 소스 복원 실패:', error);
+    });
+  }, [activeProjectId, currentUser, persistProjectWorkspaces]);
 
   useEffect(() => {
     if (!isAdminOpen) return;
@@ -789,6 +911,7 @@ function App() {
 
   const logout = () => {
     void supabase?.auth.signOut();
+    sessionUserIdRef.current = null;
     setIsLoggedIn(false);
     setCurrentUser(null);
     switchProjectStorage(null);
@@ -963,29 +1086,56 @@ function App() {
     }));
   };
 
-  const removeSourceItem = (sourceId: string) => {
+  const toggleTranscriptEditing = () => {
+    if (isTranscriptEditing && selectedSource !== null && supabase !== null) {
+      void updateStoredTranscriptSegments(supabase, selectedSource.id, selectedTranscriptSegments)
+        .catch((error) => console.error('Supabase 전사문 수정 저장 실패:', error));
+    }
+    setIsTranscriptEditing((value) => !value);
+  };
+
+  const removeSourceItem = async (sourceId: string) => {
     const targetSource = sourceItems.find((source) => source.id === sourceId);
+    const recordingBundleId = targetSource?.category === '녹음본'
+      ? targetSource.recordingId ?? targetSource.id
+      : undefined;
+    const removedSources = recordingBundleId === undefined
+      ? sourceItems.filter((source) => source.id === sourceId)
+      : sourceItems.filter((source) => source.id === sourceId || source.recordingId === recordingBundleId);
+    const removedSourceIds = new Set(removedSources.map((source) => source.id));
+    if (supabase !== null && targetSource?.storagePath !== undefined) {
+      await deleteProjectSource(
+        supabase,
+        sourceId,
+        targetSource.storagePath,
+        recordingBundleId,
+      );
+    }
     if (targetSource?.audioUrl !== undefined) {
       savedAudioUrlsRef.current.delete(targetSource.audioUrl);
       URL.revokeObjectURL(targetSource.audioUrl);
     }
-    setSourceItems((currentSourceItems) => currentSourceItems.filter((source) => source.id !== sourceId));
+    setSourceItems((currentSourceItems) => currentSourceItems.filter((source) => !removedSourceIds.has(source.id)));
     if (activeProjectId !== null) {
       projectMaterialFilesRef.current[activeProjectId] = (projectMaterialFilesRef.current[activeProjectId] ?? [])
-        .filter((entry) => entry.source.id !== sourceId);
+        .filter((entry) => !removedSourceIds.has(entry.source.id));
     }
     if (targetSource !== undefined && activeProjectIndex !== null) {
+      const removedRecordingCount = removedSources.filter((source) => source.category === '녹음본').length;
+      const removedMaterialCount = removedSources.filter((source) => source.category === '자료').length;
       setProjects((currentProjects) => currentProjects.map((project, projectIndex) => {
         if (projectIndex !== activeProjectIndex) return project;
-        if (targetSource.category === '녹음본') {
-          return { ...project, recordings: Math.max(0, project.recordings - 1), updatedAt: '방금' };
-        }
-        return { ...project, materials: Math.max(0, project.materials - 1), updatedAt: '방금' };
+        return {
+          ...project,
+          recordings: Math.max(0, project.recordings - removedRecordingCount),
+          materials: Math.max(0, project.materials - removedMaterialCount),
+          updatedAt: '방금',
+        };
       }));
     }
     setTranscriptsBySourceId((currentTranscripts) => {
       const nextTranscripts = { ...currentTranscripts };
-      delete nextTranscripts[sourceId];
+      removedSourceIds.forEach((id) => delete nextTranscripts[id]);
       return nextTranscripts;
     });
     if (selectedSource?.id === sourceId) {
@@ -995,19 +1145,61 @@ function App() {
     if (lastTranscribedSourceId === sourceId) setLastTranscribedSourceId(null);
   };
 
+  const requestSourceDeletion = (source: SourceItem) => {
+    setPendingSourceDeletion(source);
+    setSourceDeletionError(null);
+    setSourceDeletionState('idle');
+  };
+
+  const confirmSourceDeletion = async () => {
+    if (pendingSourceDeletion === null || sourceDeletionState === 'deleting') return;
+    setSourceDeletionState('deleting');
+    setSourceDeletionError(null);
+    try {
+      if (supabase !== null && pendingSourceDeletion.storagePath === undefined) {
+        throw new Error('소스 저장이 끝난 뒤 다시 시도해주세요.');
+      }
+      if (pendingSourceDeletion.storagePath !== undefined) {
+        const response = await fetch(
+          `/api/source-graph?source_id=${encodeURIComponent(pendingSourceDeletion.id)}`,
+          {
+            method: 'DELETE',
+            headers: await apiHeaders(activeProjectId),
+          },
+        );
+        if (!response.ok) {
+          const errorBody = await response.json().catch(() => null) as { detail?: string } | null;
+          throw new Error(errorBody?.detail ?? '그래프 데이터 삭제에 실패했습니다.');
+        }
+      }
+      await removeSourceItem(pendingSourceDeletion.id);
+      setPendingSourceDeletion(null);
+      setSourceDeletionState('idle');
+      setGraphReloadKey((value) => value + 1);
+    } catch (error) {
+      setSourceDeletionState('idle');
+      setSourceDeletionError(error instanceof Error ? error.message : '삭제 중 문제가 발생했습니다.');
+    }
+  };
+
   const renameSourceItem = (sourceId: string) => {
     const targetSource = sourceItems.find((source) => source.id === sourceId);
     if (targetSource === undefined) return;
     const nextTitle = window.prompt('녹음본 이름을 입력하세요.', targetSource.title)?.trim();
     if (!nextTitle) return;
 
+    const renamedSource = { ...targetSource, title: nextTitle, meta: targetSource.meta.replace(/^이름 변경 전 · /, '') };
     setSourceItems((currentSourceItems) => currentSourceItems.map((source) => (
-      source.id === sourceId ? { ...source, title: nextTitle, meta: source.meta.replace(/^이름 변경 전 · /, '') } : source
+      source.id === sourceId ? renamedSource : source
     )));
     setSelectedSource((currentSource) => (
       currentSource?.id === sourceId ? { ...currentSource, title: nextTitle } : currentSource
     ));
     setIsRecordingMenuOpen(false);
+    if (supabase !== null && targetSource.storagePath !== undefined) {
+      void updateProjectSourcePayload(supabase, sourceId, sourcePayloadForStorage(renamedSource))
+        .catch((error) => console.error('Supabase 소스 이름 저장 실패:', error));
+    }
   };
 
   const createMaterialItems = (
@@ -1030,10 +1222,15 @@ function App() {
     }));
   };
 
-  // gsvx /ingest-doc이 지원하는 문서 형식 — 이 외(이미지 등)는 카드만 추가하고 그래프 반영은 건너뜀
+  // 내부 그래프 API가 지원하는 문서 형식 — 이 외 형식은 소스 카드만 추가한다.
   const isGraphIngestibleDocument = (file: File) => /\.(pdf|pptx|docx|md|txt)$/i.test(file.name);
 
-  const uploadMaterialToGsvx = async (file: File, itemId: string, projectId: string | null) => {
+  const uploadMaterialToGraph = async (
+    file: File,
+    itemId: string,
+    projectId: string | null,
+    meetingId?: string,
+  ) => {
     const markMeta = (suffix: string) => setSourceItems((items) => items.map((source) => (
       source.id === itemId ? { ...source, meta: `자료 · ${formatFileSize(file.size)} · ${suffix}` } : source
     )));
@@ -1041,22 +1238,81 @@ function App() {
       markMeta('그래프 분석 중…');
       const form = new FormData();
       form.append('file', file, file.name);
-      const response = await fetch(`${GSVX_BASE}/ingest-doc`, {
+      const response = await fetch('/api/ingest-doc', {
         method: 'POST',
-        headers: gsvxHeaders(projectId),
+        headers: {
+          ...(await apiHeaders(projectId, meetingId)),
+          'X-Source-Id': itemId,
+        },
         body: form,
       });
       if (!response.ok) {
         const errorBody = await response.json().catch(() => null) as { detail?: string } | null;
-        throw new Error(errorBody?.detail ?? `gsvx /ingest-doc ${response.status}`);
+        throw new Error(errorBody?.detail ?? `자료 그래프 반영 요청 실패 (${response.status})`);
       }
       const result = await response.json() as { chunks_ingested: number; concepts_total: number };
       markMeta(`그래프 반영 완료 (청크 ${result.chunks_ingested}개)`);
+      setGraphReloadKey((value) => value + 1);
+      return true;
     } catch (error) {
-      console.error('gsvx 문서 그래프 반영 실패:', error);
+      console.error('문서 그래프 반영 실패:', error);
       const message = error instanceof Error ? error.message : '';
       markMeta(message.includes('이미 등록된') ? '중복 — 이미 등록된 문서라 건너뜀' : '그래프 반영 실패');
+      return false;
     }
+  };
+
+  const persistMaterialFile = async (
+    file: File,
+    source: SourceItem,
+    projectId: string,
+    scope: 'project' | 'recording',
+    recordingId?: string,
+    graphMeetingId?: string,
+  ) => {
+    if (supabase === null || currentUser === null) return source;
+    const row = await uploadProjectSource({
+      client: supabase,
+      userId: currentUser.id,
+      projectId,
+      sourceId: source.id,
+      recordingId,
+      scope,
+      kind: 'document',
+      file,
+      fileName: file.name,
+      mimeType: file.type,
+      sourcePayload: sourcePayloadForStorage({ ...source, recordingId, graphMeetingId }),
+    });
+    const persistedSource: SourceItem = {
+      ...source,
+      recordingId,
+      graphMeetingId,
+      storagePath: row.storage_path,
+      mimeType: row.mime_type ?? undefined,
+      sizeBytes: row.size_bytes,
+    };
+    setSourceItems((items) => items.map((item) => item.id === source.id ? persistedSource : item));
+    return persistedSource;
+  };
+
+  const getProjectMaterialsForTranscription = async (projectId: string) => {
+    const localMaterials = projectMaterialFilesRef.current[projectId] ?? [];
+    if (supabase === null) return localMaterials;
+    const client = supabase;
+    const localIds = new Set(localMaterials.map(({ source }) => source.id));
+    const storedMaterials = sourceItems.filter((source) => (
+      source.category === '자료'
+      && source.materialScope === 'project'
+      && source.storagePath !== undefined
+      && !localIds.has(source.id)
+    ));
+    const downloadedMaterials = await Promise.all(storedMaterials.map(async (source) => {
+      const blob = await downloadProjectSource(client, source.storagePath ?? '');
+      const file = new File([blob], source.title, { type: source.mimeType ?? blob.type });
+      return { source, file };
+    }));
+    return [...localMaterials, ...downloadedMaterials];
   };
 
   const addProjectMaterialFiles = (files: FileList | File[]) => {
@@ -1085,9 +1341,20 @@ function App() {
       )));
     }
 
-    // 문서 형식이면 gsvx로 업로드해 청킹→에피소드→그래프 노드까지 반영(카드 meta로 진행상태 표시)
+    // 원본은 Supabase Storage에 보존하고, 분석 가능한 문서는 Neo4j에도 반영한다.
     fileList.forEach((file, index) => {
-      if (isGraphIngestibleDocument(file)) void uploadMaterialToGsvx(file, nextMaterials[index].id, activeProjectId);
+      if (projectId !== null) {
+        void persistMaterialFile(file, nextMaterials[index], projectId, 'project').then((persistedSource) => {
+          projectMaterialFilesRef.current[projectId] = (projectMaterialFilesRef.current[projectId] ?? [])
+            .map((entry) => entry.source.id === persistedSource.id ? { ...entry, source: persistedSource } : entry);
+        }).catch((error) => {
+          console.error('프로젝트 자료 저장 실패:', error);
+          setSourceItems((items) => items.map((source) => source.id === nextMaterials[index].id
+            ? { ...source, meta: `${source.meta} · 저장 실패` }
+            : source));
+        });
+      }
+      if (isGraphIngestibleDocument(file)) void uploadMaterialToGraph(file, nextMaterials[index].id, activeProjectId);
     });
 
     return nextMaterials.length;
@@ -1247,30 +1514,37 @@ function App() {
       setTranscriptionError('전사할 녹음 파일이 없습니다.');
       return;
     }
+    if (activeProjectId === null) {
+      setTranscriptionError('프로젝트를 먼저 선택해주세요.');
+      return;
+    }
 
     setTranscriptionError(null);
     setTranscriptionState('transcribing');
     setTranscriptionStep(1);
-
-    const body = new FormData();
-    body.append('audio', recordedAudioBlob, recordedAudioFileName ?? `synapvox-recording-${Date.now()}.webm`);
-    const projectMaterialsForTranscription = activeProjectId === null
-      ? []
-      : projectMaterialFilesRef.current[activeProjectId] ?? [];
-    projectMaterialsForTranscription.forEach(({ file }) => {
-      body.append('materials', file, file.name);
-    });
-    recordingMaterialFiles.forEach((file) => {
-      body.append('materials', file, file.name);
-    });
-    body.append('project_id', activeProject?.name ?? 'local-project');
-    body.append('meeting_id', `meeting-${Date.now()}`);
+    const now = new Date();
+    const recordingId = `recording-${now.getTime()}`;
+    const meetingId = `meeting-${now.getTime()}`;
+    const audioFileName = recordedAudioFileName ?? `synapvox-recording-${now.getTime()}.webm`;
 
     try {
+      const projectMaterialsForTranscription = await getProjectMaterialsForTranscription(activeProjectId);
+      const body = new FormData();
+      body.append('audio', recordedAudioBlob, audioFileName);
+      projectMaterialsForTranscription.forEach(({ file }) => {
+        body.append('materials', file, file.name);
+      });
+      recordingMaterialFiles.forEach((file) => {
+        body.append('materials', file, file.name);
+      });
+      body.append('project_id', activeProjectId);
+      body.append('meeting_id', meetingId);
+
       await new Promise((resolve) => window.setTimeout(resolve, 250));
       setTranscriptionStep(2);
       const response = await fetch('/api/stt/transcribe', {
         method: 'POST',
+        headers: await apiHeaders(activeProjectId),
         body,
       });
 
@@ -1282,36 +1556,55 @@ function App() {
       const result = await response.json() as IntermediateTranscript;
       const transcriptSegments = mapIntermediateTranscript(result);
 
-      // STT 결과(중간 포맷 JSON)를 gsvx(Graphiti)로 이어서 그래프에 반영한다.
-      // 실패해도 전사 자체는 이미 성공했으니 화면 전체를 막지 않고 그래프만 조용히 스킵.
-      const gsvxProjectId = activeProjectId;
-      void (async () => {
-        try {
-          const ingestResponse = await fetch(`${GSVX_BASE}/ingest-stt`, {
-            method: 'POST',
-            headers: { ...gsvxHeaders(gsvxProjectId), 'Content-Type': 'application/json' },
-            body: JSON.stringify(result),
-          });
-          if (!ingestResponse.ok) throw new Error(`gsvx /ingest-stt ${ingestResponse.status}`);
-        } catch (error) {
-          console.error('gsvx로 STT 결과를 넘기지 못했습니다:', error);
+      // 전사문과 이 녹음에만 붙인 참고 자료를 같은 meeting_id로 Neo4j에 묶는다.
+      try {
+        const ingestResponse = await fetch('/api/ingest-stt', {
+          method: 'POST',
+          headers: {
+            ...(await apiHeaders(activeProjectId)),
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(result),
+        });
+        if (!ingestResponse.ok) {
+          const errorBody = await ingestResponse.json().catch(() => null) as { detail?: string } | null;
+          throw new Error(errorBody?.detail ?? `전사 그래프 반영 요청 실패 (${ingestResponse.status})`);
         }
-      })();
+        await Promise.all(recordingMaterialFiles.map((file, index) => (
+          isGraphIngestibleDocument(file)
+            ? uploadMaterialToGraph(file, recordingAttachedMaterials[index]?.id ?? '', activeProjectId, meetingId)
+            : Promise.resolve(false)
+        )));
+        setGraphReloadKey((value) => value + 1);
+      } catch (error) {
+        console.error('전사 결과를 그래프에 반영하지 못했습니다:', error);
+      }
       const savedTranscriptSegments = transcriptSegments;
-      const now = new Date();
       const timeLabel = now.toLocaleTimeString('ko-KR', {
         hour: '2-digit',
         minute: '2-digit',
         hour12: false,
       });
-      const recordingId = `recording-${now.getTime()}`;
+      let persistedRecordingMaterials = recordingAttachedMaterials;
+      if (supabase !== null && currentUser !== null) {
+        persistedRecordingMaterials = await Promise.all(recordingMaterialFiles.map((file, index) => (
+          persistMaterialFile(
+            file,
+            recordingAttachedMaterials[index],
+            activeProjectId,
+            'recording',
+            recordingId,
+            meetingId,
+          )
+        )));
+      }
       const linkedMaterials = [
         ...projectMaterialsForTranscription.map((entry) => entry.source),
-        ...recordingAttachedMaterials,
+        ...persistedRecordingMaterials,
       ].filter((material, index, materials) => (
         materials.findIndex((candidate) => candidate.id === material.id) === index
       ));
-      const savedRecording: SourceItem = {
+      let savedRecording: SourceItem = {
         id: recordingId,
         title: getRecordingTitle(recordedAudioFileName, `녹음본 ${timeLabel}`),
         type: recordedAudioFileName === null ? '녹음' : '파일',
@@ -1322,7 +1615,40 @@ function App() {
         durationLabel: recordedAudioDurationLabel,
         attachedMaterials: linkedMaterials,
         mediaKind: recordedMediaKind,
+        recordingId,
+        graphMeetingId: meetingId,
       };
+      if (supabase !== null && currentUser !== null) {
+        const audioRow = await uploadProjectSource({
+          client: supabase,
+          userId: currentUser.id,
+          projectId: activeProjectId,
+          sourceId: recordingId,
+          recordingId,
+          scope: 'recording',
+          kind: 'audio',
+          file: recordedAudioBlob,
+          fileName: audioFileName,
+          mimeType: recordedAudioBlob.type,
+          durationSeconds: durationLabelToSeconds(recordedAudioDurationLabel),
+          sourcePayload: sourcePayloadForStorage(savedRecording),
+        });
+        savedRecording = {
+          ...savedRecording,
+          storagePath: audioRow.storage_path,
+          mimeType: audioRow.mime_type ?? undefined,
+          sizeBytes: audioRow.size_bytes,
+        };
+        await saveRecordingTranscript({
+          client: supabase,
+          userId: currentUser.id,
+          projectId: activeProjectId,
+          recordingId,
+          meetingId,
+          intermediateJson: result as unknown as Record<string, unknown>,
+          segments: savedTranscriptSegments,
+        });
+      }
       if (recordedAudioUrl !== null) savedAudioUrlsRef.current.add(recordedAudioUrl);
       setSourceItems((currentSourceItems) => [
         savedRecording,
@@ -1346,6 +1672,10 @@ function App() {
       setTranscriptionState('done');
       setTranscriptionStep(3);
     } catch (error) {
+      if (supabase !== null) {
+        void deleteProjectSource(supabase, recordingId, undefined, recordingId)
+          .catch((cleanupError) => console.error('실패한 녹음 저장 정리 실패:', cleanupError));
+      }
       setTranscriptionState('idle');
       setTranscriptionStep(0);
       setTranscriptionError(error instanceof Error ? error.message : '전사 중 문제가 발생했습니다.');
@@ -1391,17 +1721,19 @@ function App() {
     void (async () => {
       let assistantText: string;
       try {
-        const response = await fetch(`${GSVX_BASE}/ask?q=${encodeURIComponent(query)}&k=6`, {
-          headers: gsvxHeaders(activeProjectId),
+        const response = await fetch(`/api/ask?project=${encodeURIComponent(activeProjectId ?? '')}&q=${encodeURIComponent(query)}&k=6`, {
+          headers: await apiHeaders(activeProjectId),
         });
-        if (!response.ok) throw new Error(`gsvx /ask ${response.status}`);
+        if (!response.ok) throw new Error(`/api/ask ${response.status}`);
         const data = await response.json() as {
           answer: string; hits?: { session_id: string }[];
           expansion?: { nodes?: { id: string }[] };
         };
         assistantText = data.answer;
+        setChatGraphExpansion(new Set((data.expansion?.nodes ?? []).map((node) => node.id)));
       } catch (error) {
-        console.error('gsvx AI 답변을 받아오지 못했습니다:', error);
+        console.error('AI 답변을 받아오지 못했습니다:', error);
+        setChatGraphExpansion(null);
         const hasRecordings = sourceItems.some((source) => source.category === '녹음본');
         const hasMaterials = sourceItems.some((source) => source.category === '자료');
         assistantText = hasRecordings || hasMaterials
@@ -2348,7 +2680,7 @@ function App() {
                           className="source-delete-button"
                           type="button"
                           aria-label={`${source.title} 삭제`}
-                          onClick={() => removeSourceItem(source.id)}
+                          onClick={() => requestSourceDeletion(source)}
                         >
                           <svg viewBox="0 0 24 24" aria-hidden="true">
                             <path d="M3 6h18" />
@@ -2368,10 +2700,51 @@ function App() {
                   )}
                 </div>
 
+                {pendingSourceDeletion !== null && (
+                  <div className="source-delete-confirm-backdrop" role="presentation">
+                    <div
+                      className="source-delete-confirm"
+                      role="alertdialog"
+                      aria-modal="true"
+                      aria-labelledby="source-delete-confirm-title"
+                    >
+                      <strong id="source-delete-confirm-title">삭제하시겠습니까?</strong>
+                      <p title={pendingSourceDeletion.title}>{pendingSourceDeletion.title}</p>
+                      {sourceDeletionError !== null && (
+                        <span className="source-delete-error">{sourceDeletionError}</span>
+                      )}
+                      <div>
+                        <button
+                          type="button"
+                          disabled={sourceDeletionState === 'deleting'}
+                          onClick={() => {
+                            setPendingSourceDeletion(null);
+                            setSourceDeletionError(null);
+                          }}
+                        >
+                          취소
+                        </button>
+                        <button
+                          className="danger"
+                          type="button"
+                          disabled={sourceDeletionState === 'deleting'}
+                          onClick={() => void confirmSourceDeletion()}
+                        >
+                          {sourceDeletionState === 'deleting' ? '삭제 중…' : '삭제'}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
                 <button
                   className={`source-edit-toggle ${isSourceEditing ? 'editing' : ''}`}
                   type="button"
-                  onClick={() => setIsSourceEditing((value) => !value)}
+                  onClick={() => {
+                    setIsSourceEditing((value) => !value);
+                    setPendingSourceDeletion(null);
+                    setSourceDeletionError(null);
+                  }}
                 >
                   {isSourceEditing ? '완료' : '편집하기'}
                 </button>
@@ -2379,7 +2752,12 @@ function App() {
               </aside>
 
               <section className="studio-graph">
-                <GraphModule project={activeProjectId} />
+                <GraphModule
+                  project={activeProjectId}
+                  projectName={activeProject.name}
+                  reloadKey={graphReloadKey}
+                  askExpansionIds={chatGraphExpansion}
+                />
               </section>
 
               <aside className="studio-chat">
@@ -2720,9 +3098,9 @@ function App() {
                     </p>
                   </div>
                 )}
-                {(projectMaterialFiles.length > 0 || recordingAttachedMaterials.length > 0) && (
+                {(projectMaterialSources.length > 0 || recordingAttachedMaterials.length > 0) && (
                   <div className="record-attached-list" aria-label="이 녹음본에 연결된 자료">
-                    {projectMaterialFiles.map(({ source }) => (
+                    {projectMaterialSources.map((source) => (
                       <span key={source.id}>
                         <b>공통</b>
                         {source.title}
@@ -2899,7 +3277,9 @@ function App() {
                         className="danger"
                         type="button"
                         onClick={() => {
-                          removeSourceItem(selectedSource.id);
+                          requestSourceDeletion(selectedSource);
+                          setSelectedSource(null);
+                          setIsSourceFullscreen(false);
                           setIsRecordingMenuOpen(false);
                         }}
                       >
@@ -2946,7 +3326,7 @@ function App() {
                         <div>
                           <button
                             type="button"
-                            onClick={() => setIsTranscriptEditing((value) => !value)}
+                            onClick={toggleTranscriptEditing}
                             disabled={selectedTranscriptSegments.length === 0}
                           >
                             {isTranscriptEditing ? '완료' : '편집'}
