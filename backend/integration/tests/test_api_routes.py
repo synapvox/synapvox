@@ -1,3 +1,5 @@
+import json
+
 from fastapi.testclient import TestClient
 
 from backend.integration.api import main as api_main
@@ -34,6 +36,7 @@ def test_api_ingest_stt_uses_active_project(monkeypatch):
     from backend.integration import pipeline
     monkeypatch.setattr(api_main, "_graph_runtime", lambda: (None, object(), None))
     monkeypatch.setattr(api_main, "_optional_vector_store", lambda: None)
+    monkeypatch.setattr(api_main, "_owned_transcript_exists", lambda user, project, meeting: True)
     monkeypatch.setattr(graphrag, "graph_data", lambda driver, project, database: {
         "nodes": [{"id": "t1", "type": "concept", "label": "그래프", "meta": {}}], "edges": [],
     })
@@ -103,6 +106,7 @@ def test_api_ingest_doc_stores_text_file(monkeypatch):
         "concepts_new": 1,
         "concepts_total": 1,
         "relations_new": 0,
+        "timings_ms": {},
     }
     assert captured["document_id"] == "material-123"
 
@@ -141,6 +145,104 @@ def test_api_graph_and_ask_use_current_project(monkeypatch):
     assert answer.status_code == 200
     assert answer.json()["answer"] == "질문"
 
+
+def test_api_ask_stream_emits_deltas_then_focus_graph(monkeypatch):
+    import backend.graphrag as graphrag
+
+    class _FakeSearch:
+        def __init__(self, driver, vector, database):
+            pass
+
+        def search(self, project, question, k):
+            return [{
+                "chunk_id": "c1",
+                "text": "미분 근거",
+                "score": 0.8,
+                "meeting_id": "m1",
+                "meeting_title": "최적화 개론",
+                "topics": ["미분"],
+                "topic_nodes": [{"id": "t1", "label": "미분"}],
+            }]
+
+    monkeypatch.setattr(api_main, "_graph_runtime", lambda: (object(), object(), "neo4j"))
+    monkeypatch.setattr(api_main, "_optional_vector_store", lambda: object())
+    monkeypatch.setattr(
+        api_main,
+        "_stream_answer_text",
+        lambda question, hits, history=None: iter(["미분은 ", "변화율입니다."]),
+    )
+    monkeypatch.setattr(graphrag, "HybridSearch", _FakeSearch)
+    monkeypatch.setattr(
+        graphrag,
+        "expansion_for_chunks",
+        lambda driver, project, chunk_ids, database: {
+            "nodes": [{"id": "t1", "type": "concept", "label": "미분", "meta": {}}],
+            "edges": [],
+        },
+    )
+
+    response = TestClient(app).get(
+        "/api/ask-stream",
+        params={"project": "project-uuid", "q": "미분이 뭐야", "k": 4},
+    )
+    events = [json.loads(line) for line in response.text.splitlines() if line]
+
+    assert response.status_code == 200
+    assert "".join(event.get("text", "") for event in events) == "미분은 변화율입니다."
+    assert events[-1]["type"] == "complete"
+    assert events[-1]["answer"] == "미분은 변화율입니다."
+    assert events[-1]["expansion"]["nodes"][0]["id"] == "t1"
+
+
+def test_api_ask_stream_post_passes_chat_history(monkeypatch):
+    import backend.graphrag as graphrag
+
+    captured = {}
+
+    class _FakeSearch:
+        def __init__(self, driver, vector, database):
+            pass
+
+        def search(self, project, question, k):
+            return [{
+                "chunk_id": "c1",
+                "text": "근거",
+                "meeting_id": "m1",
+                "topics": [],
+                "topic_nodes": [],
+            }]
+
+    def fake_stream(question, hits, history=None):
+        captured["history"] = history
+        return iter(["이전 대화를 이어서 답변"])
+
+    monkeypatch.setattr(api_main, "_graph_runtime", lambda: (object(), object(), "neo4j"))
+    monkeypatch.setattr(api_main, "_optional_vector_store", lambda: object())
+    monkeypatch.setattr(api_main, "_stream_answer_text", fake_stream)
+    monkeypatch.setattr(graphrag, "HybridSearch", _FakeSearch)
+    monkeypatch.setattr(
+        graphrag,
+        "expansion_for_chunks",
+        lambda driver, project, chunk_ids, database: {"nodes": [], "edges": []},
+    )
+
+    response = TestClient(app).post(
+        "/api/ask-stream",
+        json={
+            "project": "project-uuid",
+            "q": "그럼 제약은?",
+            "history": [
+                {"role": "user", "text": "KKT가 뭐야?"},
+                {"role": "assistant", "text": "최적화의 필요 조건입니다."},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["history"] == [
+        {"role": "user", "text": "KKT가 뭐야?"},
+        {"role": "assistant", "text": "최적화의 필요 조건입니다."},
+    ]
 
 def test_delete_recording_source_removes_graph_meeting_and_vectors(monkeypatch):
     calls = []

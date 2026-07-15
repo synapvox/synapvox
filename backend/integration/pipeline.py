@@ -32,9 +32,11 @@ import hashlib
 import re
 import sys
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from itertools import combinations
 from pathlib import Path
+from time import perf_counter
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -214,6 +216,59 @@ def extract_chunk_topics(project_id: str, chunk: dict, top_n: int = 7) -> dict:
     return {"chunk_id": chunk["chunk_id"], "topics": topics, "decisions": [], "action_items": []}
 
 
+def _extract_knowledge(project_id: str, chunks: list[dict]) -> tuple[list[dict], list[tuple[str, str]]]:
+    extractions = [extract_chunk_topics(project_id, chunk) for chunk in chunks]
+    relations: set[tuple[str, str]] = set()
+    for extraction in extractions:
+        ids = sorted({topic["topic_id"] for topic in extraction["topics"]})
+        relations.update(combinations(ids, 2))
+    return extractions, sorted(relations)
+
+
+def _store_knowledge(
+    graph_store,
+    vector_store,
+    project_id: str,
+    meeting_id: str,
+    chunks: list[dict],
+    extractions: list[dict],
+    relations: list[tuple[str, str]],
+) -> dict:
+    def store_graph() -> dict:
+        if hasattr(graph_store, "load_knowledge_batch"):
+            return graph_store.load_knowledge_batch(
+                project_id,
+                meeting_id,
+                chunks,
+                extractions,
+                relations,
+            )
+        graph_store.load_chunks(project_id, meeting_id, chunks)
+        for extraction in extractions:
+            graph_store.load_extraction(project_id, meeting_id, extraction)
+        for left, right in relations:
+            graph_store.relate_topics(project_id, left, right)
+        return {
+            "chunks_loaded": len(chunks),
+            "topics_loaded": sum(len(item.get("topics", [])) for item in extractions),
+            "relations_loaded": len(relations),
+            "concepts_total": len({
+                topic["topic_id"]
+                for item in extractions
+                for topic in item.get("topics", [])
+            }),
+        }
+
+    if vector_store is None:
+        return store_graph()
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="knowledge-ingest") as executor:
+        graph_future = executor.submit(store_graph)
+        vector_future = executor.submit(vector_store.add_chunks, project_id, meeting_id, chunks)
+        graph_result = graph_future.result()
+        vector_future.result()
+    return graph_result
+
+
 def ingest_intermediate(
     intermediate: dict,
     graph_store,
@@ -227,23 +282,29 @@ def ingest_intermediate(
     data["source_type"] = "transcript"
     pid, mid = data["project_id"], data["meeting_id"]
     data.setdefault("title", data.get("source") or mid)
+    started = perf_counter()
     chunks = chunk_transcript(data, max_chars=max_chars)
+    extractions, relations = _extract_knowledge(pid, chunks)
+    prepared = perf_counter()
     graph_store.load_intermediate(data)
-    graph_store.load_chunks(pid, mid, chunks)
-    if vector_store is not None:
-        vector_store.add_chunks(pid, mid, chunks)
-    topic_ids: set[str] = set()
-    relation_count = 0
-    for chunk in chunks:
-        extraction = extract_chunk_topics(pid, chunk)
-        graph_store.load_extraction(pid, mid, extraction)
-        ids = [topic["topic_id"] for topic in extraction["topics"]]
-        topic_ids.update(ids)
-        for left, right in combinations(ids, 2):
-            graph_store.relate_topics(pid, left, right)
-            relation_count += 1
+    meeting_loaded = perf_counter()
+    store_stats = _store_knowledge(graph_store, vector_store, pid, mid, chunks, extractions, relations)
+    stored = perf_counter()
+    topic_ids = {
+        topic["topic_id"]
+        for extraction in extractions
+        for topic in extraction["topics"]
+    }
+    timings = {
+        "prepare": round((prepared - started) * 1000),
+        "meeting": round((meeting_loaded - prepared) * 1000),
+        "stores": round((stored - meeting_loaded) * 1000),
+        "total": round((stored - started) * 1000),
+    }
     return {"project_id": pid, "meeting_id": mid, "chunks": chunks,
-            "topic_ids": sorted(topic_ids), "relations": relation_count, "loaded": True}
+            "topic_ids": sorted(topic_ids), "relations": len(relations), "loaded": True,
+            "concepts_total": store_stats.get("concepts_total", len(topic_ids)),
+            "timings_ms": timings}
 
 
 def ingest_document_text(
@@ -270,23 +331,37 @@ def ingest_document_text(
         "preserve_existing": meeting_id is not None,
         "segments": [],
     }
-    graph_store.load_intermediate(intermediate)
+    started = perf_counter()
     chunks = chunk_document(text, f"doc-{doc_digest}", max_chars=max_chars)
-    graph_store.load_chunks(project_id, mid, chunks)
-    if vector_store is not None:
-        vector_store.add_chunks(project_id, mid, chunks)
-    topic_ids: set[str] = set()
-    relation_count = 0
-    for chunk in chunks:
-        extraction = extract_chunk_topics(project_id, chunk)
-        graph_store.load_extraction(project_id, mid, extraction)
-        ids = [topic["topic_id"] for topic in extraction["topics"]]
-        topic_ids.update(ids)
-        for left, right in combinations(ids, 2):
-            graph_store.relate_topics(project_id, left, right)
-            relation_count += 1
+    extractions, relations = _extract_knowledge(project_id, chunks)
+    prepared = perf_counter()
+    graph_store.load_intermediate(intermediate)
+    meeting_loaded = perf_counter()
+    store_stats = _store_knowledge(
+        graph_store,
+        vector_store,
+        project_id,
+        mid,
+        chunks,
+        extractions,
+        relations,
+    )
+    stored = perf_counter()
+    topic_ids = {
+        topic["topic_id"]
+        for extraction in extractions
+        for topic in extraction["topics"]
+    }
+    timings = {
+        "prepare": round((prepared - started) * 1000),
+        "meeting": round((meeting_loaded - prepared) * 1000),
+        "stores": round((stored - meeting_loaded) * 1000),
+        "total": round((stored - started) * 1000),
+    }
     return {"project_id": project_id, "meeting_id": mid, "chunks": chunks,
-            "topic_ids": sorted(topic_ids), "relations": relation_count, "loaded": True}
+            "topic_ids": sorted(topic_ids), "relations": len(relations), "loaded": True,
+            "concepts_total": store_stats.get("concepts_total", len(topic_ids)),
+            "timings_ms": timings}
 
 
 # ── 3) 중간 매개 함수: 입력 파일 → graphrag 적재 ────────

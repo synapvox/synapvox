@@ -60,13 +60,14 @@ class VectorStore:
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
             cur.execute(f"""
                 CREATE TABLE IF NOT EXISTS {self.table} (
-                    chunk_id TEXT PRIMARY KEY,
+                    chunk_id TEXT NOT NULL,
                     project_id TEXT NOT NULL,
                     meeting_id TEXT,
                     source_type TEXT NOT NULL DEFAULT 'unknown',
                     chunk_text TEXT NOT NULL,
                     embedding VECTOR NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (project_id, chunk_id)
                 );
             """)
             cur.execute(f"CREATE INDEX IF NOT EXISTS {self.table}_project_id_idx ON {self.table} (project_id);")
@@ -86,8 +87,8 @@ class VectorStore:
                 cur,
                 f"""INSERT INTO {self.table} (chunk_id, project_id, meeting_id, source_type, chunk_text, embedding)
                     VALUES %s
-                    ON CONFLICT (chunk_id) DO UPDATE SET
-                        project_id = EXCLUDED.project_id, meeting_id = EXCLUDED.meeting_id,
+                    ON CONFLICT (project_id, chunk_id) DO UPDATE SET
+                        meeting_id = EXCLUDED.meeting_id,
                         source_type = EXCLUDED.source_type, chunk_text = EXCLUDED.chunk_text,
                         embedding = EXCLUDED.embedding""",
                 rows,

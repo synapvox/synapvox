@@ -26,6 +26,21 @@ export type StoredTranscriptRow = {
   segments: unknown[];
 };
 
+export type StoredChatMessage = {
+  role: 'user' | 'assistant';
+  text: string;
+};
+
+export type StoredChatSessionRow = {
+  id: string;
+  owner_id: string;
+  project_id: string;
+  title: string;
+  messages: StoredChatMessage[];
+  created_at: string;
+  updated_at: string;
+};
+
 type UploadSourceInput = {
   client: SupabaseClient;
   userId: string;
@@ -122,6 +137,48 @@ export const saveRecordingTranscript = async ({
     segments,
     updated_at: new Date().toISOString(),
   }, { onConflict: 'recording_id' });
+  if (error) throw error;
+};
+
+export const loadStoredChatSessions = async (
+  client: SupabaseClient,
+  projectId: string,
+) => {
+  const { data, error } = await client
+    .from('chat_sessions')
+    .select('*')
+    .eq('project_id', projectId)
+    .order('updated_at', { ascending: false });
+  if (error) throw error;
+  return (data ?? []) as StoredChatSessionRow[];
+};
+
+export const saveStoredChatSession = async (
+  client: SupabaseClient,
+  userId: string,
+  session: {
+    id: string;
+    projectId: string;
+    title: string;
+    messages: StoredChatMessage[];
+  },
+) => {
+  const { error } = await client.from('chat_sessions').upsert({
+    id: session.id,
+    owner_id: userId,
+    project_id: session.projectId,
+    title: session.title,
+    messages: session.messages,
+    updated_at: new Date().toISOString(),
+  }, { onConflict: 'id' });
+  if (error) throw error;
+};
+
+export const deleteStoredChatSession = async (
+  client: SupabaseClient,
+  sessionId: string,
+) => {
+  const { error } = await client.from('chat_sessions').delete().eq('id', sessionId);
   if (error) throw error;
 };
 

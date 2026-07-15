@@ -4,14 +4,18 @@ import { supabase } from './supabaseClient';
 import GraphModule from './graphmodule/GraphModule';
 import type { Session } from '@supabase/supabase-js';
 import {
+  deleteStoredChatSession,
   deleteProjectSource,
   downloadProjectSource,
+  loadStoredChatSessions,
   loadStoredProjectWorkspace,
+  saveStoredChatSession,
   saveRecordingTranscript,
   updateProjectSourcePayload,
   updateStoredTranscriptSegments,
   uploadProjectSource,
   type StoredSourceRow,
+  type StoredChatMessage,
 } from './sourceStorage';
 
 type Project = {
@@ -88,11 +92,62 @@ type AuthUser = {
   role: string;
 };
 
+type AskStreamEvent =
+  | { type: 'delta'; text: string }
+  | { type: 'complete'; answer: string; expansion?: { nodes?: { id: string }[] } }
+  | { type: 'error'; message: string };
+
+type ChatMessage = StoredChatMessage;
+
+type ChatSession = {
+  id: string;
+  projectId: string;
+  title: string;
+  messages: ChatMessage[];
+  createdAt: string;
+  updatedAt: string;
+};
+
 const PROJECTS_STORAGE_KEY = 'synapvox-projects';
 const WORKSPACES_STORAGE_KEY = 'synapvox-project-workspaces';
 const ACTIVE_PROJECT_STORAGE_KEY = 'synapvox-active-project';
+const CHAT_SESSIONS_STORAGE_KEY = 'synapvox-chat-sessions';
 const SUPABASE_ADMIN_EMAIL = 'root@synapvox.local';
 const scopedStorageKey = (baseKey: string, userId: string | null) => `${baseKey}:${userId ?? 'guest'}`;
+
+const CHAT_INTRO_MESSAGE: ChatMessage = {
+  role: 'assistant',
+  text: '강의 기록과 자료를 바탕으로 질문에 답변합니다. 궁금한 내용을 입력하면 가운데 그래프에서 관련 노드도 함께 표시할게요.',
+};
+
+const createChatSessionId = () => `chat-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+
+const createEmptyChatSession = (projectId: string): ChatSession => {
+  const now = new Date().toISOString();
+  return {
+    id: createChatSessionId(),
+    projectId,
+    title: '새 대화',
+    messages: [{ ...CHAT_INTRO_MESSAGE }],
+    createdAt: now,
+    updatedAt: now,
+  };
+};
+
+const loadLocalChatSessions = (userId: string, projectId: string): ChatSession[] => {
+  try {
+    const raw = window.localStorage.getItem(
+      `${scopedStorageKey(CHAT_SESSIONS_STORAGE_KEY, userId)}:${projectId}`,
+    );
+    if (raw === null) return [];
+    const parsed = JSON.parse(raw) as ChatSession[];
+    return Array.isArray(parsed)
+      ? parsed.filter((session) => session.projectId === projectId && Array.isArray(session.messages))
+      : [];
+  } catch {
+    return [];
+  }
+};
 
 const authUserFromSession = (session: Session | null): AuthUser | null => {
   if (session === null) return null;
@@ -333,12 +388,11 @@ function App() {
   const [isSourceSortOpen, setIsSourceSortOpen] = useState(false);
   const [isSourcePanelOpen, setIsSourcePanelOpen] = useState(true);
   const [chatInput, setChatInput] = useState('');
-  const [chatMessages, setChatMessages] = useState([
-    {
-      role: 'assistant',
-      text: '프로젝트의 녹음본과 자료를 바탕으로 질문에 답변합니다. 궁금한 내용을 입력하면 가운데 그래프에서 관련 노드를 함께 표시할게요.',
-    },
-  ]);
+  const [isChatResponding, setIsChatResponding] = useState(false);
+  const [, setIsChatWaiting] = useState(false);
+  const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
+  const [activeChatSessionId, setActiveChatSessionId] = useState<string | null>(null);
+  const [isChatSessionMenuOpen, setIsChatSessionMenuOpen] = useState(false);
   const [graphReloadKey, setGraphReloadKey] = useState(0);
   const [chatGraphExpansion, setChatGraphExpansion] = useState<Set<string> | null>(null);
   const [isDetailAudioPlaying, setIsDetailAudioPlaying] = useState(false);
@@ -357,6 +411,9 @@ function App() {
   const shouldSeedDemoRecordingRef = useRef(window.location.search.includes('demoRecording'));
   const sessionUserIdRef = useRef<string | null | undefined>(undefined);
   const workspaceLoadRequestRef = useRef(0);
+  const chatSessionLoadRequestRef = useRef(0);
+  const chatRequestInFlightRef = useRef(false);
+  const chatThreadRef = useRef<HTMLDivElement | null>(null);
 
   const activeProject = activeProjectIndex === null ? null : projects[activeProjectIndex];
   const activeProjectId = activeProject?.id ?? null;
@@ -367,6 +424,8 @@ function App() {
   const projectMaterialCount = projectMaterialSources.length;
   const recordingMaterialCount = recordingMaterialFiles.length;
   const totalTranscriptionMaterialCount = projectMaterialCount + recordingMaterialCount;
+  const activeChatSession = chatSessions.find((session) => session.id === activeChatSessionId) ?? null;
+  const chatMessages = activeChatSession?.messages ?? [];
 
   const apiHeaders = async (projectId: string | null, meetingId?: string): Promise<Record<string, string>> => {
     const token = (await supabase?.auth.getSession())?.data.session?.access_token;
@@ -375,6 +434,60 @@ function App() {
       ...(projectId !== null ? { 'X-Project-Id': projectId } : {}),
       ...(meetingId ? { 'X-Meeting-Id': meetingId } : {}),
     };
+  };
+  const updateChatSessionMessages = (
+    sessionId: string,
+    updater: (messages: ChatMessage[]) => ChatMessage[],
+    title?: string,
+  ) => {
+    setChatSessions((currentSessions) => currentSessions.map((session) => (
+      session.id === sessionId
+        ? {
+            ...session,
+            title: title ?? session.title,
+            messages: updater(session.messages),
+            updatedAt: new Date().toISOString(),
+          }
+        : session
+    )));
+  };
+
+  const startNewChatSession = () => {
+    if (activeProjectId === null || isChatResponding) return;
+    const session = createEmptyChatSession(activeProjectId);
+    setChatSessions((currentSessions) => [session, ...currentSessions]);
+    setActiveChatSessionId(session.id);
+    setChatInput('');
+    setChatGraphExpansion(null);
+    setIsChatSessionMenuOpen(false);
+  };
+
+  const renameChatSession = (session: ChatSession) => {
+    const nextTitle = window.prompt('대화 이름을 입력하세요.', session.title)?.trim();
+    if (!nextTitle) return;
+    setChatSessions((currentSessions) => currentSessions.map((currentSession) => (
+      currentSession.id === session.id
+        ? { ...currentSession, title: nextTitle.slice(0, 60), updatedAt: new Date().toISOString() }
+        : currentSession
+    )));
+  };
+
+  const removeChatSession = (session: ChatSession) => {
+    if (isChatResponding || !window.confirm(`“${session.title}” 대화를 삭제할까요?`)) return;
+    const remaining = chatSessions.filter((currentSession) => currentSession.id !== session.id);
+    if (remaining.length === 0 && activeProjectId !== null) {
+      const replacement = createEmptyChatSession(activeProjectId);
+      setChatSessions([replacement]);
+      setActiveChatSessionId(replacement.id);
+    } else {
+      setChatSessions(remaining);
+      if (activeChatSessionId === session.id) setActiveChatSessionId(remaining[0]?.id ?? null);
+    }
+    if (supabase !== null && currentUser !== null && currentUser.role !== 'admin') {
+      void deleteStoredChatSession(supabase, session.id).catch((error) => {
+        console.error('Supabase 대화 삭제 실패:', error);
+      });
+    }
   };
   const visibleSourceItems = sourceItems
     .filter((source) => source.category === sourceTab)
@@ -595,6 +708,79 @@ function App() {
       window.location.pathname,
     );
   }, [activeProjectId, activeProjectIndex, storageUserId]);
+
+  useEffect(() => {
+    const requestId = ++chatSessionLoadRequestRef.current;
+    setIsChatSessionMenuOpen(false);
+    setChatGraphExpansion(null);
+    setChatInput('');
+    if (activeProjectId === null || currentUser === null || currentUser.role === 'admin') {
+      setChatSessions([]);
+      setActiveChatSessionId(null);
+      return;
+    }
+
+    const localSessions = loadLocalChatSessions(currentUser.id, activeProjectId);
+    const fallbackSessions = localSessions.length > 0
+      ? localSessions
+      : [createEmptyChatSession(activeProjectId)];
+    if (supabase === null) {
+      setChatSessions(fallbackSessions);
+      setActiveChatSessionId(fallbackSessions[0].id);
+      return;
+    }
+
+    void loadStoredChatSessions(supabase, activeProjectId)
+      .then((rows) => {
+        if (chatSessionLoadRequestRef.current !== requestId) return;
+        const sessions = rows.map((row) => ({
+          id: row.id,
+          projectId: row.project_id,
+          title: row.title,
+          messages: Array.isArray(row.messages) && row.messages.length > 0
+            ? row.messages
+            : [{ ...CHAT_INTRO_MESSAGE }],
+          createdAt: row.created_at,
+          updatedAt: row.updated_at,
+        }));
+        const nextSessions = sessions.length > 0 ? sessions : fallbackSessions;
+        setChatSessions(nextSessions);
+        setActiveChatSessionId(nextSessions[0].id);
+      })
+      .catch((error) => {
+        if (chatSessionLoadRequestRef.current !== requestId) return;
+        console.error('Supabase 대화 목록 복원 실패:', error);
+        setChatSessions(fallbackSessions);
+        setActiveChatSessionId(fallbackSessions[0].id);
+      });
+  }, [activeProjectId, currentUser]);
+
+  useEffect(() => {
+    if (
+      supabase === null
+      || currentUser === null
+      || currentUser.role === 'admin'
+      || activeProjectId === null
+      || chatSessions.length === 0
+    ) return;
+    const storageClient = supabase;
+    const userId = currentUser.id;
+    const sessions = chatSessions.filter((session) => session.projectId === activeProjectId);
+    window.localStorage.setItem(
+      `${scopedStorageKey(CHAT_SESSIONS_STORAGE_KEY, userId)}:${activeProjectId}`,
+      JSON.stringify(sessions),
+    );
+    const timer = window.setTimeout(() => {
+      void Promise.all(sessions.map((session) => saveStoredChatSession(
+        storageClient,
+        userId,
+        session,
+      ))).catch((error) => {
+        console.error('Supabase 대화 저장 실패:', error);
+      });
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [activeProjectId, chatSessions, currentUser]);
 
   // 프로젝트 전환 시: 그래프를 해당 프로젝트 네임스페이스로 다시 불러오고,
   // 소스 카드·전사 목록도 프로젝트별로 분리 보관/복원한다(이전 프로젝트 데이터가 새 프로젝트에 안 섞이게).
@@ -1526,6 +1712,8 @@ function App() {
     const recordingId = `recording-${now.getTime()}`;
     const meetingId = `meeting-${now.getTime()}`;
     const audioFileName = recordedAudioFileName ?? `synapvox-recording-${now.getTime()}.webm`;
+    const recordingFilesForTranscription = [...recordingMaterialFiles];
+    const recordingMaterialsForTranscription = [...recordingAttachedMaterials];
 
     try {
       const projectMaterialsForTranscription = await getProjectMaterialsForTranscription(activeProjectId);
@@ -1534,7 +1722,7 @@ function App() {
       projectMaterialsForTranscription.forEach(({ file }) => {
         body.append('materials', file, file.name);
       });
-      recordingMaterialFiles.forEach((file) => {
+      recordingFilesForTranscription.forEach((file) => {
         body.append('materials', file, file.name);
       });
       body.append('project_id', activeProjectId);
@@ -1585,12 +1773,13 @@ function App() {
         minute: '2-digit',
         hour12: false,
       });
-      let persistedRecordingMaterials = recordingAttachedMaterials;
+      let persistedRecordingMaterials = recordingMaterialsForTranscription;
+      let transcriptPersisted = false;
       if (supabase !== null && currentUser !== null) {
-        persistedRecordingMaterials = await Promise.all(recordingMaterialFiles.map((file, index) => (
+        persistedRecordingMaterials = await Promise.all(recordingFilesForTranscription.map((file, index) => (
           persistMaterialFile(
             file,
-            recordingAttachedMaterials[index],
+            recordingMaterialsForTranscription[index],
             activeProjectId,
             'recording',
             recordingId,
@@ -1648,6 +1837,7 @@ function App() {
           intermediateJson: result as unknown as Record<string, unknown>,
           segments: savedTranscriptSegments,
         });
+        transcriptPersisted = true;
       }
       if (recordedAudioUrl !== null) savedAudioUrlsRef.current.add(recordedAudioUrl);
       setSourceItems((currentSourceItems) => [
@@ -1667,7 +1857,50 @@ function App() {
       }));
       setLastTranscribedSourceId(recordingId);
       setSourceTab('녹음본');
+
+      let graphIngestError: string | null = null;
+      if (transcriptPersisted) {
+        try {
+          const ingestResponse = await fetch('/api/ingest-stt', {
+            method: 'POST',
+            headers: {
+              ...(await apiHeaders(activeProjectId)),
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(result),
+          });
+          if (!ingestResponse.ok) {
+            const errorBody = await ingestResponse.json().catch(() => null) as { detail?: string } | null;
+            throw new Error(errorBody?.detail ?? `전사 그래프 반영 요청 실패 (${ingestResponse.status})`);
+          }
+
+          const graphDocuments = recordingFilesForTranscription
+            .map((file, index) => ({ file, source: persistedRecordingMaterials[index] }))
+            .filter(({ file, source }) => isGraphIngestibleDocument(file) && source !== undefined);
+          const documentResults = await Promise.all(graphDocuments.map(({ file, source }) => (
+            uploadMaterialToGraph(file, source.id, activeProjectId, meetingId)
+          )));
+          const failedDocumentCount = documentResults.filter((wasIngested) => !wasIngested).length;
+          if (failedDocumentCount > 0) {
+            throw new Error(`참고자료 ${failedDocumentCount}개의 그래프 반영에 실패했습니다.`);
+          }
+          setGraphReloadKey((value) => value + 1);
+        } catch (error) {
+          console.error('전사 결과를 그래프에 반영하지 못했습니다:', error);
+          graphIngestError = error instanceof Error ? error.message : '그래프 반영에 실패했습니다.';
+          setSourceItems((items) => items.map((source) => source.id === recordingId
+            ? { ...source, meta: `${source.meta} · 그래프 반영 실패` }
+            : source));
+        }
+      } else {
+        graphIngestError = '전사문이 저장되지 않아 그래프에 반영하지 못했습니다.';
+      }
+
+      if (graphIngestError !== null) {
+        setTranscriptionError(`전사는 완료됐지만 ${graphIngestError}`);
+      }
       setRecordingAttachedMaterials([]);
+      setRecordingMaterialFiles([]);
       await new Promise((resolve) => window.setTimeout(resolve, 250));
       setTranscriptionState('done');
       setTranscriptionStep(3);
@@ -1711,40 +1944,129 @@ function App() {
     setOpenProjectMenuIndex(null);
   };
 
-  const submitProjectChat = () => {
-    const query = chatInput.trim();
-    if (!query) return;
+  const submitProjectChat = (presetQuery?: string) => {
+    const query = (presetQuery ?? chatInput).trim();
+    if (!query || activeProjectId === null || activeChatSession === null) return;
+    if (chatRequestInFlightRef.current) {
+      if (presetQuery !== undefined) setChatInput(query);
+      return;
+    }
 
-    setChatMessages((currentMessages) => [...currentMessages, { role: 'user', text: query }]);
-    setChatInput('');
+    const sessionId = activeChatSession.id;
+    const history = activeChatSession.messages
+      .filter((message) => message.text.trim() !== '')
+      .slice(-12);
+    const generatedTitle = activeChatSession.title === '새 대화'
+      ? query.replace(/\s+/g, ' ').slice(0, 28)
+      : undefined;
+    chatRequestInFlightRef.current = true;
+    setIsChatResponding(true);
+    setIsChatWaiting(true);
+    updateChatSessionMessages(
+      sessionId,
+      (currentMessages) => [...currentMessages, { role: 'user', text: query }],
+      generatedTitle,
+    );
+    if (presetQuery === undefined) setChatInput('');
 
     void (async () => {
-      let assistantText: string;
-      try {
-        const response = await fetch(`/api/ask?project=${encodeURIComponent(activeProjectId ?? '')}&q=${encodeURIComponent(query)}&k=6`, {
-          headers: await apiHeaders(activeProjectId),
+      let assistantStarted = false;
+      let completed = false;
+
+      const appendAssistantDelta = (text: string) => {
+        if (!text) return;
+        setIsChatWaiting(false);
+        const isFirstDelta = !assistantStarted;
+        if (isFirstDelta) assistantStarted = true;
+        updateChatSessionMessages(sessionId, (currentMessages) => {
+          if (isFirstDelta) {
+            return [...currentMessages, { role: 'assistant', text }];
+          }
+          const nextMessages = [...currentMessages];
+          const lastIndex = nextMessages.length - 1;
+          nextMessages[lastIndex] = {
+            ...nextMessages[lastIndex],
+            text: `${nextMessages[lastIndex].text}${text}`,
+          };
+          return nextMessages;
         });
-        if (!response.ok) throw new Error(`/api/ask ${response.status}`);
-        const data = await response.json() as {
-          answer: string; hits?: { session_id: string }[];
-          expansion?: { nodes?: { id: string }[] };
-        };
-        assistantText = data.answer;
-        setChatGraphExpansion(new Set((data.expansion?.nodes ?? []).map((node) => node.id)));
+      };
+
+      const handleStreamEvent = (event: AskStreamEvent) => {
+        if (event.type === 'delta') {
+          appendAssistantDelta(event.text);
+          return;
+        }
+        if (event.type === 'error') throw new Error(event.message);
+        completed = true;
+        if (!assistantStarted && event.answer) appendAssistantDelta(event.answer);
+        setChatGraphExpansion(new Set((event.expansion?.nodes ?? []).map((node) => node.id)));
+      };
+
+      try {
+        const response = await fetch('/api/ask-stream', {
+          method: 'POST',
+          headers: {
+            ...(await apiHeaders(activeProjectId)),
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            project: activeProjectId,
+            q: query,
+            k: 6,
+            history,
+          }),
+        });
+        if (!response.ok || response.body === null) {
+          throw new Error(`/api/ask-stream ${response.status}`);
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        while (true) {
+          const { value, done } = await reader.read();
+          buffer += decoder.decode(value, { stream: !done });
+          let newlineIndex = buffer.indexOf('\n');
+          while (newlineIndex >= 0) {
+            const line = buffer.slice(0, newlineIndex).trim();
+            buffer = buffer.slice(newlineIndex + 1);
+            if (line) handleStreamEvent(JSON.parse(line) as AskStreamEvent);
+            newlineIndex = buffer.indexOf('\n');
+          }
+          if (done) break;
+        }
+        if (buffer.trim()) handleStreamEvent(JSON.parse(buffer) as AskStreamEvent);
+        if (!completed) throw new Error('AI 응답 스트림이 완료되지 않았습니다.');
       } catch (error) {
         console.error('AI 답변을 받아오지 못했습니다:', error);
         setChatGraphExpansion(null);
         const hasRecordings = sourceItems.some((source) => source.category === '녹음본');
         const hasMaterials = sourceItems.some((source) => source.category === '자료');
-        assistantText = hasRecordings || hasMaterials
+        const fallbackText = hasRecordings || hasMaterials
           ? '추가된 녹음본과 자료를 기준으로 답변을 준비하고 있습니다. 관련 근거가 만들어지면 이 대화와 가운데 그래프에 함께 표시됩니다.'
           : '아직 참고할 녹음본이나 자료가 없습니다. 먼저 녹음본을 전사하거나 자료를 추가하면, 그 내용을 바탕으로 질문에 답할 수 있습니다.';
+        if (!assistantStarted) {
+          appendAssistantDelta(fallbackText);
+        } else {
+          appendAssistantDelta('\n\n_응답 연결이 중단되었습니다. 다시 질문해 주세요._');
+        }
+      } finally {
+        chatRequestInFlightRef.current = false;
+        setIsChatResponding(false);
+        setIsChatWaiting(false);
       }
-
-      setChatMessages((currentMessages) => [...currentMessages, { role: 'assistant', text: assistantText }]);
     })();
   };
 
+  useEffect(() => {
+    const thread = chatThreadRef.current;
+    if (thread === null) return;
+    const frame = window.requestAnimationFrame(() => {
+      thread.scrollTo({ top: thread.scrollHeight, behavior: 'smooth' });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [activeChatSessionId, chatSessions, isChatResponding]);
   const isProjectWorkspace = activeProject !== null && !isProfileOpen && !isAdminOpen && !isHelpOpen;
   const showSidebar = false;
 
@@ -2764,12 +3086,63 @@ function App() {
               <div className="studio-panel-head">
                 <div>
                   <p className="eyebrow">AI chat</p>
-                  <h2>대화</h2>
+                  <h2 title={activeChatSession?.title ?? '대화'}>
+                    {activeChatSession?.title ?? '대화'}
+                  </h2>
                 </div>
-                <button className="panel-mini-button" type="button" aria-label="대화 메뉴">⋮</button>
+                <button
+                  className="panel-mini-button"
+                  type="button"
+                  aria-label="대화 목록"
+                  aria-expanded={isChatSessionMenuOpen}
+                  onClick={() => setIsChatSessionMenuOpen((value) => !value)}
+                >⋮</button>
+                {isChatSessionMenuOpen && (
+                  <div className="chat-session-menu">
+                    <button
+                      className="chat-session-new"
+                      type="button"
+                      disabled={isChatResponding}
+                      onClick={startNewChatSession}
+                    >
+                      <span>+</span>
+                      새 대화
+                    </button>
+                    <div className="chat-session-list">
+                      {chatSessions.map((session) => (
+                        <div
+                          className={`chat-session-item ${session.id === activeChatSessionId ? 'selected' : ''}`}
+                          key={session.id}
+                        >
+                          <button
+                            className="chat-session-select"
+                            type="button"
+                            disabled={isChatResponding}
+                            onClick={() => {
+                              setActiveChatSessionId(session.id);
+                              setChatGraphExpansion(null);
+                              setChatInput('');
+                              setIsChatSessionMenuOpen(false);
+                            }}
+                          >
+                            <strong>{session.title}</strong>
+                            <small>{Math.max(0, session.messages.filter((message) => message.role === 'user').length)}개 질문</small>
+                          </button>
+                          <div className="chat-session-actions">
+                            <button type="button" aria-label={`${session.title} 이름 변경`} onClick={() => renameChatSession(session)}>✎</button>
+                            <button type="button" aria-label={`${session.title} 삭제`} onClick={() => removeChatSession(session)}>×</button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
 
-              <div className="studio-chat-thread">
+              <div className="studio-chat-thread" ref={chatThreadRef} aria-live="polite">
+                {activeChatSession === null && (
+                  <div className="chat-session-loading">대화를 불러오고 있어요.</div>
+                )}
                 {chatMessages.map((message, index) => (
                   <article className={`chat-bubble ${message.role}`} key={`${message.role}-${index}`}>
                     <span>{message.role === 'assistant' ? 'SynapVox' : '나'}</span>
@@ -2790,7 +3163,7 @@ function App() {
                   onChange={(event) => setChatInput(event.target.value)}
                   placeholder="프로젝트에 대해 질문하세요"
                 />
-                <button type="submit">→</button>
+                <button type="submit" disabled={isChatResponding || activeChatSession === null} aria-label="질문 보내기">→</button>
               </form>
               </aside>
             </section>
