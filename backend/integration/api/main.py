@@ -57,6 +57,8 @@ validate = _normalizer.validate
 wrap_segments = _normalizer.wrap_segments
 _auth_schema_ready = False
 _auth_pool = None
+ADMIN_IDENTIFIER = os.getenv("SYNAPVOX_ADMIN_ID", "root")
+ADMIN_PASSWORD = os.getenv("SYNAPVOX_ADMIN_PASSWORD", "2222")
 
 app = FastAPI(title="SynapVox Integration API")
 
@@ -167,6 +169,18 @@ def _ensure_auth_schema(conn) -> None:
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS auth_sessions_user_id_idx ON auth_sessions (user_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS auth_sessions_expires_at_idx ON auth_sessions (expires_at);")
+        cur.execute(
+            """
+            INSERT INTO app_users (id, email, display_name, password_hash, role)
+            VALUES (%s, %s, %s, %s, 'admin')
+            ON CONFLICT (email) DO UPDATE
+            SET display_name = EXCLUDED.display_name,
+                password_hash = EXCLUDED.password_hash,
+                role = 'admin',
+                updated_at = now()
+            """,
+            (str(uuid4()), ADMIN_IDENTIFIER, "관리자", _password_hash(ADMIN_PASSWORD)),
+        )
     conn.commit()
     _auth_schema_ready = True
 

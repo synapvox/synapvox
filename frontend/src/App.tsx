@@ -1000,43 +1000,20 @@ function App() {
   const completeBackendAuth = (authResult: BackendAuthResponse) => {
     storeBackendAuth(authResult);
     const { user } = authResult;
+    const isAdmin = user.role === 'admin';
     setIsLoggedIn(true);
     setCurrentUser(user);
     switchProjectStorage(user.id);
-    setIsAdminOpen(false);
+    setIsAdminOpen(isAdmin);
     setIsProfileOpen(false);
     setIsHelpOpen(false);
     setActiveProjectIndex(null);
     setIsAccountMenuOpen(false);
     closeAuthModal();
-  };
-
-  const completeAdminAuth = () => {
-    clearBackendAuth();
-    const adminUser = {
-      id: 'local-admin',
-      email: 'admin@synapvox.local',
-      name: '관리자',
-      role: 'admin',
-    };
-    setIsLoggedIn(true);
-    setCurrentUser(adminUser);
-    switchProjectStorage(adminUser.id);
-    setIsAdminOpen(true);
-    setIsProfileOpen(false);
-    setIsHelpOpen(false);
-    setActiveProjectIndex(null);
-    setIsAccountMenuOpen(false);
-    closeAuthModal();
-    window.history.pushState({ view: 'admin' }, '', window.location.pathname);
+    window.history.pushState({ view: isAdmin ? 'admin' : 'home' }, '', window.location.pathname);
   };
 
   const submitAuth = async () => {
-    if (authMode === 'login' && authEmail.trim() === '0101') {
-      completeAdminAuth();
-      return;
-    }
-
     setAuthError(null);
     setAuthLoading(true);
     try {
@@ -2908,7 +2885,7 @@ function App() {
               )}
 
               <label>
-                이메일
+                {authMode === 'login' ? '아이디 또는 이메일' : '이메일'}
                 <input
                   type={authMode === 'login' ? 'text' : 'email'}
                   placeholder="you@synapvox.com"
@@ -2928,7 +2905,7 @@ function App() {
                   placeholder="비밀번호"
                   autoComplete={authMode === 'login' ? 'current-password' : 'new-password'}
                   required
-                  minLength={6}
+                  minLength={authMode === 'signup' ? 6 : undefined}
                 />
               </label>
 
