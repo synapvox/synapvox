@@ -463,6 +463,21 @@ def health() -> dict:
     return {"ok": True}
 
 
+@app.get("/api/admin/quality")
+def admin_quality() -> dict:
+    """관리자 대시보드 '품질' 탭 — 실측 WER 벤치마크(정적 데이터, backend/stt/quality_report.py 참고)."""
+    quality_report = _load_stt_module("quality_report")
+    return {"rows": quality_report.get_quality_rows()}
+
+
+@app.get("/api/admin/health")
+def admin_health() -> dict:
+    """관리자 대시보드 '시스템' 탭 — STT 의존성(CLOVA/OpenAI/Soniox) 설정 여부 체크.
+    비용 때문에 라이브 핑이 아니라 환경변수 presence만 확인함(backend/stt/health.py 참고)."""
+    stt_health = _load_stt_module("health")
+    return {"rows": stt_health.check_stt_health()}
+
+
 @app.post("/api/auth/signup")
 async def signup(payload: SignupPayload) -> dict:
     return await run_in_threadpool(_signup_user, payload)
@@ -580,10 +595,13 @@ async def ingest_stt_to_graph(
 async def ingest_doc_to_graph(
     file: UploadFile = File(...),
     x_project_id: str | None = Header(None, alias="X-Project-Id"),
+    x_meeting_id: str | None = Header(None, alias="X-Meeting-Id"),
     x_api_key: str | None = Header(None, alias="X-API-Key"),
 ) -> dict:
     """회의자료 파일 → 텍스트 추출 → gsvx 그래프 반영 (프론트 POST /ingest-doc 계약).
 
+    X-Meeting-Id를 보내면 특정 회의(음성 파일)에 딸린 자료로 스코프된다(세션 제목에 붙음,
+    gsvx_connector.document_title 참조) — 미지정 시 기존과 동일하게 프로젝트 전역 자료로 취급.
     응답은 프론트가 기대하는 {chunks_ingested, concepts_total, ...} 형태.
     """
     from backend.integration.gsvx_connector import GsvxError
@@ -609,7 +627,7 @@ async def ingest_doc_to_graph(
         title = Path(file.filename or "자료").stem or "자료"
         try:
             return await run_in_threadpool(
-                client.ingest_document_text, text, title, x_project_id)
+                client.ingest_document_text, text, title, x_project_id, x_meeting_id)
         except GsvxError as exc:
             raise HTTPException(status_code=exc.status_code or 502, detail=exc.detail) from exc
     finally:

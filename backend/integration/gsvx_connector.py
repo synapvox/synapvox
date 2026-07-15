@@ -24,6 +24,8 @@
 - 회의자료(pdf/pptx/docx/md/txt) → pipeline.extract_text로 평문 추출
 - 50,000자 상한 초과분은 줄 경계로 분할해 "제목 (i/n)" 세션 여러 개로 나눠 넣는다
 - project_id → gsvx project(group_id) 네임스페이스로 전달
+- gsvx에는 meeting_id 필드가 없어서, 자료를 특정 회의(음성 파일)에 스코프하려면 제목에
+  붙인다(document_title) — 전사문은 이미 transcript_title이 항상 meeting_id를 붙임
 
 사용 예:
     from backend.integration.gsvx_connector import GsvxClient
@@ -83,6 +85,14 @@ def transcript_title(im: dict) -> str:
     """gsvx 세션(에피소드) 제목 — 그래프 뷰·타임라인에 그대로 표시된다."""
     mode = "강의" if im.get("mode") == "lecture" else "회의"
     return f"{im['date']} {mode} 전사 ({im['meeting_id']})"
+
+
+def document_title(stem: str, meeting_id: str | None = None) -> str:
+    """자료(회의자료) 세션 제목. gsvx는 project(그룹 네임스페이스) 외에 meeting_id를 받는
+    필드가 없으므로 — transcript_title과 같은 표기(끝에 괄호)로 제목에 붙여, 어떤 회의(음성
+    파일)에 딸린 자료인지 그래프 뷰에서도 식별 가능하게 한다. meeting_id 없으면(프로젝트
+    전역 자료) 기존과 동일하게 stem 그대로."""
+    return f"{stem} ({meeting_id})" if meeting_id else stem
 
 
 def split_for_ingest(text: str, limit: int = GSVX_TEXT_LIMIT,
@@ -179,18 +189,21 @@ class GsvxClient:
                                   project=project or im.get("project_id"))
 
     def ingest_document(self, path: Path | str, project: str | None = None,
-                        title: str | None = None) -> dict:
-        """회의자료 파일(pdf/pptx/docx/md/txt) → 텍스트 추출 → gsvx 세션(들)."""
+                        title: str | None = None, meeting_id: str | None = None) -> dict:
+        """회의자료 파일(pdf/pptx/docx/md/txt) → 텍스트 추출 → gsvx 세션(들).
+
+        meeting_id를 주면 특정 회의(음성 파일)에 딸린 자료로 스코프(document_title 참조),
+        생략하면 프로젝트 전역 자료로 취급(기존 동작과 동일)."""
         path = Path(path)
         text = extract_text(path)
         if not text.strip():
             raise ValueError(f"텍스트를 추출하지 못했습니다 (지원: pdf/pptx/docx/md/txt): {path.name}")
-        return self.ingest_document_text(text, title or path.stem, project=project)
+        return self.ingest_document_text(text, title or path.stem, project=project, meeting_id=meeting_id)
 
-    def ingest_document_text(self, text: str, title: str,
-                             project: str | None = None) -> dict:
+    def ingest_document_text(self, text: str, title: str, project: str | None = None,
+                             meeting_id: str | None = None) -> dict:
         """이미 추출된 자료 평문 → gsvx 세션(들). API 릴레이(api/main.py)가 사용."""
-        return self._ingest_parts(text, title, project=project)
+        return self._ingest_parts(text, document_title(title, meeting_id), project=project)
 
     def _ingest_parts(self, text: str, title: str, project: str | None = None) -> dict:
         parts = split_for_ingest(text, self.text_limit)
@@ -229,6 +242,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="STT 결과·회의자료 → gsvx(Graphiti) 적재")
     parser.add_argument("files", nargs="+")
     parser.add_argument("--project", help="gsvx 네임스페이스 (기본: 전사문의 project_id / 키 기본값)")
+    parser.add_argument("--meeting-id", help="자료를 특정 회의(음성 파일)에 스코프 (전사문 JSON은 자체 meeting_id를 씀, 이 옵션 무시)")
     parser.add_argument("--base-url", help=f"gsvx 주소 (기본: $GSVX_BASE_URL 또는 {DEFAULT_BASE_URL})")
     parser.add_argument("--api-key", help="gsvx X-API-Key (기본: $GSVX_API_KEY 또는 데모 키)")
     args = parser.parse_args(argv)
@@ -245,7 +259,7 @@ def main(argv: list[str] | None = None) -> None:
             if isinstance(data, dict) and "segments" in data and "meeting_id" in data:
                 result = client.ingest_transcript(data, project=args.project)
         if result is None:
-            result = client.ingest_document(path, project=args.project)
+            result = client.ingest_document(path, project=args.project, meeting_id=args.meeting_id)
         print(f"{path.name}: 세션 {result['chunks_ingested']}개 적재, "
               f"신규 개념 {result['concepts_new']}개, 누적 개념 {result['concepts_total']}개")
 

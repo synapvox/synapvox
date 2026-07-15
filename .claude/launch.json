@@ -7,6 +7,12 @@
       "runtimeArgs": ["run", "dev", "--", "--port", "5173"],
       "cwd": "frontend",
       "port": 5173
+    },
+    {
+      "name": "backend",
+      "runtimeExecutable": "/Users/hyunwoocho/AI/synapvox_Local/.venv/bin/python",
+      "runtimeArgs": ["-m", "uvicorn", "backend.integration.api.main:app", "--reload", "--port", "8000"],
+      "port": 8000
     }
   ]
 }

@@ -9,6 +9,7 @@ from backend.integration import gsvx_connector
 from backend.integration.gsvx_connector import (
     GsvxClient,
     GsvxError,
+    document_title,
     split_for_ingest,
     transcript_title,
     transcript_to_text,
@@ -51,6 +52,14 @@ def test_transcript_title_reflects_mode():
     lecture = _intermediate()
     lecture["mode"] = "lecture"
     assert "강의" in transcript_title(lecture)
+
+
+def test_document_title_appends_meeting_id_when_given():
+    assert document_title("slides", "M01") == "slides (M01)"
+
+
+def test_document_title_unscoped_without_meeting_id():
+    assert document_title("slides") == "slides"
 
 
 # ── 분할: gsvx 50,000자 상한(413) 대응 ───────────────────
@@ -160,6 +169,19 @@ def test_long_transcript_is_split_into_numbered_sessions():
 def test_ingest_document_text_rejects_empty():
     with pytest.raises(ValueError):
         _RecordingClient().ingest_document_text("   ", "빈 자료")
+
+
+def test_ingest_document_text_scopes_title_to_meeting_when_given():
+    client = _RecordingClient()
+    client.ingest_document_text("자료 본문", "slides", project="P01", meeting_id="M01")
+    assert client.calls[0]["title"] == "slides (M01)"
+    assert client.calls[0]["project"] == "P01"
+
+
+def test_ingest_document_text_unscoped_without_meeting_id():
+    client = _RecordingClient()
+    client.ingest_document_text("자료 본문", "slides", project="P01")
+    assert client.calls[0]["title"] == "slides"
 
 
 def test_ingest_text_maps_gsvx_error_detail(monkeypatch):

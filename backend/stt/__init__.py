@@ -50,6 +50,8 @@ from .keyword_prompt import (
 )
 from .stt_normalizer import merge, validate, wrap_segments
 from .wer import word_error_rate
+from .quality_report import get_quality_rows
+from .health import check_stt_health
 
 __all__ = [
     "extract_pptx", "extract_pdf",
@@ -57,4 +59,5 @@ __all__ = [
     "extract_keywords_from_past_meetings", "resolve_prompt",
     "merge", "validate", "wrap_segments",
     "word_error_rate",
+    "get_quality_rows", "check_stt_health",
 ]
