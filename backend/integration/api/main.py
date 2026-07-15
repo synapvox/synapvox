@@ -12,7 +12,7 @@ from datetime import date
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
@@ -93,10 +93,15 @@ def _extract_docx_text(path: Path) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _extract_pdf_text(path: Path) -> str:
+def _extract_pdf_text(path: Path, describe_images: bool | None = None) -> str:
     try:
         pdf = _load_stt_module("pdf_extractor")
-        result = pdf.extract_pdf(str(path))
+        if describe_images is None:
+            # 이미지 설명은 임베디드 이미지마다 비전 LLM을 부른다(비용 + OPENAI_API_KEY
+            # 필수 — 없으면 KeyError로 전체 추출이 실패해 0자가 된다). 키가 있을 때만
+            # 켜고, 없으면 텍스트 전용으로 강등한다.
+            describe_images = bool(os.getenv("OPENAI_API_KEY"))
+        result = pdf.extract_pdf(str(path), describe_images=describe_images)
     except Exception:
         return ""
 
@@ -123,12 +128,13 @@ def _extract_pptx_text(path: Path) -> str:
     return "\n".join(part for part in parts if part).strip()
 
 
-def _extract_material_text(path: Path, filename: str | None, content_type: str | None) -> str:
+def _extract_material_text(path: Path, filename: str | None, content_type: str | None,
+                           describe_images: bool | None = None) -> str:
     suffix = Path(filename or path.name).suffix.lower()
     if suffix in {".txt", ".md", ".csv", ".json", ".srt", ".vtt"} or (content_type or "").startswith("text/"):
         return _read_text_file(path)
     if suffix == ".pdf":
-        return _extract_pdf_text(path)
+        return _extract_pdf_text(path, describe_images=describe_images)
     if suffix in {".docx"}:
         return _extract_docx_text(path)
     if suffix in {".pptx"}:
@@ -276,3 +282,79 @@ async def transcribe_recording(
             Path(temp_path).unlink(missing_ok=True)
         for material_path, _, _ in material_paths:
             material_path.unlink(missing_ok=True)
+
+
+# ── gsvx(Graphiti) 릴레이 — STT 결과·자료를 그래프 엔진으로 ──
+#
+# 프론트(App.tsx)는 GSVX_BASE에 POST /ingest-stt(중간포맷 JSON)·/ingest-doc(multipart)를
+# 호출한다. gsvx 본체(click6067-ship-it/synapVOX)에는 이 두 엔드포인트가 없고 텍스트
+# 입구는 /ingest-text 하나뿐이므로, 여기서 같은 계약으로 받아 텍스트로 변환해 릴레이한다.
+# 변환·분할·응답 요약 규칙은 backend/integration/gsvx_connector.py 참조.
+
+
+def _gsvx_client(x_api_key: str | None):
+    from backend.integration import gsvx_connector
+    # 프론트가 보낸 X-API-Key가 있으면 그대로 gsvx에 전달, 없으면 서버 환경변수 사용.
+    return gsvx_connector.GsvxClient(api_key=x_api_key or None)
+
+
+@app.post("/ingest-stt")
+async def ingest_stt_to_graph(
+    transcript: dict,
+    x_project_id: str | None = Header(None, alias="X-Project-Id"),
+    x_api_key: str | None = Header(None, alias="X-API-Key"),
+) -> dict:
+    """STT 중간포맷 JSON → gsvx 그래프 반영 (프론트 App.tsx POST /ingest-stt 계약)."""
+    from backend.integration.gsvx_connector import GsvxError
+
+    try:
+        validate(transcript)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"invalid intermediate format: {exc}") from exc
+
+    client = _gsvx_client(x_api_key)
+    try:
+        return await run_in_threadpool(client.ingest_transcript, transcript, x_project_id)
+    except GsvxError as exc:
+        raise HTTPException(status_code=exc.status_code or 502, detail=exc.detail) from exc
+
+
+@app.post("/ingest-doc")
+async def ingest_doc_to_graph(
+    file: UploadFile = File(...),
+    x_project_id: str | None = Header(None, alias="X-Project-Id"),
+    x_api_key: str | None = Header(None, alias="X-API-Key"),
+) -> dict:
+    """회의자료 파일 → 텍스트 추출 → gsvx 그래프 반영 (프론트 POST /ingest-doc 계약).
+
+    응답은 프론트가 기대하는 {chunks_ingested, concepts_total, ...} 형태.
+    """
+    from backend.integration.gsvx_connector import GsvxError
+
+    suffix = Path(file.filename or "").suffix or ".bin"
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+            temp_path = Path(temp_file.name)
+            while chunk := await file.read(1024 * 1024):
+                temp_file.write(chunk)
+
+        # 그래프 적재는 본문 텍스트만 필요 — PDF 이미지 설명(비전 LLM, 비용)은 끈다.
+        text = _extract_material_text(temp_path, file.filename, file.content_type,
+                                      describe_images=False)
+        if not text.strip():
+            raise HTTPException(
+                status_code=415,
+                detail="텍스트를 추출하지 못했습니다 (지원: pdf/pptx/docx/md/txt).",
+            )
+
+        client = _gsvx_client(x_api_key)
+        title = Path(file.filename or "자료").stem or "자료"
+        try:
+            return await run_in_threadpool(
+                client.ingest_document_text, text, title, x_project_id)
+        except GsvxError as exc:
+            raise HTTPException(status_code=exc.status_code or 502, detail=exc.detail) from exc
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
