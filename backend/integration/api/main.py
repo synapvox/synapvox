@@ -449,6 +449,21 @@ def health() -> dict:
     return {"ok": True}
 
 
+@app.get("/api/admin/quality")
+def admin_quality() -> dict:
+    """관리자 대시보드 '품질' 탭 — 실측 WER 벤치마크(정적 데이터, backend/stt/quality_report.py 참고)."""
+    quality_report = _load_stt_module("quality_report")
+    return {"rows": quality_report.get_quality_rows()}
+
+
+@app.get("/api/admin/health")
+def admin_health() -> dict:
+    """관리자 대시보드 '시스템' 탭 — STT 의존성(CLOVA/OpenAI/Soniox) 설정 여부 체크.
+    비용 때문에 라이브 핑이 아니라 환경변수 presence만 확인함(backend/stt/health.py 참고)."""
+    stt_health = _load_stt_module("health")
+    return {"rows": stt_health.check_stt_health()}
+
+
 @app.post("/api/auth/signup")
 async def signup(payload: SignupPayload) -> dict:
     return await run_in_threadpool(_signup_user, payload)

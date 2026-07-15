@@ -296,6 +296,8 @@ function App() {
   const [isProjectSortOpen, setIsProjectSortOpen] = useState(false);
   const [homeSection, setHomeSection] = useState('노트북');
   const [adminSection, setAdminSection] = useState('개요');
+  const [adminQualityRows, setAdminQualityRows] = useState<string[][]>([]);
+  const [adminSystemRows, setAdminSystemRows] = useState<string[][]>([]);
   const [authMode, setAuthMode] = useState<'login' | 'signup' | null>(null);
   const [isProjectModalOpen, setIsProjectModalOpen] = useState(false);
   const [projectDraft, setProjectDraft] = useState({
@@ -501,8 +503,6 @@ function App() {
     ? []
     : [[currentUser.name, currentUser.role, currentUser.email, 'active']];
   const adminBudgetRows: string[][] = [];
-  const adminQualityRows: string[][] = [];
-  const adminSystemRows: string[][] = [];
 
   useEffect(() => {
     window.history.replaceState({ view: 'home' }, '', window.location.pathname);
@@ -584,6 +584,29 @@ function App() {
     detailAudioRef.current?.pause();
     if (detailAudioRef.current !== null) detailAudioRef.current.currentTime = 0;
   }, [selectedSource]);
+
+  const refreshAdminQuality = async () => {
+    try {
+      const response = await fetch('/api/admin/quality');
+      if (!response.ok) throw new Error(`/api/admin/quality ${response.status}`);
+      const data = await response.json() as { rows: string[][] };
+      setAdminQualityRows(data.rows ?? []);
+    } catch (error) {
+      // 통합 API가 안 떠 있어도 나머지 관리자 화면은 정상 동작해야 하므로 조용히 빈 상태로 둔다.
+      console.error('품질 벤치마크를 불러오지 못했습니다:', error);
+    }
+  };
+
+  const refreshAdminSystemHealth = async () => {
+    try {
+      const response = await fetch('/api/admin/health');
+      if (!response.ok) throw new Error(`/api/admin/health ${response.status}`);
+      const data = await response.json() as { rows: string[][] };
+      setAdminSystemRows(data.rows ?? []);
+    } catch (error) {
+      console.error('시스템 헬스체크를 불러오지 못했습니다:', error);
+    }
+  };
 
   const refreshGsvxGraph = async (projectId: string | null) => {
     try {
@@ -767,6 +790,12 @@ function App() {
     }
     prevProjectIdRef.current = activeProjectId;
   }, [activeProjectId, persistProjectWorkspaces]);
+
+  useEffect(() => {
+    if (!isAdminOpen) return;
+    void refreshAdminQuality();
+    void refreshAdminSystemHealth();
+  }, [isAdminOpen]);
 
   useEffect(() => {
     if (activeProjectId === null) return;
@@ -1938,7 +1967,7 @@ function App() {
                           <p className="eyebrow">Evaluation</p>
                           <h3>품질 평가 기준</h3>
                         </div>
-                        <button className="admin-small-button" type="button">평가 실행</button>
+                        <button className="admin-small-button" type="button" onClick={() => void refreshAdminQuality()}>평가 실행</button>
                       </div>
                       <div className="admin-table" role="table" aria-label="품질 평가">
                         {adminQualityRows.length > 0 ? (
@@ -1974,7 +2003,7 @@ function App() {
                           <p className="eyebrow">Health</p>
                           <h3>서비스 헬스체크</h3>
                         </div>
-                        <button className="admin-small-button" type="button">새로고침</button>
+                        <button className="admin-small-button" type="button" onClick={() => void refreshAdminSystemHealth()}>새로고침</button>
                       </div>
                       <div className="admin-table" role="table" aria-label="서비스 헬스체크">
                         {adminSystemRows.length > 0 ? (
