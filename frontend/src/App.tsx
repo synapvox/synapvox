@@ -285,7 +285,7 @@ function App() {
   const [isProjectSortOpen, setIsProjectSortOpen] = useState(false);
   const [homeSection, setHomeSection] = useState('노트북');
   const [adminSection, setAdminSection] = useState('개요');
-  const [adminQualityRows, setAdminQualityRows] = useState<string[][]>([]);
+  const [adminQualityRows, setAdminQualityRows] = useState<{ category: string; rows: string[][] }[]>([]);
   const [adminSystemRows, setAdminSystemRows] = useState<string[][]>([]);
   const [authMode, setAuthMode] = useState<'login' | 'signup' | null>(null);
   const [isProjectModalOpen, setIsProjectModalOpen] = useState(false);
@@ -551,8 +551,8 @@ function App() {
     try {
       const response = await fetch('/api/admin/quality');
       if (!response.ok) throw new Error(`/api/admin/quality ${response.status}`);
-      const data = await response.json() as { rows: string[][] };
-      setAdminQualityRows(data.rows ?? []);
+      const data = await response.json() as { groups: { category: string; rows: string[][] }[] };
+      setAdminQualityRows(data.groups ?? []);
     } catch (error) {
       // 통합 API가 안 떠 있어도 나머지 관리자 화면은 정상 동작해야 하므로 조용히 빈 상태로 둔다.
       console.error('품질 벤치마크를 불러오지 못했습니다:', error);
@@ -2208,19 +2208,24 @@ function App() {
                         </div>
                         <button className="admin-small-button" type="button" onClick={() => void refreshAdminQuality()}>평가 실행</button>
                       </div>
-                      <div className="admin-table" role="table" aria-label="품질 평가">
-                        {adminQualityRows.length > 0 ? (
-                          adminQualityRows.map(([name, detail, status]) => (
-                            <div className="admin-table-row admin-table-row-compact" role="row" key={name}>
-                              <strong>{name}</strong>
-                              <span>{detail}</span>
-                              <mark>{status}</mark>
+                      {adminQualityRows.length > 0 ? (
+                        adminQualityRows.map((group) => (
+                          <div key={group.category} className="admin-quality-group">
+                            <p className="admin-quality-group-title">{group.category}</p>
+                            <div className="admin-table" role="table" aria-label={group.category}>
+                              {group.rows.map(([name, detail, status]) => (
+                                <div className="admin-table-row admin-table-row-compact" role="row" key={name}>
+                                  <strong>{name}</strong>
+                                  <span>{detail}</span>
+                                  <mark>{status}</mark>
+                                </div>
+                              ))}
                             </div>
-                          ))
-                        ) : (
-                          <div className="admin-empty">품질 평가 기록이 없습니다.</div>
-                        )}
-                      </div>
+                          </div>
+                        ))
+                      ) : (
+                        <div className="admin-empty">품질 평가 기록이 없습니다.</div>
+                      )}
                     </article>
                     <article className="admin-panel">
                       <div className="admin-panel-header">

@@ -252,9 +252,10 @@ def health() -> dict:
 
 @app.get("/api/admin/quality")
 def admin_quality() -> dict:
-    """관리자 대시보드 '품질' 탭 — 실측 WER 벤치마크(정적 데이터, backend/stt/quality_report.py 참고)."""
+    """관리자 대시보드 '품질' 탭 — 실측 STT 평가 요약, 카테고리별로 묶임(정적 데이터,
+    backend/stt/quality_report.py 참고)."""
     quality_report = _load_stt_module("quality_report")
-    return {"rows": quality_report.get_quality_rows()}
+    return {"groups": quality_report.get_quality_rows()}
 
 
 @app.get("/api/admin/health")

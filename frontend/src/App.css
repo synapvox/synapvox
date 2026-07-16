@@ -3010,6 +3010,19 @@ h3 {
   background: #fffdf8;
 }
 
+.admin-quality-group + .admin-quality-group {
+  margin-top: 22px;
+}
+
+.admin-quality-group-title {
+  margin: 0;
+  color: var(--moss);
+  font-size: 0.75rem;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
 .admin-empty {
   margin-top: 14px;
   min-height: 72px;
