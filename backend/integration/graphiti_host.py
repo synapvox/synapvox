@@ -10,7 +10,9 @@ from __future__ import annotations
 import os
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from graph_service.dto import AddMessagesRequest, SearchQuery
 from graph_service.zep_graphiti import ZepGraphiti, get_fact_result_from_edge
@@ -18,6 +20,8 @@ from graphiti_core.driver.neo4j_driver import Neo4jDriver
 from graphiti_core.errors import GroupsEdgesNotFoundError, NodeNotFoundError
 from graphiti_core.nodes import EpisodeType
 from pydantic import BaseModel, Field
+
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 
 class AcademicConcept(BaseModel):

@@ -10,9 +10,15 @@
     },
     {
       "name": "backend",
-      "runtimeExecutable": "/Users/hyunwoocho/AI/synapvox_Local/.venv/bin/python",
+      "runtimeExecutable": "/Users/hyunwoocho/AI/synapvox/.venv/bin/python",
       "runtimeArgs": ["-m", "uvicorn", "backend.integration.api.main:app", "--reload", "--port", "8000"],
       "port": 8000
+    },
+    {
+      "name": "graphiti",
+      "runtimeExecutable": "/Users/hyunwoocho/AI/synapvox/.venv/bin/python",
+      "runtimeArgs": ["-m", "uvicorn", "backend.integration.graphiti_host:app", "--reload", "--port", "8020"],
+      "port": 8020
     }
   ]
 }
