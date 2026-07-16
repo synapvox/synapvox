@@ -17,9 +17,12 @@ from fastapi import FastAPI, HTTPException
 from graph_service.dto import AddMessagesRequest, SearchQuery
 from graph_service.zep_graphiti import ZepGraphiti, get_fact_result_from_edge
 from graphiti_core.driver.neo4j_driver import Neo4jDriver
-from graphiti_core.errors import GroupsEdgesNotFoundError, NodeNotFoundError
+from graphiti_core.errors import NodeNotFoundError
 from graphiti_core.nodes import EpisodeType
+from langsmith import traceable
 from pydantic import BaseModel, Field
+
+from backend.observability import wrap_openai_client
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
@@ -46,6 +49,10 @@ class Formula(BaseModel):
     """A named equation, mathematical expression, theorem, or quantitative rule."""
 
     expression: str | None = Field(None, description="Formula or symbolic expression when present")
+
+
+class EpisodeDeleteRequest(BaseModel):
+    episode_ids: list[str] = Field(min_length=1, max_length=500)
 
 
 ENTITY_TYPES: dict[str, type[BaseModel]] = {
@@ -79,6 +86,9 @@ async def lifespan(app: FastAPI):
     if os.getenv("OPENAI_API_KEY"):
         graphiti.llm_client.config.api_key = os.environ["OPENAI_API_KEY"]
     graphiti.llm_client.model = os.getenv("GRAPHITI_MODEL") or "gpt-5-mini"
+    graphiti.llm_client.client = wrap_openai_client(graphiti.llm_client.client)
+    graphiti.embedder.client = wrap_openai_client(graphiti.embedder.client)
+    graphiti.cross_encoder.client = wrap_openai_client(graphiti.cross_encoder.client)
     await graphiti.driver.health_check()
     await graphiti.build_indices_and_constraints()
     app.state.graphiti = graphiti
@@ -108,6 +118,7 @@ async def healthcheck() -> dict:
 
 
 @app.post("/messages", status_code=201)
+@traceable(name="Graphiti knowledge extraction", run_type="chain")
 async def add_messages(request: AddMessagesRequest) -> dict:
     concepts_new = 0
     relations_new = 0
@@ -153,19 +164,27 @@ class SearchQueryWithMeeting(SearchQuery):
 
 
 async def _episode_ids_for_meeting(episode_ids: set[str], meeting_id: str) -> set[str]:
-    """주어진 에피소드 uuid 중 이 미팅 것만 골라낸다. 에피소드 제목은 gsvx_connector의
-    transcript_title()/document_title()이 "... (M07)" 형태로 meeting_id를 끝에 붙여
-    저장해두므로, 그 접미사로 매칭한다."""
+    """주어진 에피소드 uuid 중 이 미팅 것만 골라낸다.
+
+    새 전사 데이터는 원본 파일명을 화면 제목으로 쓰고 source_description에 meeting_id를
+    저장한다. 기존 데이터와 녹음 연결 자료는 제목의 ``(meeting_id)`` 접미사도 지원한다.
+    """
     if not episode_ids:
         return set()
     result = await _client().driver.execute_query(
-        "MATCH (e:Episodic) WHERE e.uuid IN $ids AND e.name ENDS WITH $suffix RETURN e.uuid AS uuid",
-        ids=list(episode_ids), suffix=f"({meeting_id})",
+        """MATCH (e:Episodic)
+           WHERE e.uuid IN $ids
+             AND (e.source_description = $description OR e.name ENDS WITH $suffix)
+           RETURN e.uuid AS uuid""",
+        ids=list(episode_ids),
+        description=f"meeting:{meeting_id}",
+        suffix=f"({meeting_id})",
     )
     return {record["uuid"] for record in result.records}
 
 
 @app.post("/search")
+@traceable(name="Graphiti fact search", run_type="retriever")
 async def search(query: SearchQueryWithMeeting) -> dict:
     edges = await _client().search(
         group_ids=query.group_ids,
@@ -181,11 +200,15 @@ async def search(query: SearchQueryWithMeeting) -> dict:
 
 @app.delete("/group/{group_id}")
 async def delete_group(group_id: str) -> dict:
-    try:
-        await _client().delete_group(group_id)
-    except GroupsEdgesNotFoundError:
-        pass
-    return {"success": True, "message": "Group deleted"}
+    result = await _client().driver.execute_query(
+        """MATCH (node {group_id: $group_id})
+           WITH collect(node) AS nodes, count(node) AS deleted
+           FOREACH (node IN nodes | DETACH DELETE node)
+           RETURN deleted""",
+        group_id=group_id,
+    )
+    deleted = int(result.records[0]["deleted"]) if result.records else 0
+    return {"success": True, "nodes_deleted": deleted}
 
 
 @app.delete("/episode/{episode_id}")
@@ -195,3 +218,73 @@ async def delete_episode(episode_id: str) -> dict:
     except NodeNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Episode not found") from exc
     return {"success": True, "message": "Episode deleted"}
+
+
+@app.post("/episodes/delete")
+async def delete_episodes(request: EpisodeDeleteRequest) -> dict:
+    """Delete several episodes and their now-unreferenced graph data in bulk."""
+    episode_ids = list(dict.fromkeys(request.episode_ids))
+    driver = _client().driver
+
+    candidate_result = await driver.execute_query(
+        """MATCH (episode:Episodic)
+           WHERE episode.uuid IN $episode_ids
+           OPTIONAL MATCH (episode)-[:MENTIONS]->(entity:Entity)
+           RETURN count(DISTINCT episode) AS episodes,
+                  collect(DISTINCT entity.uuid) AS entity_ids""",
+        episode_ids=episode_ids,
+    )
+    if not candidate_result.records:
+        return {"success": True, "episodes_deleted": 0, "entities_deleted": 0}
+    record = candidate_result.records[0]
+    episode_count = int(record["episodes"])
+    entity_ids = [value for value in record["entity_ids"] if value]
+
+    # Keep shared facts, but remove deleted episode ownership from Graphiti edges.
+    await driver.execute_query(
+        """MATCH ()-[relation:RELATES_TO]->()
+           WHERE any(id IN coalesce(relation.episodes, []) WHERE id IN $episode_ids)
+           SET relation.episodes = [id IN coalesce(relation.episodes, [])
+                                    WHERE NOT id IN $episode_ids]
+           WITH relation
+           WHERE size(relation.episodes) = 0
+           DELETE relation""",
+        episode_ids=episode_ids,
+    )
+    await driver.execute_query(
+        """MATCH (episode:Episodic)
+           WHERE episode.uuid IN $episode_ids
+           DETACH DELETE episode""",
+        episode_ids=episode_ids,
+    )
+    orphan_result = await driver.execute_query(
+        """MATCH (entity:Entity)
+           WHERE entity.uuid IN $entity_ids
+             AND NOT EXISTS { MATCH (:Episodic)-[:MENTIONS]->(entity) }
+           WITH collect(entity) AS entities, count(entity) AS deleted
+           FOREACH (entity IN entities | DETACH DELETE entity)
+           RETURN deleted""",
+        entity_ids=entity_ids,
+    )
+    entity_count = int(orphan_result.records[0]["deleted"]) if orphan_result.records else 0
+    return {
+        "success": True,
+        "episodes_deleted": episode_count,
+        "entities_deleted": entity_count,
+    }
+
+
+@app.delete("/group/{group_id}/orphans")
+async def prune_group_orphans(group_id: str) -> dict:
+    """Remove concepts no remaining episode in this project references."""
+    result = await _client().driver.execute_query(
+        """MATCH (n:Entity {group_id: $group_id})
+           WHERE NOT EXISTS { MATCH (:Episodic)-[:MENTIONS]->(n) }
+           WITH collect(n) AS orphans
+           WITH orphans, size(orphans) AS deleted
+           FOREACH (n IN orphans | DETACH DELETE n)
+           RETURN deleted""",
+        group_id=group_id,
+    )
+    deleted = int(result.records[0]["deleted"]) if result.records else 0
+    return {"success": True, "entities_deleted": deleted}

@@ -1,8 +1,8 @@
 // GraphModule — the elastic knowledge-graph feature set, ported from
 // click6067-ship-it/synapVOX (web/) as a self-contained, router-less module that
-// drops into the team app's project view. Talks to the SAME gsvx (Graphiti)
-// backend the app already uses (VITE_API_BASE / VITE_API_KEY), scoped to the
-// active project id. Styling is scoped under `.svx-graphmodule` so it never
+// drops into the team app's project view. Talks to the integration API's
+// authenticated `/api` routes, scoped to the active project id. Styling is
+// scoped under `.svx-graphmodule` so it never
 // leaks into the team's global CSS.
 import { useCallback, useState } from 'react'
 import '@fontsource-variable/fraunces'
@@ -72,7 +72,7 @@ export default function GraphModule({
   return (
     <div className="svx-graphmodule">
       <div className="svx-gm__controls">
-        <span className="svx-gm__scope-label">현재 프로젝트</span>
+        <span className="svx-gm__scope-label">그래프 뷰</span>
         <span className="svx-gm__count">
           개념 {meta.nodes}개 · 연결 {meta.edges}개
         </span>

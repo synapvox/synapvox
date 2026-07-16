@@ -9,7 +9,7 @@ this project signs with ES256 (asymmetric). Frontend gets the token from
 import os
 
 import jwt
-from fastapi import Header, HTTPException
+from fastapi import Depends, Header, HTTPException
 
 _jwks_client: jwt.PyJWKClient | None = None
 
@@ -35,3 +35,17 @@ def require_user(authorization: str = Header(default="")) -> dict:
         raise HTTPException(status_code=401, detail="missing bearer token")
     token = authorization.removeprefix("Bearer ").strip()
     return _decode_token(token, _get_jwks_client())
+
+
+def require_admin(user: dict = Depends(require_user)) -> dict:
+    app_metadata = user.get("app_metadata") if isinstance(user.get("app_metadata"), dict) else {}
+    role = str(app_metadata.get("role") or "").lower()
+    email = str(user.get("email") or "").strip().lower()
+    allowed_emails = {
+        value.strip().lower()
+        for value in os.getenv("SYNAPVOX_ADMIN_EMAILS", "root@synapvox.local").split(",")
+        if value.strip()
+    }
+    if role != "admin" and email not in allowed_emails:
+        raise HTTPException(status_code=403, detail="admin access required")
+    return user

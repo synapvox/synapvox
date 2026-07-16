@@ -9,7 +9,7 @@ from fastapi import HTTPException
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[4]))  # repo root
 
-from backend.integration.api.auth import _decode_token, require_user
+from backend.integration.api.auth import _decode_token, require_admin, require_user
 
 
 class _FakeSigningKey:
@@ -75,3 +75,24 @@ def test_require_user_rejects_non_bearer_authorization_header():
     with pytest.raises(HTTPException) as exc_info:
         require_user(authorization="Basic dXNlcjpwYXNz")
     assert exc_info.value.status_code == 401
+
+
+def test_require_admin_accepts_admin_role():
+    user = {"sub": "admin-1", "email": "someone@example.com", "app_metadata": {"role": "admin"}}
+
+    assert require_admin(user) == user
+
+
+def test_require_admin_accepts_configured_email(monkeypatch):
+    monkeypatch.setenv("SYNAPVOX_ADMIN_EMAILS", "admin@example.com")
+    user = {"sub": "admin-1", "email": "ADMIN@example.com"}
+
+    assert require_admin(user) == user
+
+
+def test_require_admin_rejects_regular_user(monkeypatch):
+    monkeypatch.setenv("SYNAPVOX_ADMIN_EMAILS", "admin@example.com")
+
+    with pytest.raises(HTTPException) as exc_info:
+        require_admin({"sub": "user-1", "email": "user@example.com"})
+    assert exc_info.value.status_code == 403

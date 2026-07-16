@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import { Plus, Trash2 } from 'lucide-react';
 import './App.css';
 import { supabase } from './supabaseClient';
 import GraphModule from './graphmodule/GraphModule';
@@ -13,6 +14,23 @@ import {
   uploadProjectSource,
   type StoredSourceRow,
 } from './sourceStorage';
+import {
+  createStoredProject,
+  loadStoredProjects,
+  removeStoredProjectFiles,
+  updateStoredProject,
+  type StoredProjectRow,
+} from './projectStorage';
+import {
+  createChatSessionId,
+  deleteProjectChat,
+  loadProjectChats,
+  saveProjectChat,
+  type StoredChatMessage,
+  type StoredChatSession,
+} from './chatStorage';
+
+const AssistantMessage = lazy(() => import('./MarkdownMessage'));
 
 type Project = {
   id: string;              // 그래프/벡터 저장소의 프로젝트 네임스페이스 키
@@ -88,6 +106,11 @@ type AuthUser = {
   role: string;
 };
 
+const INITIAL_CHAT_MESSAGES: StoredChatMessage[] = [{
+  role: 'assistant',
+  text: '프로젝트의 녹음본과 자료를 바탕으로 질문에 답변합니다. 궁금한 내용을 입력하면 가운데 그래프에서 관련 노드를 함께 표시할게요.',
+}];
+
 const PROJECTS_STORAGE_KEY = 'synapvox-projects';
 const WORKSPACES_STORAGE_KEY = 'synapvox-project-workspaces';
 const ACTIVE_PROJECT_STORAGE_KEY = 'synapvox-active-project';
@@ -98,7 +121,7 @@ const authUserFromSession = (session: Session | null): AuthUser | null => {
   if (session === null) return null;
   const metadataName = session.user.user_metadata.name;
   const email = session.user.email?.toLowerCase() ?? '로그인된 계정';
-  const isAdmin = email === SUPABASE_ADMIN_EMAIL;
+  const isAdmin = session.user.app_metadata.role === 'admin' || email === SUPABASE_ADMIN_EMAIL;
   return {
     id: session.user.id,
     email,
@@ -112,7 +135,7 @@ const authUserFromSession = (session: Session | null): AuthUser | null => {
 };
 
 // 프로젝트 목록을 localStorage에 영속화 — 새로고침해도 프로젝트 id↔그래프 매핑이 유지된다.
-const loadStoredProjects = (userId: string | null): Project[] => {
+const loadCachedProjects = (userId: string | null): Project[] => {
   try {
     const raw = window.localStorage.getItem(scopedStorageKey(PROJECTS_STORAGE_KEY, userId));
     if (raw === null) return [];
@@ -124,6 +147,30 @@ const loadStoredProjects = (userId: string | null): Project[] => {
     return [];
   }
 };
+
+const formatProjectUpdatedAt = (value: string) => {
+  const timestamp = new Date(value).getTime();
+  if (!Number.isFinite(timestamp)) return value;
+  const elapsedMinutes = Math.max(0, Math.floor((Date.now() - timestamp) / 60_000));
+  if (elapsedMinutes < 1) return '방금';
+  if (elapsedMinutes < 60) return `${elapsedMinutes}분 전`;
+  const elapsedHours = Math.floor(elapsedMinutes / 60);
+  if (elapsedHours < 24) return `${elapsedHours}시간 전`;
+  return new Intl.DateTimeFormat('ko-KR', { month: 'numeric', day: 'numeric' }).format(new Date(timestamp));
+};
+
+const hydrateStoredProject = (row: StoredProjectRow): Project => ({
+  id: row.id,
+  name: row.name,
+  description: row.description,
+  updatedAt: formatProjectUpdatedAt(row.updated_at),
+  recordings: row.recordings,
+  materials: row.materials,
+  status: row.status,
+  favorite: row.favorite,
+  shared: row.shared,
+  trashed: row.trashed_at !== null,
+});
 
 const loadStoredWorkspaces = (userId: string | null): Record<string, ProjectWorkspace> => {
   try {
@@ -289,6 +336,12 @@ function App() {
   const [adminSystemRows, setAdminSystemRows] = useState<string[][]>([]);
   const [authMode, setAuthMode] = useState<'login' | 'signup' | null>(null);
   const [isProjectModalOpen, setIsProjectModalOpen] = useState(false);
+  const [projectMutationState, setProjectMutationState] = useState<'idle' | 'saving' | 'deleting'>('idle');
+  const [projectMutationError, setProjectMutationError] = useState<string | null>(null);
+  const [pendingProjectAction, setPendingProjectAction] = useState<{
+    type: 'trash' | 'permanent' | 'empty';
+    projectIndex?: number;
+  } | null>(null);
   const [projectDraft, setProjectDraft] = useState({
     name: '',
     description: '',
@@ -333,17 +386,21 @@ function App() {
   const [isSourceSortOpen, setIsSourceSortOpen] = useState(false);
   const [isSourcePanelOpen, setIsSourcePanelOpen] = useState(true);
   const [chatInput, setChatInput] = useState('');
-  const [chatMessages, setChatMessages] = useState([
-    {
-      role: 'assistant',
-      text: '프로젝트의 녹음본과 자료를 바탕으로 질문에 답변합니다. 궁금한 내용을 입력하면 가운데 그래프에서 관련 노드를 함께 표시할게요.',
-    },
-  ]);
+  const [chatMessages, setChatMessages] = useState<StoredChatMessage[]>(INITIAL_CHAT_MESSAGES);
+  const [chatSessions, setChatSessions] = useState<StoredChatSession[]>([]);
+  const [activeChatSessionId, setActiveChatSessionId] = useState<string | null>(null);
+  const [isChatMenuOpen, setIsChatMenuOpen] = useState(false);
+  const [pendingChatDeletionId, setPendingChatDeletionId] = useState<string | null>(null);
+  const [chatDeletionState, setChatDeletionState] = useState<'idle' | 'deleting'>('idle');
+  const [chatDeletionError, setChatDeletionError] = useState<string | null>(null);
+  const [isChatResponding, setIsChatResponding] = useState(false);
+  const [workspaceLoadedProjectId, setWorkspaceLoadedProjectId] = useState<string | null>(null);
   const [graphReloadKey, setGraphReloadKey] = useState(0);
   const [chatGraphExpansion, setChatGraphExpansion] = useState<Set<string> | null>(null);
   const [isDetailAudioPlaying, setIsDetailAudioPlaying] = useState(false);
   const [detailAudioTimeLabel, setDetailAudioTimeLabel] = useState('00:00');
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const transcriptionInFlightRef = useRef(false);
   const recordingStreamRef = useRef<MediaStream | null>(null);
   const recordingChunksRef = useRef<Blob[]>([]);
   const isClosingRecordingRef = useRef(false);
@@ -357,6 +414,8 @@ function App() {
   const shouldSeedDemoRecordingRef = useRef(window.location.search.includes('demoRecording'));
   const sessionUserIdRef = useRef<string | null | undefined>(undefined);
   const workspaceLoadRequestRef = useRef(0);
+  const chatLoadRequestRef = useRef(0);
+  const projectCountSyncRef = useRef(new Map<string, string>());
 
   const activeProject = activeProjectIndex === null ? null : projects[activeProjectIndex];
   const activeProjectId = activeProject?.id ?? null;
@@ -549,7 +608,7 @@ function App() {
 
   const refreshAdminQuality = async () => {
     try {
-      const response = await fetch('/api/admin/quality');
+      const response = await fetch('/api/admin/quality', { headers: await apiHeaders(null) });
       if (!response.ok) throw new Error(`/api/admin/quality ${response.status}`);
       const data = await response.json() as { rows: string[][] };
       setAdminQualityRows(data.rows ?? []);
@@ -561,7 +620,7 @@ function App() {
 
   const refreshAdminSystemHealth = async () => {
     try {
-      const response = await fetch('/api/admin/health');
+      const response = await fetch('/api/admin/health', { headers: await apiHeaders(null) });
       if (!response.ok) throw new Error(`/api/admin/health ${response.status}`);
       const data = await response.json() as { rows: string[][] };
       setAdminSystemRows(data.rows ?? []);
@@ -618,7 +677,7 @@ function App() {
   }, [storageUserId]);
 
   const switchProjectStorage = (userId: string | null, restoreActiveProject = true) => {
-    const nextProjects = userId === null ? [] : loadStoredProjects(userId);
+    const nextProjects = userId === null ? [] : loadCachedProjects(userId);
     const storedActiveProjectId = userId === null || !restoreActiveProject
       ? null
       : window.localStorage.getItem(scopedStorageKey(ACTIVE_PROJECT_STORAGE_KEY, userId));
@@ -636,6 +695,20 @@ function App() {
     setHomeSection('노트북');
     setStatusFilter('전체');
     setProjectQuery('');
+
+    if (userId !== null && supabase !== null) {
+      void loadStoredProjects(supabase).then((rows) => {
+        if (sessionUserIdRef.current !== userId) return;
+        const remoteProjects = rows.map(hydrateStoredProject);
+        setProjects(remoteProjects);
+        const remoteActiveIndex = storedActiveProjectId === null
+          ? -1
+          : remoteProjects.findIndex((project) => project.id === storedActiveProjectId && !project.trashed);
+        setActiveProjectIndex(remoteActiveIndex >= 0 ? remoteActiveIndex : null);
+      }).catch((error) => {
+        console.error('Supabase 프로젝트 목록 복원 실패:', error);
+      });
+    }
   };
 
   useEffect(() => {
@@ -764,6 +837,7 @@ function App() {
   }, [activeProjectId, persistProjectWorkspaces]);
 
   useEffect(() => {
+    setWorkspaceLoadedProjectId(null);
     if (supabase === null || currentUser === null || activeProjectId === null) return;
     const projectId = activeProjectId;
     const requestId = workspaceLoadRequestRef.current + 1;
@@ -785,6 +859,7 @@ function App() {
         sources: restoredSources,
         transcripts: restoredTranscripts,
       };
+      setWorkspaceLoadedProjectId(projectId);
       persistProjectWorkspaces();
       setProjects((currentProjects) => currentProjects.map((project) => (
         project.id === projectId
@@ -801,6 +876,44 @@ function App() {
   }, [activeProjectId, currentUser, persistProjectWorkspaces]);
 
   useEffect(() => {
+    const requestId = chatLoadRequestRef.current + 1;
+    chatLoadRequestRef.current = requestId;
+    setChatGraphExpansion(null);
+    setIsChatResponding(false);
+    setIsChatMenuOpen(false);
+    setPendingChatDeletionId(null);
+    setChatDeletionError(null);
+    if (supabase === null || currentUser === null || activeProjectId === null) {
+      setChatMessages(INITIAL_CHAT_MESSAGES);
+      setChatSessions([]);
+      setActiveChatSessionId(null);
+      return;
+    }
+    const projectId = activeProjectId;
+    setChatMessages(INITIAL_CHAT_MESSAGES);
+    void loadProjectChats(supabase, projectId).then((sessions) => {
+      if (chatLoadRequestRef.current !== requestId) return;
+      if (sessions.length > 0) {
+        setChatSessions(sessions);
+        setActiveChatSessionId(sessions[0].id);
+        setChatMessages(sessions[0].messages.length > 0 ? sessions[0].messages : INITIAL_CHAT_MESSAGES);
+      } else {
+        const session: StoredChatSession = {
+          id: createChatSessionId(),
+          title: '새 대화',
+          messages: [],
+          updatedAt: new Date().toISOString(),
+        };
+        setChatSessions([session]);
+        setActiveChatSessionId(session.id);
+        setChatMessages(INITIAL_CHAT_MESSAGES);
+      }
+    }).catch((error) => {
+      console.error('프로젝트 대화 목록 복원 실패:', error);
+    });
+  }, [activeProjectId, currentUser]);
+
+  useEffect(() => {
     if (!isAdminOpen) return;
     void refreshAdminQuality();
     void refreshAdminSystemHealth();
@@ -814,6 +927,31 @@ function App() {
     };
     persistProjectWorkspaces();
   }, [activeProjectId, sourceItems, transcriptsBySourceId, persistProjectWorkspaces]);
+
+  useEffect(() => {
+    if (
+      activeProject === null
+      || supabase === null
+      || currentUser === null
+      || workspaceLoadedProjectId !== activeProject.id
+    ) return;
+    const recordings = sourceItems.filter((source) => source.category === '녹음본').length;
+    const materials = sourceItems.filter((source) => source.category === '자료').length;
+    const countKey = `${recordings}:${materials}`;
+    if (projectCountSyncRef.current.get(activeProject.id) === countKey) return;
+    projectCountSyncRef.current.set(activeProject.id, countKey);
+
+    if (activeProject.recordings !== recordings || activeProject.materials !== materials) {
+      setProjects((currentProjects) => currentProjects.map((project) => (
+        project.id === activeProject.id ? { ...project, recordings, materials } : project
+      )));
+    }
+    void updateStoredProject(supabase, activeProject.id, { recordings, materials })
+      .catch((error) => {
+        projectCountSyncRef.current.delete(activeProject.id);
+        console.error('프로젝트 소스 수 저장 실패:', error);
+      });
+  }, [activeProject, currentUser, sourceItems, workspaceLoadedProjectId]);
 
   const closeSourceModal = () => {
     isClosingRecordingRef.current = true;
@@ -990,10 +1128,11 @@ function App() {
       name: createDefaultProjectName(projects),
       description: '',
     });
+    setProjectMutationError(null);
     setIsProjectModalOpen(true);
   };
 
-  const createProject = () => {
+  const createProject = async () => {
     if (!isLoggedIn) {
       setAuthMode('login');
       return;
@@ -1002,29 +1141,37 @@ function App() {
       openAdminHome();
       return;
     }
+    if (supabase === null || currentUser === null || projectMutationState !== 'idle') return;
     const name = projectDraft.name.trim() || '새 프로젝트';
     const description = projectDraft.description.trim() || '녹음본과 자료를 묶을 새 작업 공간';
-    const nextProject: Project = {
-      id: createProjectId(),
-      name,
-      description,
-      updatedAt: '방금',
-      recordings: 0,
-      materials: 0,
-      status: '자료 필요',
-    };
+    setProjectMutationState('saving');
+    setProjectMutationError(null);
+    try {
+      const row = await createStoredProject(supabase, {
+        id: createProjectId(),
+        owner_id: currentUser.id,
+        name,
+        description,
+        status: '자료 필요',
+      });
+      const nextProject = hydrateStoredProject(row);
 
-    setProjects((currentProjects) => [nextProject, ...currentProjects]);
-    setIsProjectModalOpen(false);
-    setIsProfileOpen(false);
-    setIsAdminOpen(false);
-    setIsHelpOpen(false);
-    setIsSettingsOpen(false);
-    setHomeSection('노트북');
-    setStatusFilter('전체');
-    setProjectQuery('');
-    setActiveProjectIndex(0);
-    window.history.pushState({ view: 'project', projectIndex: 0 }, '', window.location.pathname);
+      setProjects((currentProjects) => [nextProject, ...currentProjects]);
+      setIsProjectModalOpen(false);
+      setIsProfileOpen(false);
+      setIsAdminOpen(false);
+      setIsHelpOpen(false);
+      setIsSettingsOpen(false);
+      setHomeSection('노트북');
+      setStatusFilter('전체');
+      setProjectQuery('');
+      setActiveProjectIndex(0);
+      window.history.pushState({ view: 'project', projectIndex: 0 }, '', window.location.pathname);
+    } catch (error) {
+      setProjectMutationError(error instanceof Error ? error.message : '프로젝트를 만들지 못했습니다.');
+    } finally {
+      setProjectMutationState('idle');
+    }
   };
 
   const startProjectEditing = () => {
@@ -1036,16 +1183,22 @@ function App() {
     setIsProjectTitleEditing(true);
   };
 
-  const saveProjectEdits = () => {
-    if (activeProjectIndex === null) return;
+  const saveProjectEdits = async () => {
+    if (activeProjectIndex === null || activeProject === null || supabase === null || projectMutationState !== 'idle') return;
     const name = projectEditDraft.name.trim() || activeProject?.name || '새 프로젝트';
     const description = projectEditDraft.description.trim() || '녹음본과 자료를 묶을 작업 공간';
-    setProjects((currentProjects) => currentProjects.map((project, projectIndex) => (
-      projectIndex === activeProjectIndex
-        ? { ...project, name, description, updatedAt: '방금' }
-        : project
-    )));
-    setIsProjectTitleEditing(false);
+    setProjectMutationState('saving');
+    try {
+      const row = await updateStoredProject(supabase, activeProject.id, { name, description });
+      setProjects((currentProjects) => currentProjects.map((project) => (
+        project.id === row.id ? hydrateStoredProject(row) : project
+      )));
+      setIsProjectTitleEditing(false);
+    } catch (error) {
+      console.error('프로젝트 수정 저장 실패:', error);
+    } finally {
+      setProjectMutationState('idle');
+    }
   };
 
   const formatTranscriptSegment = (segment: TranscriptSegment) => (
@@ -1094,7 +1247,7 @@ function App() {
     setIsTranscriptEditing((value) => !value);
   };
 
-  const removeSourceItem = async (sourceId: string) => {
+  const removeSourceItem = async (sourceId: string, persist = true) => {
     const targetSource = sourceItems.find((source) => source.id === sourceId);
     const recordingBundleId = targetSource?.category === '녹음본'
       ? targetSource.recordingId ?? targetSource.id
@@ -1103,7 +1256,7 @@ function App() {
       ? sourceItems.filter((source) => source.id === sourceId)
       : sourceItems.filter((source) => source.id === sourceId || source.recordingId === recordingBundleId);
     const removedSourceIds = new Set(removedSources.map((source) => source.id));
-    if (supabase !== null && targetSource?.storagePath !== undefined) {
+    if (persist && supabase !== null && targetSource?.storagePath !== undefined) {
       await deleteProjectSource(
         supabase,
         sourceId,
@@ -1156,23 +1309,41 @@ function App() {
     setSourceDeletionState('deleting');
     setSourceDeletionError(null);
     try {
-      if (supabase !== null && pendingSourceDeletion.storagePath === undefined) {
-        throw new Error('소스 저장이 끝난 뒤 다시 시도해주세요.');
+      if (activeProjectId === null) throw new Error('프로젝트를 찾지 못했습니다.');
+      const params = new URLSearchParams({ project_id: activeProjectId });
+      if (pendingSourceDeletion.recordingId) {
+        params.set('recording_id', pendingSourceDeletion.recordingId);
       }
-      if (pendingSourceDeletion.storagePath !== undefined) {
-        const response = await fetch(
-          `/api/source-graph?source_id=${encodeURIComponent(pendingSourceDeletion.id)}`,
-          {
-            method: 'DELETE',
-            headers: await apiHeaders(activeProjectId),
-          },
-        );
-        if (!response.ok) {
-          const errorBody = await response.json().catch(() => null) as { detail?: string } | null;
-          throw new Error(errorBody?.detail ?? '그래프 데이터 삭제에 실패했습니다.');
+      if (pendingSourceDeletion.graphMeetingId) {
+        params.set('meeting_id', pendingSourceDeletion.graphMeetingId);
+      }
+      params.set('title', pendingSourceDeletion.title);
+      const response = await fetch(
+        `/api/sources/${encodeURIComponent(pendingSourceDeletion.id)}?${params.toString()}`,
+        {
+          method: 'DELETE',
+          headers: await apiHeaders(activeProjectId),
+        },
+      );
+      const body = await response.json().catch(() => null) as {
+        detail?: string;
+        storage_paths?: string[];
+        warnings?: string[];
+      } | null;
+      if (!response.ok) {
+        throw new Error(body?.detail ?? '소스 데이터 삭제에 실패했습니다.');
+      }
+      if (supabase !== null && (body?.storage_paths?.length ?? 0) > 0) {
+        try {
+          await removeStoredProjectFiles(supabase, body?.storage_paths ?? []);
+        } catch (error) {
+          console.error('삭제된 소스의 Storage 파일 정리 실패:', error);
         }
       }
-      await removeSourceItem(pendingSourceDeletion.id);
+      if ((body?.warnings?.length ?? 0) > 0) {
+        console.warn('소스 일부 저장소 정리 경고:', body?.warnings);
+      }
+      await removeSourceItem(pendingSourceDeletion.id, false);
       setPendingSourceDeletion(null);
       setSourceDeletionState('idle');
       setGraphReloadKey((value) => value + 1);
@@ -1520,6 +1691,7 @@ function App() {
   };
 
   const startTranscription = async () => {
+    if (transcriptionInFlightRef.current) return;
     if (recordedAudioBlob === null) {
       setTranscriptionError('전사할 녹음 파일이 없습니다.');
       return;
@@ -1528,6 +1700,7 @@ function App() {
       setTranscriptionError('프로젝트를 먼저 선택해주세요.');
       return;
     }
+    transcriptionInFlightRef.current = true;
 
     setTranscriptionError(null);
     setTranscriptionState('transcribing');
@@ -1536,9 +1709,57 @@ function App() {
     const recordingId = `recording-${now.getTime()}`;
     const meetingId = `meeting-${now.getTime()}`;
     const audioFileName = recordedAudioFileName ?? `synapvox-recording-${now.getTime()}.webm`;
+    let audioUploadPromise: ReturnType<typeof uploadProjectSource> | null = null;
+    let recordingMaterialsPromise: Promise<SourceItem[]> | null = null;
 
     try {
       const projectMaterialsForTranscription = await getProjectMaterialsForTranscription(activeProjectId);
+      const timeLabel = now.toLocaleTimeString('ko-KR', {
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+      });
+      const pendingLinkedMaterials = [
+        ...projectMaterialsForTranscription.map((entry) => entry.source),
+        ...recordingAttachedMaterials,
+      ];
+      if (supabase !== null && currentUser !== null) {
+        audioUploadPromise = uploadProjectSource({
+          client: supabase,
+          userId: currentUser.id,
+          projectId: activeProjectId,
+          sourceId: recordingId,
+          recordingId,
+          scope: 'recording',
+          kind: 'audio',
+          file: recordedAudioBlob,
+          fileName: audioFileName,
+          mimeType: recordedAudioBlob.type,
+          durationSeconds: durationLabelToSeconds(recordedAudioDurationLabel),
+          sourcePayload: sourcePayloadForStorage({
+            id: recordingId,
+            title: getRecordingTitle(recordedAudioFileName, `녹음본 ${timeLabel}`),
+            type: recordedAudioFileName === null ? '녹음' : '파일',
+            category: '녹음본',
+            meta: `전사 중 · 오늘 ${timeLabel}`,
+            updatedOrder: 0,
+            attachedMaterials: pendingLinkedMaterials,
+            mediaKind: recordedMediaKind,
+            recordingId,
+            graphMeetingId: meetingId,
+          }),
+        });
+        recordingMaterialsPromise = Promise.all(recordingMaterialFiles.map((file, index) => (
+          persistMaterialFile(
+            file,
+            recordingAttachedMaterials[index],
+            activeProjectId,
+            'recording',
+            recordingId,
+            meetingId,
+          )
+        )));
+      }
       const body = new FormData();
       body.append('audio', recordedAudioBlob, audioFileName);
       projectMaterialsForTranscription.forEach(({ file }) => {
@@ -1565,49 +1786,11 @@ function App() {
 
       const result = await response.json() as IntermediateTranscript;
       const transcriptSegments = mapIntermediateTranscript(result);
-      let persistedRecordingMaterials = recordingAttachedMaterials;
-      if (supabase !== null && currentUser !== null) {
-        persistedRecordingMaterials = await Promise.all(recordingMaterialFiles.map((file, index) => (
-          persistMaterialFile(
-            file,
-            recordingAttachedMaterials[index],
-            activeProjectId,
-            'recording',
-            recordingId,
-            meetingId,
-          )
-        )));
-      }
+      const persistedRecordingMaterials = recordingMaterialsPromise === null
+        ? recordingAttachedMaterials
+        : await recordingMaterialsPromise;
 
-      // 전사문과 이 녹음에만 붙인 참고 자료를 같은 meeting_id로 Neo4j에 묶는다.
-      try {
-        const ingestResponse = await fetch('/api/ingest-stt', {
-          method: 'POST',
-          headers: {
-            ...(await apiHeaders(activeProjectId)),
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(result),
-        });
-        if (!ingestResponse.ok) {
-          const errorBody = await ingestResponse.json().catch(() => null) as { detail?: string } | null;
-          throw new Error(errorBody?.detail ?? `전사 그래프 반영 요청 실패 (${ingestResponse.status})`);
-        }
-        await Promise.all(recordingMaterialFiles.map((file, index) => (
-          isGraphIngestibleDocument(file)
-            ? uploadMaterialToGraph(file, persistedRecordingMaterials[index]?.id ?? '', activeProjectId, meetingId)
-            : Promise.resolve(false)
-        )));
-        setGraphReloadKey((value) => value + 1);
-      } catch (error) {
-        console.error('전사 결과를 그래프에 반영하지 못했습니다:', error);
-      }
       const savedTranscriptSegments = transcriptSegments;
-      const timeLabel = now.toLocaleTimeString('ko-KR', {
-        hour: '2-digit',
-        minute: '2-digit',
-        hour12: false,
-      });
       const linkedMaterials = [
         ...projectMaterialsForTranscription.map((entry) => entry.source),
         ...persistedRecordingMaterials,
@@ -1629,40 +1812,34 @@ function App() {
         graphMeetingId: meetingId,
       };
       if (supabase !== null && currentUser !== null) {
-        const audioRow = await uploadProjectSource({
-          client: supabase,
-          userId: currentUser.id,
-          projectId: activeProjectId,
-          sourceId: recordingId,
-          recordingId,
-          scope: 'recording',
-          kind: 'audio',
-          file: recordedAudioBlob,
-          fileName: audioFileName,
-          mimeType: recordedAudioBlob.type,
-          durationSeconds: durationLabelToSeconds(recordedAudioDurationLabel),
-          sourcePayload: sourcePayloadForStorage(savedRecording),
-        });
+        const audioRow = await audioUploadPromise;
+        if (audioRow === null) throw new Error('녹음 파일 저장을 시작하지 못했습니다.');
         savedRecording = {
           ...savedRecording,
           storagePath: audioRow.storage_path,
           mimeType: audioRow.mime_type ?? undefined,
           sizeBytes: audioRow.size_bytes,
         };
-        await saveRecordingTranscript({
-          client: supabase,
-          userId: currentUser.id,
-          projectId: activeProjectId,
-          recordingId,
-          meetingId,
-          intermediateJson: result as unknown as Record<string, unknown>,
-          segments: savedTranscriptSegments,
-        });
+        await Promise.all([
+          updateProjectSourcePayload(supabase, recordingId, sourcePayloadForStorage(savedRecording)),
+          saveRecordingTranscript({
+            client: supabase,
+            userId: currentUser.id,
+            projectId: activeProjectId,
+            recordingId,
+            meetingId,
+            intermediateJson: result as unknown as Record<string, unknown>,
+            segments: savedTranscriptSegments,
+          }),
+        ]);
       }
+
       if (recordedAudioUrl !== null) savedAudioUrlsRef.current.add(recordedAudioUrl);
       setSourceItems((currentSourceItems) => [
-        savedRecording,
-        ...currentSourceItems.map((source) => ({ ...source, updatedOrder: source.updatedOrder + 1 })),
+        { ...savedRecording, meta: `${savedRecording.meta} · 그래프 분석 중` },
+        ...currentSourceItems
+          .filter((source) => source.id !== recordingId)
+          .map((source) => ({ ...source, updatedOrder: source.updatedOrder + 1 })),
       ]);
       if (activeProjectIndex !== null) {
         setProjects((currentProjects) => currentProjects.map((project, projectIndex) => (
@@ -1681,10 +1858,54 @@ function App() {
       await new Promise((resolve) => window.setTimeout(resolve, 250));
       setTranscriptionState('done');
       setTranscriptionStep(3);
+
+      // 전사 결과 저장까지만 사용자 대기 경로에 둔다. Graphiti 지식 추출은 보통
+      // 전사 자체보다 오래 걸리므로 뒤에서 수행하고 소스 카드 상태로 결과를 알린다.
+      void (async () => {
+        try {
+          const ingestResponse = await fetch('/api/ingest-stt', {
+            method: 'POST',
+            headers: {
+              ...(await apiHeaders(activeProjectId)),
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(result),
+          });
+          if (!ingestResponse.ok) {
+            const errorBody = await ingestResponse.json().catch(() => null) as { detail?: string } | null;
+            throw new Error(errorBody?.detail ?? `전사 그래프 반영 요청 실패 (${ingestResponse.status})`);
+          }
+          await Promise.all(recordingMaterialFiles.map((file, index) => (
+            isGraphIngestibleDocument(file)
+              ? uploadMaterialToGraph(file, persistedRecordingMaterials[index]?.id ?? '', activeProjectId, meetingId)
+              : Promise.resolve(false)
+          )));
+          setSourceItems((items) => items.map((source) => (
+            source.id === recordingId
+              ? { ...source, meta: source.meta.replace(' · 그래프 분석 중', '') }
+              : source
+          )));
+          setGraphReloadKey((value) => value + 1);
+        } catch (error) {
+          console.error('전사 결과를 그래프에 반영하지 못했습니다:', error);
+          setSourceItems((items) => items.map((source) => (
+            source.id === recordingId
+              ? { ...source, meta: source.meta.replace(' · 그래프 분석 중', ' · 그래프 반영 실패') }
+              : source
+          )));
+        }
+      })();
+      transcriptionInFlightRef.current = false;
     } catch (error) {
+      transcriptionInFlightRef.current = false;
       if (supabase !== null) {
-        void deleteProjectSource(supabase, recordingId, undefined, recordingId)
-          .catch((cleanupError) => console.error('실패한 녹음 저장 정리 실패:', cleanupError));
+        const client = supabase;
+        const pendingUploads: Promise<unknown>[] = [];
+        if (audioUploadPromise !== null) pendingUploads.push(audioUploadPromise);
+        if (recordingMaterialsPromise !== null) pendingUploads.push(recordingMaterialsPromise);
+        void Promise.allSettled(pendingUploads).then(() => (
+          deleteProjectSource(client, recordingId, undefined, recordingId)
+        )).catch((cleanupError) => console.error('실패한 녹음 저장 정리 실패:', cleanupError));
       }
       setTranscriptionState('idle');
       setTranscriptionStep(0);
@@ -1705,53 +1926,284 @@ function App() {
     }
   };
 
-  const updateProject = (index: number, updates: Partial<(typeof projects)[number]>) => {
-    setProjects((currentProjects) => currentProjects.map((project, projectIndex) => (
-      projectIndex === index ? { ...project, ...updates } : project
+  const updateProject = async (index: number, updates: Partial<Project>) => {
+    const target = projects[index];
+    if (target === undefined || supabase === null) return;
+    setOpenProjectMenuIndex(null);
+    try {
+      const row = await updateStoredProject(supabase, target.id, {
+        ...(updates.name !== undefined ? { name: updates.name } : {}),
+        ...(updates.description !== undefined ? { description: updates.description } : {}),
+        ...(updates.status !== undefined ? { status: updates.status } : {}),
+        ...(updates.recordings !== undefined ? { recordings: updates.recordings } : {}),
+        ...(updates.materials !== undefined ? { materials: updates.materials } : {}),
+        ...(updates.favorite !== undefined ? { favorite: updates.favorite } : {}),
+        ...(updates.shared !== undefined ? { shared: updates.shared } : {}),
+      });
+      setProjects((currentProjects) => currentProjects.map((project) => (
+        project.id === row.id ? hydrateStoredProject(row) : project
+      )));
+    } catch (error) {
+      console.error('프로젝트 저장 실패:', error);
+      setProjectMutationError(error instanceof Error ? error.message : '프로젝트를 저장하지 못했습니다.');
+    }
+  };
+
+  const requestProjectTrash = (index: number) => {
+    setOpenProjectMenuIndex(null);
+    setProjectMutationError(null);
+    setPendingProjectAction({ type: 'trash', projectIndex: index });
+  };
+
+  const setProjectTrashState = async (index: number, trashed: boolean) => {
+    const target = projects[index];
+    if (target === undefined) return;
+    const response = await fetch(`/api/projects/${encodeURIComponent(target.id)}/trash`, {
+      method: 'PATCH',
+      headers: { ...(await apiHeaders(target.id)), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ trashed }),
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => null) as { detail?: string } | null;
+      throw new Error(body?.detail ?? '프로젝트 상태를 변경하지 못했습니다.');
+    }
+    setProjects((currentProjects) => currentProjects.map((project) => (
+      project.id === target.id ? { ...project, trashed, updatedAt: '방금' } : project
     )));
     setOpenProjectMenuIndex(null);
   };
 
-  const deleteProject = (index: number) => {
-    updateProject(index, { trashed: true });
+  const permanentlyDeleteProject = async (project: Project) => {
+    const response = await fetch(`/api/projects/${encodeURIComponent(project.id)}`, {
+      method: 'DELETE',
+      headers: await apiHeaders(project.id),
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => null) as { detail?: string } | null;
+      throw new Error(body?.detail ?? '프로젝트를 영구 삭제하지 못했습니다.');
+    }
+    const body = await response.json() as { storage_paths?: string[]; warnings?: string[] };
+    if ((body.warnings?.length ?? 0) > 0) {
+      console.warn('프로젝트 일부 저장소 정리 경고:', body.warnings);
+    }
+    if (supabase !== null) {
+      try {
+        await removeStoredProjectFiles(supabase, body.storage_paths ?? []);
+      } catch (error) {
+        console.error('삭제된 프로젝트의 Storage 파일 정리 실패:', error);
+      }
+    }
+    delete projectWorkspacesRef.current[project.id];
+    persistProjectWorkspaces();
+    window.localStorage.removeItem(scopedStorageKey(ACTIVE_PROJECT_STORAGE_KEY, storageUserId));
   };
 
-  const emptyTrash = () => {
-    setProjects((currentProjects) => currentProjects.filter((project) => !project.trashed));
-    setOpenProjectMenuIndex(null);
+  const confirmProjectAction = async () => {
+    if (pendingProjectAction === null || projectMutationState === 'deleting') return;
+    setProjectMutationState('deleting');
+    setProjectMutationError(null);
+    try {
+      if (pendingProjectAction.type === 'trash' && pendingProjectAction.projectIndex !== undefined) {
+        await setProjectTrashState(pendingProjectAction.projectIndex, true);
+      } else if (pendingProjectAction.type === 'permanent' && pendingProjectAction.projectIndex !== undefined) {
+        const target = projects[pendingProjectAction.projectIndex];
+        if (target !== undefined) {
+          await permanentlyDeleteProject(target);
+          setProjects((currentProjects) => currentProjects.filter((project) => project.id !== target.id));
+        }
+      } else if (pendingProjectAction.type === 'empty') {
+        const trashedProjects = projects.filter((project) => project.trashed);
+        const results = await Promise.allSettled(trashedProjects.map(permanentlyDeleteProject));
+        const deletedIds = new Set(trashedProjects
+          .filter((_, index) => results[index].status === 'fulfilled')
+          .map((project) => project.id));
+        setProjects((currentProjects) => currentProjects.filter((project) => !deletedIds.has(project.id)));
+        const failed = results.filter((result) => result.status === 'rejected');
+        if (failed.length > 0) throw new Error(`${failed.length}개 프로젝트를 삭제하지 못했습니다.`);
+      }
+      setPendingProjectAction(null);
+    } catch (error) {
+      setProjectMutationError(error instanceof Error ? error.message : '요청을 처리하지 못했습니다.');
+    } finally {
+      setProjectMutationState('idle');
+    }
+  };
+
+  const startNewChat = () => {
+    if (isChatResponding) return;
+    const session: StoredChatSession = {
+      id: createChatSessionId(),
+      title: '새 대화',
+      messages: [],
+      updatedAt: new Date().toISOString(),
+    };
+    setChatSessions((sessions) => [
+      session,
+      ...sessions.filter((item) => item.messages.length > 0),
+    ]);
+    setActiveChatSessionId(session.id);
+    setChatMessages(INITIAL_CHAT_MESSAGES);
+    setChatGraphExpansion(null);
+    setPendingChatDeletionId(null);
+    setChatDeletionError(null);
+    setIsChatMenuOpen(false);
+  };
+
+  const selectChatSession = (session: StoredChatSession) => {
+    if (isChatResponding) return;
+    setActiveChatSessionId(session.id);
+    setChatMessages(session.messages.length > 0 ? session.messages : INITIAL_CHAT_MESSAGES);
+    setChatGraphExpansion(null);
+    setPendingChatDeletionId(null);
+    setChatDeletionError(null);
+    setIsChatMenuOpen(false);
+  };
+
+  const confirmChatDeletion = async () => {
+    if (
+      pendingChatDeletionId === null
+      || chatDeletionState === 'deleting'
+      || supabase === null
+    ) return;
+    const chatId = pendingChatDeletionId;
+    setChatDeletionState('deleting');
+    setChatDeletionError(null);
+    try {
+      await deleteProjectChat(supabase, chatId);
+      const remainingSessions = chatSessions.filter((session) => session.id !== chatId);
+      if (remainingSessions.length > 0) {
+        setChatSessions(remainingSessions);
+        if (activeChatSessionId === chatId) {
+          setActiveChatSessionId(remainingSessions[0].id);
+          setChatMessages(
+            remainingSessions[0].messages.length > 0
+              ? remainingSessions[0].messages
+              : INITIAL_CHAT_MESSAGES,
+          );
+          setChatGraphExpansion(null);
+        }
+      } else {
+        const session: StoredChatSession = {
+          id: createChatSessionId(),
+          title: '새 대화',
+          messages: [],
+          updatedAt: new Date().toISOString(),
+        };
+        setChatSessions([session]);
+        setActiveChatSessionId(session.id);
+        setChatMessages(INITIAL_CHAT_MESSAGES);
+        setChatGraphExpansion(null);
+      }
+      setPendingChatDeletionId(null);
+    } catch (error) {
+      setChatDeletionError(error instanceof Error ? error.message : '대화를 삭제하지 못했습니다.');
+    } finally {
+      setChatDeletionState('idle');
+    }
   };
 
   const submitProjectChat = () => {
     const query = chatInput.trim();
-    if (!query) return;
+    if (
+      !query
+      || isChatResponding
+      || activeProjectId === null
+      || activeChatSessionId === null
+      || currentUser === null
+      || supabase === null
+    ) return;
 
-    setChatMessages((currentMessages) => [...currentMessages, { role: 'user', text: query }]);
+    const projectId = activeProjectId;
+    const chatId = activeChatSessionId;
+    const requestId = chatLoadRequestRef.current;
+    const history = chatMessages.slice(-30);
+    const userMessage: StoredChatMessage = { role: 'user', text: query };
+    const pendingMessages: StoredChatMessage[] = [...chatMessages, userMessage, { role: 'assistant', text: '' }];
+    setChatMessages(pendingMessages);
     setChatInput('');
+    setIsChatResponding(true);
 
     void (async () => {
-      let assistantText: string;
+      let assistantText = '';
       try {
-        const response = await fetch(`/api/ask?project=${encodeURIComponent(activeProjectId ?? '')}&q=${encodeURIComponent(query)}&k=6`, {
-          headers: await apiHeaders(activeProjectId),
+        const response = await fetch('/api/ask-stream', {
+          method: 'POST',
+          headers: { ...(await apiHeaders(projectId)), 'Content-Type': 'application/json' },
+          body: JSON.stringify({ project: projectId, q: query, k: 6, history }),
         });
-        if (!response.ok) throw new Error(`/api/ask ${response.status}`);
-        const data = await response.json() as {
-          answer: string; hits?: { session_id: string }[];
-          expansion?: { nodes?: { id: string }[] };
+        if (!response.ok || response.body === null) throw new Error(`/api/ask-stream ${response.status}`);
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let streamError: string | null = null;
+        const consumeLine = (line: string) => {
+          if (!line.trim()) return;
+          const event = JSON.parse(line) as {
+            type: 'delta' | 'complete' | 'error';
+            text?: string;
+            answer?: string;
+            message?: string;
+            expansion?: { nodes?: { id: string }[] };
+          };
+          if (event.type === 'delta') {
+            assistantText += event.text ?? '';
+            if (chatLoadRequestRef.current === requestId) {
+              setChatMessages([...chatMessages, userMessage, { role: 'assistant', text: assistantText }]);
+            }
+          } else if (event.type === 'complete') {
+            assistantText = event.answer ?? assistantText;
+            if (chatLoadRequestRef.current === requestId) {
+              setChatGraphExpansion(new Set((event.expansion?.nodes ?? []).map((node) => node.id)));
+            }
+          } else if (event.type === 'error') {
+            streamError = event.message ?? 'AI 답변을 생성하지 못했습니다.';
+          }
         };
-        assistantText = data.answer;
-        setChatGraphExpansion(new Set((data.expansion?.nodes ?? []).map((node) => node.id)));
+
+        while (true) {
+          const { done, value } = await reader.read();
+          buffer += decoder.decode(value, { stream: !done });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() ?? '';
+          lines.forEach(consumeLine);
+          if (done) break;
+        }
+        consumeLine(buffer);
+        if (streamError !== null) throw new Error(streamError);
+        if (!assistantText.trim()) throw new Error('빈 답변이 반환되었습니다.');
       } catch (error) {
         console.error('AI 답변을 받아오지 못했습니다:', error);
-        setChatGraphExpansion(null);
-        const hasRecordings = sourceItems.some((source) => source.category === '녹음본');
-        const hasMaterials = sourceItems.some((source) => source.category === '자료');
-        assistantText = hasRecordings || hasMaterials
-          ? '추가된 녹음본과 자료를 기준으로 답변을 준비하고 있습니다. 관련 근거가 만들어지면 이 대화와 가운데 그래프에 함께 표시됩니다.'
-          : '아직 참고할 녹음본이나 자료가 없습니다. 먼저 녹음본을 전사하거나 자료를 추가하면, 그 내용을 바탕으로 질문에 답할 수 있습니다.';
+        assistantText = '답변을 불러오지 못했습니다. 잠시 후 다시 질문해주세요.';
+        if (chatLoadRequestRef.current === requestId) setChatGraphExpansion(null);
       }
 
-      setChatMessages((currentMessages) => [...currentMessages, { role: 'assistant', text: assistantText }]);
+      const completedMessages: StoredChatMessage[] = [
+        ...chatMessages,
+        userMessage,
+        { role: 'assistant', text: assistantText },
+      ];
+      if (chatLoadRequestRef.current === requestId) {
+        setChatMessages(completedMessages);
+        setIsChatResponding(false);
+      }
+      try {
+        const savedSession = await saveProjectChat(
+          supabase,
+          currentUser.id,
+          projectId,
+          chatId,
+          completedMessages,
+        );
+        if (chatLoadRequestRef.current === requestId) {
+          setChatSessions((sessions) => [
+            savedSession,
+            ...sessions.filter((session) => session.id !== chatId),
+          ]);
+        }
+      } catch (error) {
+        console.error('프로젝트 대화 저장 실패:', error);
+      }
     })();
   };
 
@@ -2467,7 +2919,15 @@ function App() {
                 ))}
               </div>
               {homeSection === '휴지통' && (
-                <button className="empty-trash-button" type="button" onClick={emptyTrash}>
+                <button
+                  className="empty-trash-button"
+                  type="button"
+                  disabled={!projects.some((project) => project.trashed)}
+                  onClick={() => {
+                    setProjectMutationError(null);
+                    setPendingProjectAction({ type: 'empty' });
+                  }}
+                >
                   휴지통 비우기
                 </button>
               )}
@@ -2483,7 +2943,7 @@ function App() {
               )}
 
               {visibleProjects.map((project) => (
-                <article className="home-project-card" key={project.name}>
+                <article className="home-project-card" key={project.id}>
                   <button className="project-card-main" type="button" onClick={() => openProject(project.index)}>
                     <div>
                       <span className="project-state">{project.status}</span>
@@ -2514,13 +2974,26 @@ function App() {
                     {openProjectMenuIndex === project.index && (
                       <div className="project-menu-popover">
                         <button type="button" onClick={() => setOpenProjectMenuIndex(null)}>수정</button>
-                        <button type="button" onClick={() => updateProject(project.index, { favorite: !project.favorite })}>
+                        <button type="button" onClick={() => void updateProject(project.index, { favorite: !project.favorite })}>
                           {project.favorite ? '즐겨찾기 해제' : '즐겨찾기'}
                         </button>
                         {project.trashed ? (
-                          <button type="button" onClick={() => updateProject(project.index, { trashed: false })}>복원</button>
+                          <>
+                            <button type="button" onClick={() => void setProjectTrashState(project.index, false)}>복원</button>
+                            <button
+                              className="danger"
+                              type="button"
+                              onClick={() => {
+                                setOpenProjectMenuIndex(null);
+                                setProjectMutationError(null);
+                                setPendingProjectAction({ type: 'permanent', projectIndex: project.index });
+                              }}
+                            >
+                              영구 삭제
+                            </button>
+                          </>
                         ) : (
-                          <button className="danger" type="button" onClick={() => deleteProject(project.index)}>삭제</button>
+                          <button className="danger" type="button" onClick={() => requestProjectTrash(project.index)}>삭제</button>
                         )}
                       </div>
                     )}
@@ -2552,7 +3025,7 @@ function App() {
                 onBlur={(event) => {
                   const nextTarget = event.relatedTarget;
                   if (isProjectTitleEditing && !event.currentTarget.contains(nextTarget)) {
-                    saveProjectEdits();
+                    void saveProjectEdits();
                   }
                 }}
               >
@@ -2563,7 +3036,7 @@ function App() {
                       value={projectEditDraft.name}
                       onChange={(event) => setProjectEditDraft((draft) => ({ ...draft, name: event.target.value }))}
                       onKeyDown={(event) => {
-                        if (event.key === 'Enter') saveProjectEdits();
+                        if (event.key === 'Enter') void saveProjectEdits();
                       }}
                       autoFocus
                     />
@@ -2573,7 +3046,7 @@ function App() {
                       onChange={(event) => setProjectEditDraft((draft) => ({ ...draft, description: event.target.value }))}
                       placeholder="프로젝트 설명"
                       onKeyDown={(event) => {
-                        if (event.key === 'Enter') saveProjectEdits();
+                        if (event.key === 'Enter') void saveProjectEdits();
                       }}
                     />
                   </>
@@ -2776,14 +3249,101 @@ function App() {
                   <p className="eyebrow">AI chat</p>
                   <h2>대화</h2>
                 </div>
-                <button className="panel-mini-button" type="button" aria-label="대화 메뉴">⋮</button>
+                <button
+                  className="panel-mini-button"
+                  type="button"
+                  aria-label="대화 내역"
+                  aria-expanded={isChatMenuOpen}
+                  onClick={() => {
+                    setIsChatMenuOpen((open) => !open);
+                    setPendingChatDeletionId(null);
+                    setChatDeletionError(null);
+                  }}
+                >
+                  ⋮
+                </button>
               </div>
+
+              {isChatMenuOpen && (
+                <div className="chat-session-menu">
+                  <div className="chat-session-menu-head">
+                    <strong>대화 내역</strong>
+                    <button type="button" onClick={startNewChat} disabled={isChatResponding}>
+                      <Plus size={16} aria-hidden="true" />
+                      새 대화
+                    </button>
+                  </div>
+                  <div className="chat-session-list">
+                    {chatSessions.map((session) => (
+                      <div
+                        className={`chat-session-item ${session.id === activeChatSessionId ? 'active' : ''}`}
+                        key={session.id}
+                      >
+                        <button
+                          className="chat-session-select"
+                          type="button"
+                          disabled={isChatResponding}
+                          onClick={() => selectChatSession(session)}
+                          title={session.title}
+                        >
+                          {session.title}
+                        </button>
+                        <button
+                          className="chat-session-delete"
+                          type="button"
+                          aria-label={`${session.title} 삭제`}
+                          disabled={isChatResponding}
+                          onClick={() => {
+                            setPendingChatDeletionId(session.id);
+                            setChatDeletionError(null);
+                          }}
+                        >
+                          <Trash2 size={16} aria-hidden="true" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                  {pendingChatDeletionId !== null && (
+                    <div className="chat-delete-confirm" role="dialog" aria-modal="true">
+                      <strong>삭제하시겠습니까?</strong>
+                      <p>이 대화 내역은 복구할 수 없습니다.</p>
+                      {chatDeletionError !== null && <small>{chatDeletionError}</small>}
+                      <div>
+                        <button
+                          type="button"
+                          disabled={chatDeletionState === 'deleting'}
+                          onClick={() => {
+                            setPendingChatDeletionId(null);
+                            setChatDeletionError(null);
+                          }}
+                        >
+                          취소
+                        </button>
+                        <button
+                          className="danger"
+                          type="button"
+                          disabled={chatDeletionState === 'deleting'}
+                          onClick={() => void confirmChatDeletion()}
+                        >
+                          {chatDeletionState === 'deleting' ? '삭제 중…' : '삭제'}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
 
               <div className="studio-chat-thread">
                 {chatMessages.map((message, index) => (
                   <article className={`chat-bubble ${message.role}`} key={`${message.role}-${index}`}>
                     <span>{message.role === 'assistant' ? 'SynapVox' : '나'}</span>
-                    <p>{message.text}</p>
+                    {message.role === 'assistant' && message.text ? (
+                      <Suspense fallback={<p>{message.text}</p>}>
+                        <AssistantMessage text={message.text} />
+                      </Suspense>
+                    ) : (
+                      <p>{message.text || '답변 생성 중…'}</p>
+                    )}
                   </article>
                 ))}
               </div>
@@ -2799,8 +3359,9 @@ function App() {
                   value={chatInput}
                   onChange={(event) => setChatInput(event.target.value)}
                   placeholder="프로젝트에 대해 질문하세요"
+                  disabled={isChatResponding}
                 />
-                <button type="submit">→</button>
+                <button type="submit" disabled={isChatResponding || chatInput.trim() === ''}>→</button>
               </form>
               </aside>
             </section>
@@ -2917,7 +3478,7 @@ function App() {
               className="project-create-form"
               onSubmit={(event) => {
                 event.preventDefault();
-                createProject();
+                void createProject();
               }}
             >
               <label>
@@ -2937,8 +3498,61 @@ function App() {
                   placeholder="이 프로젝트에 모을 녹음본과 자료를 짧게 적어주세요."
                 />
               </label>
-              <button className="auth-submit" type="submit">만들기</button>
+              {projectMutationError !== null && <p className="auth-error">{projectMutationError}</p>}
+              <button className="auth-submit" type="submit" disabled={projectMutationState === 'saving'}>
+                {projectMutationState === 'saving' ? '만드는 중…' : '만들기'}
+              </button>
             </form>
+          </section>
+        </div>
+      )}
+
+      {pendingProjectAction !== null && (
+        <div className="auth-modal-backdrop" role="presentation">
+          <section
+            className="auth-modal project-delete-modal"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="project-delete-title"
+          >
+            <p className="eyebrow">Project</p>
+            <h2 id="project-delete-title">
+              {pendingProjectAction.type === 'trash'
+                ? '휴지통으로 이동할까요?'
+                : pendingProjectAction.type === 'permanent'
+                  ? '프로젝트를 영구 삭제할까요?'
+                  : '휴지통을 비울까요?'}
+            </h2>
+            <p>
+              {pendingProjectAction.type === 'trash'
+                ? '휴지통에서 다시 복원할 수 있습니다.'
+                : pendingProjectAction.type === 'permanent'
+                  ? '녹음본, 자료, 전사문과 지식 그래프가 함께 삭제되며 복구할 수 없습니다.'
+                  : '휴지통의 모든 프로젝트와 연결된 파일 및 지식 그래프가 삭제되며 복구할 수 없습니다.'}
+            </p>
+            {projectMutationError !== null && <p className="auth-error">{projectMutationError}</p>}
+            <div className="project-delete-actions">
+              <button
+                type="button"
+                disabled={projectMutationState === 'deleting'}
+                onClick={() => {
+                  setPendingProjectAction(null);
+                  setProjectMutationError(null);
+                }}
+              >
+                취소
+              </button>
+              <button
+                className="danger"
+                type="button"
+                disabled={projectMutationState === 'deleting'}
+                onClick={() => void confirmProjectAction()}
+              >
+                {projectMutationState === 'deleting'
+                  ? '처리 중…'
+                  : pendingProjectAction.type === 'trash' ? '휴지통으로 이동' : '영구 삭제'}
+              </button>
+            </div>
           </section>
         </div>
       )}

@@ -13,6 +13,7 @@ fi
 uv venv "$VENV_DIR" --python 3.12
 uv pip install --python "$VENV_DIR/bin/python" \
   --editable "$GRAPHITI_DIR" \
-  --editable "$GRAPHITI_DIR/server"
+  --editable "$GRAPHITI_DIR/server" \
+  "langsmith>=0.1.108"
 
 echo "Graphiti installed in $VENV_DIR"

@@ -1,4 +1,4 @@
-import type { AskResult, ConceptDetail, GraphData, Project, SessionDetail } from './types'
+import type { AskResult, ConceptDetail, GraphData, SessionDetail } from './types'
 import { supabase } from '../../supabaseClient'
 
 const BASE = '/api'
@@ -57,11 +57,6 @@ async function jsonOrThrow(r: Response): Promise<unknown> {
   throw new ApiError(r.status, detail || `요청에 실패했습니다 (${r.status})`)
 }
 
-export async function listProjects(): Promise<Project[]> {
-  const body = (await jsonOrThrow(await req('/projects'))) as { projects?: Project[] }
-  return Array.isArray(body?.projects) ? body.projects : []
-}
-
 export async function getGraph(project: string): Promise<GraphData> {
   return (await jsonOrThrow(await req(`/graph?project=${encodeURIComponent(project)}`))) as GraphData
 }
@@ -73,27 +68,6 @@ export async function ask(project: string, q: string): Promise<AskResult> {
   return (await jsonOrThrow(
     await req(`/ask?project=${encodeURIComponent(project)}&q=${encodeURIComponent(q)}&k=6`),
   )) as AskResult
-}
-
-export async function ingestText(
-  project: string,
-  title: string,
-  text: string,
-  signal?: AbortSignal,
-  name?: string,
-): Promise<unknown> {
-  // `signal` lets the upload modal's 취소 abort the in-flight request. (The server
-  // may still finish the ingest — cancel means "stop waiting," not "undo.")
-  // `name` = human display name for a NEW project (stored server-side so every
-  // device/teammate sees the Korean name instead of the ASCII group_id slug).
-  const payload: Record<string, unknown> = { project, title, text }
-  if (name && name.trim()) payload.name = name.trim()
-  return jsonOrThrow(await req('/ingest-text', { body: JSON.stringify(payload), signal }, 'POST'))
-}
-
-/** Set/rename a project's human display name (fixes an existing slug project). */
-export async function setProjectName(project: string, name: string): Promise<void> {
-  await jsonOrThrow(await req('/project-name', { body: JSON.stringify({ project, name }) }, 'POST'))
 }
 
 // ── 상세 조회 (concept/session) ─────────────────────────────

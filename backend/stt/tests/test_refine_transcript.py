@@ -7,9 +7,11 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))  # repo roo
 import pytest
 
 from backend.stt.refine_transcript import (
+    _chunk_segments,
     _chunk_text,
     _parse_llm_output,
     build_refinement_prompt,
+    refine_transcript,
     retrieve_relevant_context,
 )
 
@@ -85,6 +87,71 @@ def test_chunk_text_empty_returns_empty_list():
     assert _chunk_text(None) == []
     assert _chunk_text("") == []
     assert _chunk_text("   ") == []
+
+
+def test_chunk_segments_keeps_ids_and_caps_batch_size():
+    segments = [
+        {"id": index, "speaker": "A", "text": f"segment {index}"}
+        for index in range(125)
+    ]
+
+    batches = _chunk_segments(segments, max_segments=60, max_chars=100_000)
+
+    assert [len(batch) for batch in batches] == [60, 60, 5]
+    assert [segment["id"] for batch in batches for segment in batch] == list(range(125))
+
+
+class _FakeCompletionResponse:
+    def __init__(self, content):
+        self.choices = [
+            type("Choice", (), {"message": type("Message", (), {"content": content})()})()
+        ]
+
+
+class _FakeRefinementClient:
+    def __init__(self):
+        self.batch_ids = []
+        self.chat = type("Chat", (), {})()
+        self.chat.completions = self
+
+    def create(self, **request):
+        prompt = request["messages"][0]["content"]
+        transcript = prompt.split("# 전사문 세그먼트 (JSON)\n", 1)[1].split(
+            "\n\n# 출력 형식", 1
+        )[0]
+        segments = json.loads(transcript)
+        ids = [segment["id"] for segment in segments]
+        self.batch_ids.append(ids)
+        return _FakeCompletionResponse(json.dumps({
+            "segments": [
+                {"id": segment["id"], "text": f"{segment['text']} 교정"}
+                for segment in segments
+            ],
+        }, ensure_ascii=False))
+
+
+def test_refine_transcript_splits_large_transcript_and_merges_in_order():
+    segments = [
+        {
+            "id": index,
+            "speaker": "A",
+            "start": float(index),
+            "end": float(index + 1),
+            "text": f"원문 {index}",
+        }
+        for index in range(125)
+    ]
+    client = _FakeRefinementClient()
+
+    result = refine_transcript(
+        {"source": "lecture.wav", "segments": segments},
+        material_text="강의 자료",
+        client=client,
+    )
+
+    assert [len(ids) for ids in client.batch_ids] == [60, 60, 5]
+    assert [segment["id"] for segment in result["segments"]] == list(range(125))
+    assert result["segments"][124]["text"] == "원문 124 교정"
 
 
 class _FakeVectorStore:

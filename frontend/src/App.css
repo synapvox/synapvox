@@ -779,6 +779,36 @@ button {
   width: min(500px, 100%);
 }
 
+.project-delete-modal {
+  width: min(460px, 100%);
+}
+
+.project-delete-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 22px;
+}
+
+.project-delete-actions button {
+  min-height: 44px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fffdf7;
+  color: var(--ink);
+  font-weight: 800;
+}
+
+.project-delete-actions button.danger {
+  border-color: #9d5548;
+  background: #8f493e;
+  color: #fffaf3;
+}
+
+.project-delete-actions button:disabled {
+  opacity: 0.58;
+}
+
 .feedback-form,
 .project-create-form {
   margin-top: 20px;
@@ -3740,6 +3770,154 @@ h3 {
   background: #fffaf0;
 }
 
+.chat-session-menu {
+  position: absolute;
+  z-index: 20;
+  top: 64px;
+  right: 12px;
+  left: 12px;
+  max-height: min(430px, calc(100% - 84px));
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fffdf7;
+  box-shadow: 0 18px 38px rgba(62, 48, 31, 0.16);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.chat-session-menu-head {
+  flex: none;
+  min-height: 48px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px 8px 12px;
+}
+
+.chat-session-menu-head strong {
+  font-size: 0.86rem;
+}
+
+.chat-session-menu-head button {
+  min-height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fffaf0;
+  color: var(--ink);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 9px;
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.chat-session-list {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px;
+}
+
+.chat-session-item {
+  min-height: 42px;
+  border-radius: 6px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 34px;
+  align-items: center;
+  gap: 3px;
+}
+
+.chat-session-item + .chat-session-item {
+  margin-top: 2px;
+}
+
+.chat-session-item:hover,
+.chat-session-item.active {
+  background: #f4eee2;
+}
+
+.chat-session-select,
+.chat-session-delete {
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+}
+
+.chat-session-select {
+  min-width: 0;
+  height: 42px;
+  overflow: hidden;
+  padding: 0 8px;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.82rem;
+}
+
+.chat-session-delete {
+  width: 30px;
+  height: 30px;
+  border-radius: 5px;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+}
+
+.chat-session-delete:hover {
+  background: #e9dfd1;
+  color: #8d4037;
+}
+
+.chat-delete-confirm {
+  flex: none;
+  border-top: 1px solid var(--line);
+  background: #fff8ee;
+  padding: 12px;
+}
+
+.chat-delete-confirm > strong {
+  display: block;
+  font-size: 0.88rem;
+}
+
+.chat-delete-confirm > p {
+  margin: 4px 0 10px;
+  color: var(--muted);
+  font-size: 0.76rem;
+}
+
+.chat-delete-confirm > small {
+  display: block;
+  margin-bottom: 8px;
+  color: #9a4137;
+  font-size: 0.72rem;
+}
+
+.chat-delete-confirm > div {
+  display: flex;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
+.chat-delete-confirm button {
+  min-width: 58px;
+  height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fffdf7;
+  color: var(--ink);
+  font-weight: 800;
+}
+
+.chat-delete-confirm button.danger {
+  border-color: #8d4037;
+  background: #8d4037;
+  color: #fff;
+}
+
 .sources-collapsed .studio-sources .studio-panel-head {
   width: 100%;
   justify-content: center;
@@ -4874,7 +5052,7 @@ h3 {
   align-self: flex-start;
 }
 
-.chat-bubble span {
+.chat-bubble > span {
   display: block;
   margin-bottom: 5px;
   color: var(--muted);
@@ -4882,13 +5060,129 @@ h3 {
   font-weight: 900;
 }
 
-.chat-bubble.user span {
+.chat-bubble.user > span {
   color: #d8cbb8;
 }
 
 .chat-bubble p {
   line-height: 1.55;
   font-size: 0.9rem;
+}
+
+.chat-markdown {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  line-height: 1.55;
+  font-size: 0.9rem;
+}
+
+.chat-markdown > :first-child {
+  margin-top: 0;
+}
+
+.chat-markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.chat-markdown p,
+.chat-markdown ul,
+.chat-markdown ol,
+.chat-markdown blockquote,
+.chat-markdown pre,
+.chat-markdown table {
+  margin: 0 0 0.75em;
+}
+
+.chat-markdown ul,
+.chat-markdown ol {
+  padding-left: 1.35em;
+}
+
+.chat-markdown li + li {
+  margin-top: 0.25em;
+}
+
+.chat-markdown h1,
+.chat-markdown h2,
+.chat-markdown h3,
+.chat-markdown h4 {
+  margin: 1em 0 0.45em;
+  letter-spacing: 0;
+  line-height: 1.3;
+}
+
+.chat-markdown h1 {
+  font-size: 1.15rem;
+}
+
+.chat-markdown h2 {
+  font-size: 1.05rem;
+}
+
+.chat-markdown h3,
+.chat-markdown h4 {
+  font-size: 0.96rem;
+}
+
+.chat-markdown blockquote {
+  border-left: 3px solid var(--line);
+  padding-left: 0.8em;
+  color: var(--muted);
+}
+
+.chat-markdown code {
+  border-radius: 4px;
+  background: rgba(105, 94, 76, 0.1);
+  padding: 0.12em 0.32em;
+  font-family: "JetBrains Mono Variable", monospace;
+  font-size: 0.84em;
+}
+
+.chat-markdown pre {
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #f7f2e8;
+  padding: 0.75em;
+}
+
+.chat-markdown pre code {
+  background: transparent;
+  padding: 0;
+}
+
+.chat-markdown a {
+  color: #52634c;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.chat-markdown table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+
+.chat-markdown th,
+.chat-markdown td {
+  border: 1px solid var(--line);
+  padding: 0.4em 0.55em;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.chat-markdown .katex-display {
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  margin: 0.8em 0;
+  padding: 0.15em 0;
+}
+
+.chat-markdown .katex {
+  font-size: 1em;
 }
 
 .studio-chat-composer {

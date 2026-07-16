@@ -5,6 +5,7 @@ uvicorn[standard]
 python-dotenv
 requests
 openai
+langsmith>=0.1.108
 pypdf
 pdfplumber
 pymupdf

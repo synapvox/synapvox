@@ -4,10 +4,14 @@ import os
 from pathlib import Path
 
 from openai import OpenAI
+from langsmith import traceable
 
 from backend.graphrag import VectorStore
+from backend.observability import wrap_openai_client
 
 _MAX_RETRIES = 2
+_MAX_SEGMENTS_PER_REQUEST = 60
+_MAX_TRANSCRIPT_CHARS_PER_REQUEST = 12_000
 DEFAULT_REFINEMENT_MODEL = "gpt-5-mini"
 
 
@@ -34,6 +38,7 @@ def _chunk_text(text: str, chunk_size: int = 300) -> list:
     return chunks
 
 
+@traceable(name="STT material retrieval", run_type="retriever")
 def retrieve_relevant_context(
     query_text: str,
     project_id: str,
@@ -108,32 +113,62 @@ def _parse_llm_output(raw_content: str, expected_ids: set) -> dict:
 
     got_ids = {s["id"] for s in data["segments"]}
     if got_ids != expected_ids:
-        raise ValueError(f"segment id mismatch: expected {expected_ids}, got {got_ids}")
+        missing = sorted(expected_ids - got_ids)
+        unexpected = sorted(got_ids - expected_ids)
+        raise ValueError(
+            "segment id mismatch: "
+            f"missing={missing[:10]}{'...' if len(missing) > 10 else ''}, "
+            f"unexpected={unexpected[:10]}{'...' if len(unexpected) > 10 else ''}"
+        )
 
     return {s["id"]: s["text"] for s in data["segments"]}
 
 
-def refine_transcript(
-    data: dict,
-    material_text: str = None,
-    past_meeting_texts: list = None,
-    model: str = None,
-) -> dict:
-    """Apply stage-2 refinement to a 중간 포맷 JSON object (source/mode/segments shape).
-    Returns the same shape with segments[].text replaced by the corrected version."""
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-    model = model or refinement_model()
-    prompt = build_refinement_prompt(data["segments"], material_text, past_meeting_texts)
-    expected_ids = {s["id"] for s in data["segments"]}
+def _chunk_segments(
+    segments: list,
+    max_segments: int = _MAX_SEGMENTS_PER_REQUEST,
+    max_chars: int = _MAX_TRANSCRIPT_CHARS_PER_REQUEST,
+) -> list[list]:
+    """Split refinement requests without changing segment boundaries or IDs."""
+    batches: list[list] = []
+    current: list = []
+    current_chars = 0
+    for segment in segments:
+        segment_chars = len(str(segment.get("text") or "")) + 80
+        if current and (
+            len(current) >= max_segments
+            or current_chars + segment_chars > max_chars
+        ):
+            batches.append(current)
+            current = []
+            current_chars = 0
+        current.append(segment)
+        current_chars += segment_chars
+    if current:
+        batches.append(current)
+    return batches
 
-    messages = [{"role": "user", "content": prompt}]
-    corrections = None
+
+def _refine_segment_batch(
+    client,
+    model: str,
+    segments: list,
+    material_text: str | None,
+    past_meeting_texts: list | None,
+) -> dict:
+    prompt = build_refinement_prompt(segments, material_text, past_meeting_texts)
+    expected_ids = {segment["id"] for segment in segments}
     last_error = None
 
-    for _ in range(_MAX_RETRIES + 1):
+    for attempt in range(_MAX_RETRIES + 1):
+        retry_note = (
+            ""
+            if attempt == 0
+            else f"\n\n이전 응답 오류: {last_error}. 모든 id를 정확히 한 번씩 포함하세요."
+        )
         request = {
             "model": model,
-            "messages": messages,
+            "messages": [{"role": "user", "content": prompt + retry_note}],
             "response_format": {"type": "json_object"},
         }
         if model.startswith("gpt-5"):
@@ -141,15 +176,39 @@ def refine_transcript(
         response = client.chat.completions.create(**request)
         content = response.choices[0].message.content
         try:
-            corrections = _parse_llm_output(content, expected_ids)
-            break
-        except (json.JSONDecodeError, ValueError) as e:
-            last_error = str(e)
-            messages.append({"role": "assistant", "content": content})
-            messages.append({"role": "user", "content": f"오류: {last_error}. 형식을 정확히 지켜 다시 출력하세요."})
+            return _parse_llm_output(content, expected_ids)
+        except (json.JSONDecodeError, ValueError) as exc:
+            last_error = str(exc)
 
-    if corrections is None:
-        raise RuntimeError(f"LLM refinement failed after {_MAX_RETRIES + 1} attempts: {last_error}")
+    raise RuntimeError(
+        f"LLM refinement batch failed after {_MAX_RETRIES + 1} attempts: {last_error}"
+    )
+
+
+@traceable(name="Stage 2 transcript refinement", run_type="chain")
+def refine_transcript(
+    data: dict,
+    material_text: str = None,
+    past_meeting_texts: list = None,
+    model: str = None,
+    client=None,
+) -> dict:
+    """Apply stage-2 refinement to a 중간 포맷 JSON object (source/mode/segments shape).
+    Returns the same shape with segments[].text replaced by the corrected version."""
+    client = client or wrap_openai_client(OpenAI(api_key=os.environ["OPENAI_API_KEY"]))
+    model = model or refinement_model()
+    batches = _chunk_segments(data["segments"])
+    corrections: dict = {}
+    for batch in batches:
+        corrections.update(
+            _refine_segment_batch(
+                client,
+                model,
+                batch,
+                material_text,
+                past_meeting_texts,
+            )
+        )
 
     refined_segments = [{**seg, "text": corrections[seg["id"]]} for seg in data["segments"]]
     return {**data, "segments": refined_segments}

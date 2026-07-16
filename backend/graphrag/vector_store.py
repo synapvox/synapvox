@@ -44,7 +44,9 @@ def openai_embed(text: str, model: str = "text-embedding-3-small") -> list[float
     global _openai_client
     if _openai_client is None:
         from openai import OpenAI
-        _openai_client = OpenAI()
+        from backend.observability import wrap_openai_client
+
+        _openai_client = wrap_openai_client(OpenAI())
     return _openai_client.embeddings.create(model=model, input=text or "").data[0].embedding
 
 

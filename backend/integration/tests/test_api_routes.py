@@ -39,7 +39,7 @@ def test_project_can_move_to_and_restore_from_trash(monkeypatch):
     assert calls == [("test-user", "p-1", True), ("test-user", "p-1", False)]
 
 
-def test_permanent_project_delete_resets_graphiti_before_database(monkeypatch):
+def test_permanent_project_delete_cleans_graphiti_and_database(monkeypatch):
     calls = []
 
     class _Graphiti:
@@ -61,7 +61,50 @@ def test_permanent_project_delete_resets_graphiti_before_database(monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["storage_paths"] == ["user/project/file.pdf"]
-    assert calls == [("graphiti", "p-1"), ("database", "p-1")]
+    assert set(calls) == {("graphiti", "p-1"), ("database", "p-1")}
+
+
+def test_permanent_project_delete_succeeds_when_graphiti_cleanup_fails(monkeypatch):
+    class _Graphiti:
+        def reset(self, project):
+            raise RuntimeError("graph offline")
+
+    monkeypatch.setattr(api_main, "_owned_project_record", lambda user, project: {
+        "id": project, "name": "강의", "trashed_at": "2026-07-16",
+    })
+    monkeypatch.setattr(api_main, "_gsvx_client", lambda: _Graphiti())
+    monkeypatch.setattr(
+        api_main,
+        "_delete_project_rows",
+        lambda user, project: ["user/project/file.pdf"],
+    )
+
+    response = TestClient(app).delete("/api/projects/p-1")
+
+    assert response.status_code == 200
+    assert response.json()["database_deleted"] is True
+    assert response.json()["graph_deleted"] is False
+    assert response.json()["warnings"]
+
+
+def test_permanent_project_delete_succeeds_when_only_graphiti_data_exists(monkeypatch):
+    class _Graphiti:
+        def reset(self, project):
+            return {"success": True, "nodes_deleted": 3}
+
+    monkeypatch.setattr(api_main, "_owned_project_record", lambda user, project: None)
+    monkeypatch.setattr(api_main, "_gsvx_client", lambda: _Graphiti())
+
+    def missing_database(user, project):
+        raise LookupError("project not found")
+
+    monkeypatch.setattr(api_main, "_delete_project_rows", missing_database)
+
+    response = TestClient(app).delete("/api/projects/p-1")
+
+    assert response.status_code == 200
+    assert response.json()["graph_deleted"] is True
+    assert response.json()["database_deleted"] is False
 
 
 def test_permanent_project_delete_requires_trash(monkeypatch):
@@ -233,8 +276,8 @@ def test_api_ask_stream_post_uses_graphiti_question(monkeypatch):
     captured = {}
 
     class _Graphiti:
-        def ask(self, project, question, k, meeting_id=None):
-            captured.update(project=project, question=question, k=k, meeting_id=meeting_id)
+        def ask(self, project, question, k, meeting_id=None, history=None):
+            captured.update(project=project, question=question, k=k, meeting_id=meeting_id, history=history)
             return {"answer": "이전 대화를 이어서 답변", "hits": [], "expansion": {"nodes": [], "edges": []}}
 
     monkeypatch.setattr(api_main, "_gsvx_client", lambda: _Graphiti())
@@ -252,7 +295,16 @@ def test_api_ask_stream_post_uses_graphiti_question(monkeypatch):
     )
 
     assert response.status_code == 200
-    assert captured == {"project": "project-uuid", "question": "그럼 제약은?", "k": 6, "meeting_id": None}
+    assert captured == {
+        "project": "project-uuid",
+        "question": "그럼 제약은?",
+        "k": 6,
+        "meeting_id": None,
+        "history": [
+            {"role": "user", "text": "KKT가 뭐야?"},
+            {"role": "assistant", "text": "최적화의 필요 조건입니다."},
+        ],
+    }
 
 
 def test_api_ask_stream_post_threads_meeting_id(monkeypatch):
@@ -304,11 +356,11 @@ def test_delete_source_removes_owned_graphiti_episodes(monkeypatch):
 
     class _Graphiti:
         def find_episode_ids(self, project, **kwargs):
-            return []
+            raise AssertionError("stored episode IDs must skip compatibility lookups")
 
-        def delete_episode(self, episode_id):
-            deleted.append(episode_id)
-            return {"success": True}
+        def delete_episodes(self, episode_ids):
+            deleted.extend(episode_ids)
+            return {"success": True, "episodes_deleted": 2, "entities_deleted": 3}
 
     monkeypatch.setattr(api_main, "_owned_source_record", lambda user, source_id: source)
     monkeypatch.setattr(api_main, "_owned_source_bundle_records", lambda user, record: [record])
@@ -317,4 +369,82 @@ def test_delete_source_removes_owned_graphiti_episodes(monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["episodes_deleted"] == 2
+    assert response.json()["orphan_entities_deleted"] == 3
     assert set(deleted) == {"episode-1", "episode-2"}
+
+
+def test_delete_source_everywhere_uses_hints_when_database_row_is_missing(monkeypatch):
+    deleted = []
+
+    class _Graphiti:
+        def find_episode_ids(self, project, **kwargs):
+            assert project == "project-uuid"
+            return ["episode-orphan"]
+
+        def delete_episodes(self, episode_ids):
+            deleted.extend(episode_ids)
+            return {"success": True, "episodes_deleted": 1, "entities_deleted": 2}
+
+    monkeypatch.setattr(api_main, "_owned_source_record", lambda user, source_id: None)
+    monkeypatch.setattr(api_main, "_gsvx_client", lambda: _Graphiti())
+    monkeypatch.setattr(
+        api_main,
+        "_delete_source_rows",
+        lambda user, source, recording: {
+            "storage_paths": [],
+            "sources_deleted": 0,
+            "transcripts_deleted": 0,
+        },
+    )
+
+    response = TestClient(app).delete(
+        "/api/sources/source-missing",
+        params={
+            "project_id": "project-uuid",
+            "meeting_id": "meeting-1",
+            "title": "lecture.wav",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["graph_deleted"] is True
+    assert response.json()["database_deleted"] is False
+    assert deleted == ["episode-orphan"]
+
+
+def test_delete_source_everywhere_keeps_database_success_when_graphiti_fails(monkeypatch):
+    source = {
+        "id": "source-1",
+        "project_id": "project-uuid",
+        "recording_id": None,
+        "kind": "document",
+        "original_name": "notes.pdf",
+        "source_payload": {"graphEpisodeIds": ["episode-1"]},
+    }
+
+    class _Graphiti:
+        def delete_episodes(self, episode_ids):
+            raise RuntimeError("graph offline")
+
+    monkeypatch.setattr(api_main, "_owned_source_record", lambda user, source_id: source)
+    monkeypatch.setattr(api_main, "_owned_source_bundle_records", lambda user, record: [record])
+    monkeypatch.setattr(api_main, "_gsvx_client", lambda: _Graphiti())
+    monkeypatch.setattr(
+        api_main,
+        "_delete_source_rows",
+        lambda user, source_id, recording_id: {
+            "storage_paths": ["user/project/notes.pdf"],
+            "sources_deleted": 1,
+            "transcripts_deleted": 0,
+        },
+    )
+
+    response = TestClient(app).delete(
+        "/api/sources/source-1",
+        params={"project_id": "project-uuid"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["database_deleted"] is True
+    assert response.json()["graph_deleted"] is False
+    assert response.json()["storage_paths"] == ["user/project/notes.pdf"]

@@ -16,6 +16,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import requests
+from langsmith import traceable
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -29,6 +30,7 @@ _stt_pkg = sys.modules.setdefault("backend.stt", types.ModuleType("backend.stt")
 _stt_pkg.__path__ = [str(REPO_ROOT / "backend" / "stt")]
 
 from backend.integration.pipeline import chunk_document, chunk_transcript, extract_text  # noqa: E402
+from backend.observability import wrap_openai_client  # noqa: E402
 from backend.stt.stt_normalizer import validate  # noqa: E402
 
 # gsvx /ingest-text 본문 상한은 50,000자(_MAX_TEXT_CHARS, 초과 시 413) — 여유를 두고 자른다.
@@ -59,8 +61,11 @@ def transcript_to_text(im: dict) -> str:
 
 def transcript_title(im: dict) -> str:
     """gsvx 세션(에피소드) 제목 — 그래프 뷰·타임라인에 그대로 표시된다."""
+    source_name = Path(str(im.get("source") or "")).name.strip()
+    if source_name:
+        return source_name
     mode = "강의" if im.get("mode") == "lecture" else "회의"
-    return f"{im['date']} {mode} 전사 ({im['meeting_id']})"
+    return f"{im['date']} {mode} 전사"
 
 
 def document_title(stem: str, meeting_id: str | None = None) -> str:
@@ -164,6 +169,7 @@ class GsvxClient:
         """공식 Graphiti `/messages`에 한 에피소드를 넣는다."""
         return self.ingest_texts([text], title, project=project, name=name)
 
+    @traceable(name="Graphiti episode ingest", run_type="chain")
     def ingest_texts(self, texts: list[str], title: str, project: str | None = None,
                      name: str | None = None) -> dict:
         """여러 청크를 한 요청으로 보내 Graphiti의 벌크 적재 경로를 사용한다."""
@@ -228,7 +234,15 @@ class GsvxClient:
                 ).data()
         return {"nodes": nodes, "edges": edges}
 
-    def ask(self, project: str, question: str, k: int = 6, meeting_id: str | None = None) -> dict:
+    @traceable(name="SynapVox AI chat", run_type="chain")
+    def ask(
+        self,
+        project: str,
+        question: str,
+        k: int = 6,
+        meeting_id: str | None = None,
+        history: list[dict] | None = None,
+    ) -> dict:
         """meeting_id(선택)를 주면 graphiti_host의 /search가 이 미팅의 에피소드에서 나온
         사실로만 결과를 좁힌다 — group_id는 그대로 프로젝트 단위라 세션 간 엔티티 중복
         제거(dedup)는 안 깨진다(dedup은 group_id 스코프라서, 미팅별 group_id로 쪼개면
@@ -239,8 +253,13 @@ class GsvxClient:
         search = self._request("POST", "/search", body=body)
         facts = search.get("facts") if isinstance(search.get("facts"), list) else []
         expansion = self._expansion_for_facts(project, facts)
+        answer = (
+            self._answer_from_facts(question, facts, history=history)
+            if history
+            else self._answer_from_facts(question, facts)
+        )
         return {
-            "answer": self._answer_from_facts(question, facts),
+            "answer": answer,
             "hits": facts,
             "expansion": expansion,
         }
@@ -292,6 +311,21 @@ class GsvxClient:
 
     def delete_episode(self, episode_id: str) -> dict:
         return self._request("DELETE", f"/episode/{quote(episode_id, safe='')}")
+
+    def delete_episodes(self, episode_ids: list[str]) -> dict:
+        if not episode_ids:
+            return {"success": True, "episodes_deleted": 0, "entities_deleted": 0}
+        return self._request(
+            "POST",
+            "/episodes/delete",
+            body={"episode_ids": list(dict.fromkeys(episode_ids))},
+        )
+
+    def prune_orphans(self, project: str) -> dict:
+        return self._request(
+            "DELETE",
+            f"/group/{quote(project, safe='')}/orphans",
+        )
 
     def find_episode_ids(self, project: str, *, meeting_id: str | None = None,
                          title: str | None = None) -> list[str]:
@@ -373,7 +407,12 @@ class GsvxClient:
         return {"nodes": list(nodes.values()), "edges": edges}
 
     @staticmethod
-    def _answer_from_facts(question: str, facts: list[dict]) -> str:
+    @traceable(name="AI answer from Graphiti facts", run_type="chain")
+    def _answer_from_facts(
+        question: str,
+        facts: list[dict],
+        history: list[dict] | None = None,
+    ) -> str:
         if not facts:
             return "현재 과목 자료에서 질문과 관련된 근거를 찾지 못했습니다."
         from openai import OpenAI
@@ -381,7 +420,13 @@ class GsvxClient:
         evidence = "\n".join(
             f"- {fact.get('fact') or fact.get('name') or ''}" for fact in facts
         )
-        response = OpenAI(api_key=os.getenv("OPENAI_API_KEY")).chat.completions.create(
+        prior_messages = [
+            {"role": message["role"], "content": str(message.get("text") or "")}
+            for message in (history or [])[-20:]
+            if message.get("role") in {"user", "assistant"} and str(message.get("text") or "").strip()
+        ]
+        client = wrap_openai_client(OpenAI(api_key=os.getenv("OPENAI_API_KEY")))
+        response = client.chat.completions.create(
             model=os.getenv("GRAPHITI_ANSWER_MODEL") or DEFAULT_ANSWER_MODEL,
             temperature=0.2,
             messages=[
@@ -393,11 +438,13 @@ class GsvxClient:
                         "블록 $$...$$ LaTeX로 작성하세요. 근거가 부족하면 명확히 알리세요."
                     ),
                 },
+                *prior_messages,
                 {"role": "user", "content": f"질문: {question}\n\nGraphiti 근거:\n{evidence}"},
             ],
         )
         return response.choices[0].message.content or "답변을 생성하지 못했습니다."
 
+    @traceable(name="STT transcript to Graphiti", run_type="chain")
     def ingest_transcript(self, im: dict, project: str | None = None) -> dict:
         """STT 중간포맷 dict → gsvx 세션(들). project 미지정 시 중간포맷의 project_id 사용.
 
@@ -411,6 +458,7 @@ class GsvxClient:
             [chunk["text"] for chunk in chunks],
             transcript_title(im),
             project=project or im.get("project_id"),
+            source_description=f"meeting:{im['meeting_id']}",
         )
 
     def ingest_document(self, path: Path | str, project: str | None = None,
@@ -425,6 +473,7 @@ class GsvxClient:
             raise ValueError(f"텍스트를 추출하지 못했습니다 (지원: pdf/pptx/docx/md/txt): {path.name}")
         return self.ingest_document_text(text, title or path.stem, project=project, meeting_id=meeting_id)
 
+    @traceable(name="Course material to Graphiti", run_type="chain")
     def ingest_document_text(self, text: str, title: str, project: str | None = None,
                              meeting_id: str | None = None) -> dict:
         """이미 추출된 자료 평문 → gsvx 세션(들). API 릴레이(api/main.py)가 사용."""
@@ -436,11 +485,21 @@ class GsvxClient:
             project=project,
         )
 
-    def _ingest_chunks(self, chunks: list[str], title: str,
-                       project: str | None = None) -> dict:
+    def _ingest_chunks(
+        self,
+        chunks: list[str],
+        title: str,
+        project: str | None = None,
+        source_description: str | None = None,
+    ) -> dict:
         if not chunks:
             raise ValueError("빈 텍스트는 그래프에 넣을 수 없습니다.")
-        result = self.ingest_texts(chunks, title, project=project)
+        result = self.ingest_texts(
+            chunks,
+            title,
+            project=project,
+            name=source_description,
+        )
         stats = result.get("stats", {})
         return {
             "chunks_ingested": len(chunks),

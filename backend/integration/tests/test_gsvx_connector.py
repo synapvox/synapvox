@@ -47,11 +47,14 @@ def test_transcript_to_text_rejects_broken_intermediate():
         transcript_to_text(broken)
 
 
-def test_transcript_title_reflects_mode():
-    assert transcript_title(_intermediate()) == "2026-07-15 회의 전사 (M01)"
-    lecture = _intermediate()
-    lecture["mode"] = "lecture"
-    assert "강의" in transcript_title(lecture)
+def test_transcript_title_uses_original_audio_filename():
+    assert transcript_title(_intermediate()) == "meeting.m4a"
+
+
+def test_transcript_title_falls_back_when_source_is_missing():
+    transcript = _intermediate()
+    transcript["source"] = ""
+    assert transcript_title(transcript) == "2026-07-15 회의 전사"
 
 
 def test_document_title_appends_meeting_id_when_given():
@@ -286,3 +289,51 @@ def test_ask_includes_meeting_id_in_search_body_when_given(monkeypatch):
 
     client.ask("project-uuid", "질문", 6)  # meeting_id 생략 시 기존과 동일(필드 자체가 없음)
     assert "meeting_id" not in calls[1]
+
+
+def test_prune_orphans_uses_project_scoped_graphiti_route(monkeypatch):
+    calls = []
+
+    class _FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"success": True, "entities_deleted": 2}
+
+    def fake_request(method, url, **kwargs):
+        calls.append((method, url))
+        return _FakeResponse()
+
+    monkeypatch.setattr(gsvx_connector.requests, "request", fake_request)
+    result = GsvxClient(base_url="https://graphiti.example").prune_orphans("project/uuid")
+
+    assert result["entities_deleted"] == 2
+    assert calls == [("DELETE", "https://graphiti.example/group/project%2Fuuid/orphans")]
+
+
+def test_delete_episodes_uses_one_bulk_request(monkeypatch):
+    calls = []
+
+    class _FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"success": True, "episodes_deleted": 2, "entities_deleted": 4}
+
+    def fake_request(method, url, **kwargs):
+        calls.append((method, url, kwargs.get("json")))
+        return _FakeResponse()
+
+    monkeypatch.setattr(gsvx_connector.requests, "request", fake_request)
+    result = GsvxClient(base_url="https://graphiti.example").delete_episodes(
+        ["episode-2", "episode-1", "episode-2"]
+    )
+
+    assert result["episodes_deleted"] == 2
+    assert calls == [(
+        "POST",
+        "https://graphiti.example/episodes/delete",
+        {"episode_ids": ["episode-2", "episode-1"]},
+    )]

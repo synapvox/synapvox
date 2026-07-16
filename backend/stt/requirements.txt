@@ -5,6 +5,7 @@ pyannote.audio
 kiwipiepy
 requests
 openai
+langsmith>=0.1.108
 pdfplumber
 pymupdf
 # refine_transcript.py가 backend.graphrag.VectorStore를 씀 (backend/graphrag/requirements.txt와 동일)
