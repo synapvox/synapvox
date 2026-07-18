@@ -1,3 +1,5 @@
 {"id": "q-001", "question": "경사하강법에서 학습률이 너무 크면 어떻게 되는가?", "question_type": "causal", "gold_answer": "손실이 수렴하지 않고 진동하거나 발산할 수 있다.", "gold_sources": ["3주차 강의.m4a"], "gold_concepts": ["경사하강법", "학습률", "발산"]}
 {"id": "q-002", "question": "경사하강법과 학습률의 관계를 설명해줘.", "question_type": "relation", "gold_answer": "학습률은 경사하강법이 한 번에 이동하는 보폭을 결정한다.", "gold_sources": ["3주차 강의.m4a", "3장 슬라이드.pdf"], "gold_concepts": ["경사하강법", "학습률"]}
 {"id": "q-003", "question": "이 강의에서 트랜스포머를 다뤘나?", "question_type": "abstain", "gold_answer": "다루지 않았다 — 근거 없음을 명확히 답해야 한다.", "gold_sources": [], "gold_concepts": []}
+{"id": "q-004", "question": "지금 기본 링크 함수는 무엇인가?", "question_type": "temporal", "temporal_kind": "current", "gold_answer": "probit", "gold_sources": ["개정판 노트"], "gold_concepts": ["링크 함수"]}
+{"id": "q-005", "question": "처음에 기본 링크 함수는 무엇이었나?", "question_type": "temporal", "temporal_kind": "historical", "gold_answer": "logit", "gold_sources": ["초판 노트"], "gold_concepts": ["링크 함수"]}

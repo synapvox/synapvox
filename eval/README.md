@@ -22,8 +22,39 @@ python eval/run_eval.py --project <group_id>
 - judge 모델: 기본 `gpt-5-mini`, `EVAL_JUDGE_MODEL` 환경변수 또는 `--judge-model`로 변경
 - 결과: `eval/results/<날짜>_<커밋>.json` — 지표 + 게이트 판정 + **실패 사례 원문**(질문·답변·근거·사유)
 
-## 골드셋 작성
+## 구조 — 코드와 데이터셋 분리
 
-`goldset.jsonl` — 현재 내용은 **파일럿 예시 3문항**(계획서 §2의 예시 그대로)이므로,
-실제 적재된 강의 기준으로 교체해야 한다. 형식·유형 분포·제작 절차는 계획서 §2 참조.
-`--resolve-only`로 파일명 매칭을 먼저 확인할 것.
+```
+eval/
+  run_eval.py        # 하네스 (§3)
+  judge_prompts.py   # LLM-as-judge 프롬프트
+  ingest_ch4.py      # 평가 코퍼스 적재 (§2.5·§5-0)
+  dataset/
+    goldset.jsonl            # 골드셋 47문항 (아래)
+    goldset_selftest.jsonl   # --self-test 전용 고정 파일럿(5문항) — 건드리지 말 것
+    scripts/                 # Chapter 4 합성 대본 5개 (평가 재현용 — 합성이라 커밋 포함)
+  results/           # 실행 결과 JSON (커밋 제외)
+```
+
+## 골드셋
+
+`dataset/goldset.jsonl` — **Chapter 4 대본(범주형 데이터·로지스틱 회귀) 기준 47문항**:
+definition 10 · relation 10 · multi_hop 10 · causal 5 · temporal 6 · global 3 · abstain 3.
+평가 대상은 **평가 전용 프로젝트 `p-eval-ch4`** (2026-07-19 적재 완료, 세션 5개).
+형식·유형 분포·제작 절차는 계획서 §2 참조. 문항 수정 후 `--resolve-only`로 파일명 매칭을 확인할 것.
+
+## 평가 코퍼스 적재 (§2.5·§5-0)
+
+대본 5개(4.1~4.4 본 강의 = T1, 4.5 보강 정정공지 = T2)를 content_date 지정으로 적재한다
+(4.1~4.4는 2026-03-02~03-23 주차별, 4.5는 2026-05-11 — §0.5: 생략 시 now()로 덮임):
+
+```bash
+python eval/ingest_ch4.py --project <group_id>   # 대본은 기본 eval/dataset/scripts/
+```
+
+- temporal 6문항(q-t01~06)은 4.5의 **명시적 갱신 신호** 3종(logit→probit, OR→RR,
+  카이제곱→Fisher) × current/historical. `temporal_kind` 필드로 구분, 집계는
+  current(갱신 반영)/historical(과거 보존) 분리 (§1① temporal 정확도).
+- ⚠️ abstain·global 문항이 "이 코퍼스가 전부"임을 전제하므로 **빈 평가 전용 프로젝트**에
+  적재할 것 — 다른 강의와 섞이면 문항이 오염된다. 4.5는 합성 '정정'이라 실사용
+  프로젝트 적재 금지, 결과 보고 시 "설계된 시간 테스트" 명시 (§6).

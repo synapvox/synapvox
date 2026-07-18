@@ -54,6 +54,9 @@ def load_goldset(path: Path) -> list[dict]:
             raise ValueError(f"goldset {line_no}행: 알 수 없는 question_type '{item['question_type']}'")
         if item["question_type"] in RETRIEVAL_EXEMPT and item["gold_sources"]:
             raise ValueError(f"goldset {line_no}행: {item['question_type']} 문항은 gold_sources가 비어야 함")
+        if item["question_type"] == "temporal" and item.get("temporal_kind") not in ("current", "historical"):
+            raise ValueError(
+                f"goldset {line_no}행: temporal 문항은 temporal_kind(current|historical)가 필요함 (§2.5)")
         items.append(item)
     return items
 
@@ -158,6 +161,9 @@ def judge_item(item: dict, answer: str, hits: list[dict], judge) -> dict:
     claims = [claim for claim in faith.get("claims", []) if isinstance(claim, dict)]
     result["claims_total"] = len(claims)
     result["claims_supported"] = sum(1 for claim in claims if claim.get("supported"))
+    # Citation Recall(§1②): 근거가 필요한 주장(=분해된 주장) 중 인용이 달린 비율 —
+    # 주장 분해를 이미 하는 faithfulness judge가 cited를 함께 판정
+    result["claims_cited"] = sum(1 for claim in claims if claim.get("cited"))
     result["unsupported_claims"] = [
         {"claim": claim.get("claim", ""), "reason": claim.get("reason", "")}
         for claim in claims if not claim.get("supported")
@@ -207,6 +213,9 @@ def aggregate(records: list[dict]) -> dict:
             "citation_precision": _ratio(
                 sum(r.get("citations_supported", 0) for r in judged),
                 sum(r.get("citations_total", 0) for r in judged)),
+            "citation_recall": _ratio(
+                sum(r.get("claims_cited", 0) for r in judged),
+                sum(r.get("claims_total", 0) for r in judged)),
             "abstain_accuracy": _ratio(
                 sum(1 for r in abstains if r.get("abstained_ok")), len(abstains)),
         }
@@ -214,6 +223,12 @@ def aggregate(records: list[dict]) -> dict:
     by_type: dict[str, list[dict]] = {}
     for record in records:
         by_type.setdefault(record["question_type"], []).append(record)
+    # temporal 정확도(§1①): 단순 Hit이 아니라 "올바른 시점의 근거를 집었는가" —
+    # current(T2)/historical(T1)을 나눠 집계
+    for kind in ("current", "historical"):
+        group = [r for r in by_type.get("temporal", []) if r.get("temporal_kind") == kind]
+        if group:
+            by_type[f"temporal({kind})"] = group
     return {
         "overall": summarize(records),
         "by_type": {qtype: summarize(group) for qtype, group in sorted(by_type.items())},
@@ -303,6 +318,7 @@ def run(project: str, goldset_path: Path, k: int, judge_model: str,
         record = {
             "id": item["id"],
             "question_type": item["question_type"],
+            "temporal_kind": item.get("temporal_kind"),
             "question": item["question"],
             "answer": answer,
             "evidence": evidence_block(hits),
@@ -325,6 +341,7 @@ def run(project: str, goldset_path: Path, k: int, judge_model: str,
             "judge_model": judge_model if not skip_judge else None,
             "answer_model": os.getenv("GRAPHITI_ANSWER_MODEL") or "gpt-4o-mini",
             "graph_sessions": len(session_titles),  # 재현성: 평가 시점 그래프 상태 (§6)
+            "graph_session_titles": sorted(session_titles),  # §6 "적재된 강의 목록" 기록
             "goldset_unresolved": unresolved,
         },
         "metrics": metrics,
@@ -336,7 +353,7 @@ def run(project: str, goldset_path: Path, k: int, judge_model: str,
 
 def print_report(result: dict) -> None:
     print("\n== 지표 (유형별, n 병기) ==")
-    header = f"{'유형':<14}{'n':>3}{'hit':>7}{'mrr':>7}{'정답':>6}{'충실':>7}{'인용':>7}{'기권':>7}"
+    header = f"{'유형':<14}{'n':>3}{'hit':>7}{'mrr':>7}{'정답':>6}{'충실':>7}{'인용P':>7}{'인용R':>7}{'기권':>7}"
     print(header)
 
     def row(name: str, m: dict) -> str:
@@ -346,7 +363,8 @@ def print_report(result: dict) -> None:
             return f"{value:.0%}" if pct else f"{value}"
         return (f"{name:<14}{m['n']:>3}{fmt(m['hit_rate']):>7}"
                 f"{fmt(m['mrr']):>7}{m['correctness_avg'] if m['correctness_avg'] is not None else '-':>6}"
-                f"{fmt(m['faithfulness']):>7}{fmt(m['citation_precision']):>7}{fmt(m['abstain_accuracy']):>7}")
+                f"{fmt(m['faithfulness']):>7}{fmt(m['citation_precision']):>7}"
+                f"{fmt(m['citation_recall']):>7}{fmt(m['abstain_accuracy']):>7}")
 
     print(row("전체", result["metrics"]["overall"]))
     for qtype, m in result["metrics"]["by_type"].items():
@@ -379,6 +397,8 @@ def self_test() -> None:
             return {"nodes": [
                 {"id": "u1", "type": "session", "label": "3주차 강의.m4a"},
                 {"id": "u2", "type": "session", "label": "3장 슬라이드 (M01)"},
+                {"id": "u3", "type": "session", "label": "초판 노트"},
+                {"id": "u4", "type": "session", "label": "개정판 노트"},
             ]}
 
         def ask(self, project, question, k):
@@ -390,29 +410,43 @@ def self_test() -> None:
                 return {"answer": "보폭을 결정한다 [1]", "hits": [
                     {"fact": "무관한 fact", "sources": [{"title": "다른 자료.pdf"}]},
                 ]}
+            if "처음" in question:  # q-005: 시점 miss + 인용 없는 답 (citation recall 저하 검증)
+                return {"answer": "probit이 기본이다", "hits": [
+                    {"fact": "기본 링크를 probit으로 교체", "sources": [{"title": "개정판 노트"}]},
+                ]}
+            if "링크" in question:  # q-004: 올바른 시점(T2) 회수 — current hit
+                return {"answer": "probit이 기본이다 [1]", "hits": [
+                    {"fact": "기본 링크를 probit으로 교체", "sources": [{"title": "개정판 노트"}]},
+                ]}
             return {"answer": "자료에 근거가 없어 답할 수 없습니다.", "hits": []}  # q-003: 기권
 
     def _fake_judge(system: str, user: str) -> dict:
+        ok = "발산" in user or "probit" in user  # q-001·temporal만 지지/정답 (q-002는 실패 유지)
         if "기권 판정자" in system:
             return {"abstained": "없어" in user or "없습니다" in user, "reason": "기권 표현"}
         if "인용 검증자" in system:
-            supported = "발산" in user  # q-001만 지지되는 인용
-            return {"citations": [{"n": 1, "claim": "…", "supported": supported, "reason": "대조"}]}
+            return {"citations": [{"n": 1, "claim": "…", "supported": ok, "reason": "대조"}]}
         if "검증자" in system:
-            return {"claims": [{"claim": "…", "supported": "발산" in user, "reason": "대조"}]}
-        return {"score": 5 if "발산" in user else 3, "reason": "채점"}
+            cited = "[1]" in user.split("# 답변")[-1]  # 근거 목록의 [1] 말고 답변의 인용만
+            return {"claims": [{"claim": "…", "supported": ok, "cited": cited, "reason": "대조"}]}
+        return {"score": 5 if ok else 3, "reason": "채점"}
 
-    goldset = EVAL_DIR / "goldset.jsonl"
+    goldset = EVAL_DIR / "dataset" / "goldset_selftest.jsonl"  # 실골드셋과 무관한 고정 파일럿
     result = run("self-test-project", goldset, k=6, judge_model="fake",
                  client=_FakeClient(), judge=_fake_judge)
     overall = result["metrics"]["overall"]
-    assert overall["n"] == 3, overall
-    assert overall["hit_rate"] == 0.5, overall       # scored 2문항 중 q-001만 hit
-    assert overall["mrr"] == 0.5, overall            # (1/1 + 0) / 2
+    assert overall["n"] == 5, overall
+    assert overall["hit_rate"] == 0.5, overall       # scored 4문항 중 q-001·q-004 hit
+    assert overall["mrr"] == 0.5, overall            # (1 + 0 + 1 + 0) / 4
     assert overall["abstain_accuracy"] == 1.0, overall
+    assert overall["citation_recall"] == 0.75, overall  # 4개 주장 중 q-005만 인용 없음
     assert result["metrics"]["by_type"]["abstain"]["n"] == 1
+    # temporal 분리 집계(§1①) — current는 올바른 시점(T2) 회수, historical은 시점 오류로 miss
+    assert result["metrics"]["by_type"]["temporal"]["n"] == 2
+    assert result["metrics"]["by_type"]["temporal(current)"]["hit_rate"] == 1.0
+    assert result["metrics"]["by_type"]["temporal(historical)"]["hit_rate"] == 0.0
     failure_ids = [failure["id"] for failure in result["failures"]]
-    assert failure_ids == ["q-002"], failure_ids     # miss + unsupported + bad-citation
+    assert failure_ids == ["q-002", "q-005"], failure_ids  # q-002: miss+환각+나쁜인용 / q-005: 시점 miss
     print_report(result)
     print("\n✅ self-test 통과 — 하네스 배관 정상")
 
@@ -420,7 +454,7 @@ def self_test() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="RAG 평가 하네스 (rag-evaluation-plan.md §3)")
     parser.add_argument("--project", help="평가 대상 프로젝트 group_id")
-    parser.add_argument("--goldset", default=str(EVAL_DIR / "goldset.jsonl"))
+    parser.add_argument("--goldset", default=str(EVAL_DIR / "dataset" / "goldset.jsonl"))
     parser.add_argument("--k", type=int, default=6)
     parser.add_argument("--judge-model", default=os.getenv("EVAL_JUDGE_MODEL") or DEFAULT_JUDGE_MODEL)
     parser.add_argument("--resolve-only", action="store_true",
