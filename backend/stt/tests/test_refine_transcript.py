@@ -149,7 +149,9 @@ def test_refine_transcript_splits_large_transcript_and_merges_in_order():
         client=client,
     )
 
-    assert [len(ids) for ids in client.batch_ids] == [60, 60, 5]
+    # 배치는 병렬 실행되어 호출 순서가 비결정적이므로 크기 구성만 검증(순서 무관).
+    # 최종 결과는 원본 세그먼트 순서로 재조립되므로 아래 순서 검증은 그대로 성립한다.
+    assert sorted((len(ids) for ids in client.batch_ids), reverse=True) == [60, 60, 5]
     assert [segment["id"] for segment in result["segments"]] == list(range(125))
     assert result["segments"][124]["text"] == "원문 124 교정"
 

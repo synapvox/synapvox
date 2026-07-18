@@ -1,6 +1,8 @@
 import argparse
+import contextvars
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from openai import OpenAI
@@ -12,11 +14,20 @@ from backend.observability import wrap_openai_client
 _MAX_RETRIES = 2
 _MAX_SEGMENTS_PER_REQUEST = 60
 _MAX_TRANSCRIPT_CHARS_PER_REQUEST = 12_000
+_DEFAULT_REFINEMENT_CONCURRENCY = 6
 DEFAULT_REFINEMENT_MODEL = "gpt-5-mini"
 
 
 def refinement_model() -> str:
     return os.getenv("STT_REFINEMENT_MODEL") or DEFAULT_REFINEMENT_MODEL
+
+
+def refinement_concurrency() -> int:
+    """동시에 보낼 배치 수 상한. STT_REFINEMENT_CONCURRENCY로 조정(기본 6)."""
+    try:
+        return max(1, int(os.getenv("STT_REFINEMENT_CONCURRENCY") or _DEFAULT_REFINEMENT_CONCURRENCY))
+    except ValueError:
+        return _DEFAULT_REFINEMENT_CONCURRENCY
 
 
 def _chunk_text(text: str, chunk_size: int = 300) -> list:
@@ -199,16 +210,26 @@ def refine_transcript(
     model = model or refinement_model()
     batches = _chunk_segments(data["segments"])
     corrections: dict = {}
-    for batch in batches:
-        corrections.update(
-            _refine_segment_batch(
-                client,
-                model,
-                batch,
-                material_text,
-                past_meeting_texts,
+
+    if len(batches) <= 1:
+        for batch in batches:
+            corrections.update(
+                _refine_segment_batch(client, model, batch, material_text, past_meeting_texts)
             )
-        )
+    else:
+        # 배치는 서로 독립(각자 자기 세그먼트 id만 교정)이라 병렬로 보낸다. 순차 합산이던
+        # 벽시계 시간이 배치 하나 수준으로 줄어든다. LangSmith 추적 트리가 스레드에서도
+        # 부모 run 아래에 붙도록 배치마다 현재 컨텍스트 사본에서 실행한다. 배치가 실패하면
+        # (재시도 소진 후 RuntimeError) executor.map 순회 중 그대로 전파된다.
+        def _run(batch: list) -> dict:
+            return contextvars.copy_context().run(
+                _refine_segment_batch, client, model, batch, material_text, past_meeting_texts
+            )
+
+        max_workers = min(len(batches), refinement_concurrency())
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for result in executor.map(_run, batches):
+                corrections.update(result)
 
     refined_segments = [{**seg, "text": corrections[seg["id"]]} for seg in data["segments"]]
     return {**data, "segments": refined_segments}
