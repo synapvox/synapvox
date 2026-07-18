@@ -1,0 +1,41 @@
+# Graphiti 지식그래프 호스트(backend/integration/graphiti_host.py) 전용 이미지.
+#
+# graphiti_core / graph_service 는 services/graphiti submodule에 pin된 커밋과
+# 동일한 커밋을 GitHub에서 직접 설치한다. submodule 체크아웃에 의존하지 않고,
+# graph-service가 요구하는 graphiti-core를 PyPI 릴리스가 아니라 pin된 커밋으로
+# 고정해 버전 불일치(custom_extraction_instructions 등)를 원천 차단한다.
+#
+# Railway 서비스 설정:
+#   - Root Directory: (비움 = 저장소 루트) — backend/ 패키지가 컨텍스트에 있어야 함
+#   - Dockerfile Path: Dockerfile.graphiti
+#   - Variables: NEO4J_URI, NEO4J_USERNAME(또는 NEO4J_USER), NEO4J_PASSWORD,
+#                NEO4J_DATABASE, OPENAI_API_KEY, (선택) GRAPHITI_MODEL
+FROM python:3.12-slim
+
+# pip의 git+https 설치에 git이 필요
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# services/graphiti submodule이 가리키는 커밋 (git ls-tree HEAD services/graphiti 기준).
+# submodule 커밋을 올릴 때 이 값도 같이 갱신할 것.
+ARG GRAPHITI_REF=20a6728fbda9fb257ebf84584c2ccf37801a7cf9
+
+# graphiti-core 를 pin된 커밋에서 먼저 설치 → graph-service의 graphiti-core>=0.28.2
+# 요구사항이 이 버전으로 충족되어 PyPI 릴리스를 다시 받지 않는다.
+RUN pip install --no-cache-dir \
+      "graphiti-core @ git+https://github.com/getzep/graphiti.git@${GRAPHITI_REF}" \
+      "graph-service @ git+https://github.com/getzep/graphiti.git@${GRAPHITI_REF}#subdirectory=server"
+
+# backend 통합 의존성(langsmith 등). graphiti_host가 backend.observability를 쓴다.
+COPY backend/requirements.txt /app/backend/requirements.txt
+RUN pip install --no-cache-dir -r /app/backend/requirements.txt
+
+# backend 패키지(graphiti_host.py, observability.py 등)
+COPY backend /app/backend
+
+# Railway가 주입하는 $PORT에 바인딩(미설정 시 8020).
+ENV PORT=8020
+CMD ["sh", "-c", "uvicorn backend.integration.graphiti_host:app --host 0.0.0.0 --port ${PORT}"]
