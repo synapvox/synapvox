@@ -13,3 +13,4 @@ python-pptx
 psycopg2-binary>=2.9
 pyjwt[crypto]
 neo4j>=5.26
+kiwipiepy

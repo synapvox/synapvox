@@ -18,16 +18,20 @@ from urllib.parse import quote
 import requests
 from langsmith import traceable
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+# 이 파일은 로컬에서는 <repo>/backend/integration/gsvx_connector.py 지만, backend/ 를
+# 배포 루트로 쓰는 환경(Railway 등)에서는 <container>/integration/gsvx_connector.py 로
+# 놓인다. backend 디렉터리를 파일 위치 기준으로 고정해 두 레이아웃 모두에서 동작하게 한다.
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = BACKEND_ROOT.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 # backend/stt/__init__.py는 stt팀 전용 의존성(kiwipiepy 등)을 끌어오므로, api/main.py의
 # _load_stt_module과 같은 방식으로 패키지 스텁만 등록해 __init__ 실행 없이 서브모듈을 쓴다.
 _backend_pkg = sys.modules.setdefault("backend", types.ModuleType("backend"))
-_backend_pkg.__path__ = [str(REPO_ROOT / "backend")]
+_backend_pkg.__path__ = [str(BACKEND_ROOT)]
 _stt_pkg = sys.modules.setdefault("backend.stt", types.ModuleType("backend.stt"))
-_stt_pkg.__path__ = [str(REPO_ROOT / "backend" / "stt")]
+_stt_pkg.__path__ = [str(BACKEND_ROOT / "stt")]
 
 from backend.integration.pipeline import chunk_document, chunk_transcript, extract_text  # noqa: E402
 from backend.observability import wrap_openai_client  # noqa: E402

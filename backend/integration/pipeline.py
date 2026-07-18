@@ -36,7 +36,9 @@ from datetime import date
 from itertools import combinations
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+# backend/ 를 배포 루트로 쓰는 환경에서도 동작하도록 backend 디렉터리를 파일 위치 기준으로 잡는다.
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = BACKEND_ROOT.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 

@@ -26,7 +26,12 @@ from pydantic import BaseModel, Field
 
 from .auth import require_admin, require_user
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+# 이 파일은 로컬에서는 <repo>/backend/integration/api/main.py 지만, backend/ 를 배포
+# 루트로 쓰는 환경(Railway 등)에서는 <container>/integration/api/main.py 로 놓인다.
+# 어느 쪽이든 backend 디렉터리(stt/graphrag/integration/observability를 담은 폴더)를
+# 파일 위치 기준으로 고정하면 두 레이아웃 모두에서 동작한다.
+BACKEND_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = BACKEND_ROOT.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 load_dotenv(REPO_ROOT / ".env")
@@ -35,15 +40,15 @@ logger = logging.getLogger(__name__)
 
 def _load_stt_module(module_name: str):
     backend_package = sys.modules.setdefault("backend", types.ModuleType("backend"))
-    backend_package.__path__ = [str(REPO_ROOT / "backend")]
+    backend_package.__path__ = [str(BACKEND_ROOT)]
     stt_package = sys.modules.setdefault("backend.stt", types.ModuleType("backend.stt"))
-    stt_package.__path__ = [str(REPO_ROOT / "backend" / "stt")]
+    stt_package.__path__ = [str(BACKEND_ROOT / "stt")]
 
     qualified_name = f"backend.stt.{module_name}"
     if qualified_name in sys.modules:
         return sys.modules[qualified_name]
 
-    module_path = REPO_ROOT / "backend" / "stt" / f"{module_name}.py"
+    module_path = BACKEND_ROOT / "stt" / f"{module_name}.py"
     spec = importlib.util.spec_from_file_location(qualified_name, module_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load STT module: {module_name}")
