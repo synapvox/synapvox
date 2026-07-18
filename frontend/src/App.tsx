@@ -1911,9 +1911,13 @@ function App() {
           setGraphReloadKey((value) => value + 1);
         } catch (error) {
           console.error('전사 결과를 그래프에 반영하지 못했습니다:', error);
+          const message = error instanceof Error ? error.message : '';
+          const suffix = message.includes('이미 등록된')
+            ? ' · 그래프 반영됨 (중복 건너뜀)'
+            : ' · 그래프 반영 실패';
           setSourceItems((items) => items.map((source) => (
             source.id === recordingId
-              ? { ...source, meta: source.meta.replace(' · 그래프 분석 중', ' · 그래프 반영 실패') }
+              ? { ...source, meta: source.meta.replace(' · 그래프 분석 중', suffix) }
               : source
           )));
         }
@@ -3279,6 +3283,10 @@ function App() {
                     ? { n: openChatCitation.n, title: openChatCitation.title, fact: openChatCitation.fact ?? '' }
                     : null}
                   onCitationClose={() => setOpenChatCitationKey(null)}
+                  onResetFocus={() => {
+                    setChatGraphExpansion(null);
+                    setOpenChatCitationKey(null);
+                  }}
                 />
               </section>
 
