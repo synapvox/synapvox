@@ -380,6 +380,11 @@ function App() {
   const [isSourceFullscreen, setIsSourceFullscreen] = useState(false);
   const [isRecordingMenuOpen, setIsRecordingMenuOpen] = useState(false);
   const [recordInputMode, setRecordInputMode] = useState<'record' | 'upload'>('record');
+  // 업로드한 녹음 파일의 실제 녹음 날짜(사용자 지정) — 전사 중간포맷 date로 들어가
+  // 그래프 시간축에 쓰인다. 직접 녹음은 지금 하는 것이므로 항상 오늘(제출 시점 계산).
+  const [recordingContentDate, setRecordingContentDate] = useState<string>(
+    () => new Date().toISOString().slice(0, 10),
+  );
   const [recordingState, setRecordingState] = useState<'idle' | 'recording' | 'ready'>('idle');
   const [recordedAudioUrl, setRecordedAudioUrl] = useState<string | null>(null);
   const [recordedAudioBlob, setRecordedAudioBlob] = useState<Blob | null>(null);
@@ -1803,6 +1808,13 @@ function App() {
       });
       body.append('project_id', activeProjectId);
       body.append('meeting_id', meetingId);
+      // 파일 업로드는 사용자가 지정한 녹음 날짜, 직접 녹음은 오늘(제출 시점).
+      body.append(
+        'content_date',
+        recordInputMode === 'upload' && recordingContentDate
+          ? recordingContentDate
+          : new Date().toISOString().slice(0, 10),
+      );
 
       await new Promise((resolve) => window.setTimeout(resolve, 250));
       setTranscriptionStep(2);
@@ -3735,6 +3747,16 @@ function App() {
                 </div>
 
                 {recordInputMode === 'upload' ? (
+                  <>
+                  <label className="source-date-field">
+                    <span>녹음 날짜</span>
+                    <input
+                      type="date"
+                      value={recordingContentDate}
+                      onChange={(event) => setRecordingContentDate(event.target.value)}
+                    />
+                    <small>녹음이 이뤄진 실제 날짜 — 그래프 시간축에 사용됩니다 (기본: 오늘)</small>
+                  </label>
                   <div
                     className="record-file-dropzone"
                     role="button"
@@ -3758,6 +3780,7 @@ function App() {
                       <p>wav, mp3, m4a, webm, mp4 파일도 바로 전사할 수 있습니다.</p>
                     </div>
                   </div>
+                  </>
                 ) : (
                   <div className="record-live-panel">
                     <div className={`record-ready-dot ${recordingState}`} aria-hidden="true" />

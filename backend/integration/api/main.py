@@ -214,7 +214,9 @@ def _dev_transcript(source: str, project_id: str, meeting_id: str) -> dict:
 
 
 @traceable(name="Clova STT and refinement", run_type="chain")
-def _transcribe_with_clova(audio_path: str, source: str, project_id: str, meeting_id: str, material_text: str | None = None) -> dict:
+def _transcribe_with_clova(audio_path: str, source: str, project_id: str, meeting_id: str,
+                           material_text: str | None = None,
+                           content_date: str | None = None) -> dict:
     clova = _load_stt_module("stt_clova")
 
     clova_started = time.perf_counter()
@@ -232,7 +234,7 @@ def _transcribe_with_clova(audio_path: str, source: str, project_id: str, meetin
     data = wrap_segments(
         raw_result["segments"],
         source=source,
-        date=date.today().isoformat(),
+        date=content_date or date.today().isoformat(),
         project_id=project_id,
         meeting_id=meeting_id,
     )
@@ -287,10 +289,21 @@ async def transcribe_recording(
     materials: list[UploadFile] = File(default=[]),
     project_id: str = Form("local-project"),
     meeting_id: str = Form("local-meeting"),
+    content_date: str | None = Form(None),
     user: dict = Depends(require_user),
 ) -> dict:
     if not audio.content_type or not (audio.content_type.startswith("audio/") or audio.content_type.startswith("video/")):
         raise HTTPException(status_code=400, detail="audio or video file is required")
+    # content_date(YYYY-MM-DD): 녹음의 실제 날짜(파일 업로드 시 사용자 지정). 생략 시 오늘.
+    # 중간포맷 date로 들어가 그래프 시간축(reference_time)까지 흐른다.
+    if content_date:
+        try:
+            date.fromisoformat(content_date)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="content_date는 YYYY-MM-DD 형식이어야 합니다.",
+            ) from None
 
     source_name = audio.filename or f"recording-{uuid4().hex}.webm"
     suffix = _extension(audio.filename, audio.content_type)
@@ -341,6 +354,7 @@ async def transcribe_recording(
             project_id,
             meeting_id,
             material_text,
+            content_date,
         )
     except HTTPException:
         raise
