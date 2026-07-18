@@ -1,3 +1,4 @@
+import json
 import pathlib
 import sys
 
@@ -134,7 +135,7 @@ class _RecordingClient(GsvxClient):
     def ingest_texts(self, texts, title, project=None, name=None):
         for i, text in enumerate(texts):
             chunk_title = title if len(texts) == 1 else f"{title} ({i + 1}/{len(texts)})"
-            self.calls.append({"text": text, "title": chunk_title, "project": project})
+            self.calls.append({"text": text, "title": chunk_title, "project": project, "name": name})
         return {
             "session_key": title,
             "session_keys": [call["title"] for call in self.calls],
@@ -180,6 +181,34 @@ def test_transcript_is_ingested_as_one_episode_by_default():
     assert len(client.calls) == 1
     assert "가" * 500 in client.calls[0]["text"]
     assert "나" * 500 in client.calls[0]["text"]
+
+
+def test_ingest_transcript_source_description_carries_tracking_metadata():
+    client = _RecordingClient()
+    client.ingest_transcript(_intermediate())
+
+    meta = json.loads(client.calls[0]["name"])
+    assert meta == {
+        "kind": "transcript",
+        "file": "meeting.m4a",
+        "project_id": "P01",
+        "meeting_id": "M01",
+    }
+
+
+def test_ingest_document_text_source_description_carries_tracking_metadata():
+    client = _RecordingClient()
+    client.ingest_document_text("자료 본문", "slides", project="P01", meeting_id="M01")
+
+    meta = json.loads(client.calls[0]["name"])
+    assert meta == {
+        "kind": "document",
+        "file": "slides",
+        "project_id": "P01",
+        "meeting_id": "M01",
+    }
+    # graphiti_host 미팅 필터가 의존하는 부분 문자열 형식(공백 없는 compact JSON)
+    assert '"meeting_id":"M01"' in client.calls[0]["name"]
 
 
 def test_ingest_document_text_rejects_empty():

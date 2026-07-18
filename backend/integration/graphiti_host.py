@@ -174,10 +174,13 @@ async def _episode_ids_for_meeting(episode_ids: set[str], meeting_id: str) -> se
     result = await _client().driver.execute_query(
         """MATCH (e:Episodic)
            WHERE e.uuid IN $ids
-             AND (e.source_description = $description OR e.name ENDS WITH $suffix)
+             AND (e.source_description = $description
+                  OR e.source_description CONTAINS $meeting_pair
+                  OR e.name ENDS WITH $suffix)
            RETURN e.uuid AS uuid""",
         ids=list(episode_ids),
         description=f"meeting:{meeting_id}",
+        meeting_pair=f'"meeting_id":"{meeting_id}"',
         suffix=f"({meeting_id})",
     )
     return {record["uuid"] for record in result.records}
