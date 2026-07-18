@@ -9,8 +9,10 @@ grounded AI answers while scoping every operation by the project group_id.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
+import time
 import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -79,6 +81,28 @@ def document_title(stem: str, meeting_id: str | None = None) -> str:
     파일)에 딸린 자료인지 그래프 뷰에서도 식별 가능하게 한다. meeting_id 없으면(프로젝트
     전역 자료) 기존과 동일하게 stem 그대로."""
     return f"{stem} ({meeting_id})" if meeting_id else stem
+
+
+logger = logging.getLogger(__name__)
+
+
+def _tag_langsmith_run(**metadata) -> None:
+    """현재 LangSmith run에 추적 메타데이터(project_id 등)를 붙인다.
+
+    추적이 꺼져 있거나 run 컨텍스트가 없으면 조용히 무시 — 관측은 본 기능을
+    실패시키면 안 된다."""
+    try:
+        from langsmith.run_helpers import get_current_run_tree
+
+        run = get_current_run_tree()
+        values = {key: value for key, value in metadata.items() if value}
+        if run is None or not values:
+            return
+        extra = getattr(run, "extra", None) or {}
+        extra.setdefault("metadata", {}).update(values)
+        run.extra = extra
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def source_metadata(kind: str, file: str, project: str | None,
@@ -264,6 +288,7 @@ class GsvxClient:
         사실로만 결과를 좁힌다 — group_id는 그대로 프로젝트 단위라 세션 간 엔티티 중복
         제거(dedup)는 안 깨진다(dedup은 group_id 스코프라서, 미팅별 group_id로 쪼개면
         같은 인물/개념이 회의마다 중복 생성됨 — 그래서 사후 필터링 방식을 씀)."""
+        _tag_langsmith_run(project_id=project, meeting_id=meeting_id)
         facts, expansion = self._retrieve(project, question, k, meeting_id)
         answer = (
             self._answer_from_facts(question, facts, history=history)
@@ -276,6 +301,7 @@ class GsvxClient:
             "expansion": expansion,
         }
 
+    @traceable(name="SynapVox AI chat (stream)", run_type="chain")
     def ask_stream(
         self,
         project: str,
@@ -287,6 +313,7 @@ class GsvxClient:
         """ask()의 스트리밍 버전 — {'type': 'delta', 'text'} 이벤트를 생성되는 대로 내고,
         마지막에 ask()와 동일한 페이로드의 {'type': 'complete', ...}를 낸다.
         검색·expansion은 스트리밍 전에 끝내므로 complete의 hits/expansion은 ask()와 같다."""
+        _tag_langsmith_run(project_id=project, meeting_id=meeting_id)
         facts, expansion = self._retrieve(project, question, k, meeting_id)
         yield {"type": "status", "stage": "answering"}  # 검색 종료 → 생성 시작 신호
         parts: list[str] = []
@@ -549,9 +576,12 @@ class GsvxClient:
         — 프론트 App.tsx가 기대하는 {chunks_ingested, concepts_total}를 포함한다.
         """
         validate(im)
+        _tag_langsmith_run(
+            project_id=project or im.get("project_id"), meeting_id=im.get("meeting_id"))
+        started = time.perf_counter()
         max_chars = int(os.getenv("GRAPHITI_CHUNK_CHARS") or DEFAULT_GRAPHITI_CHUNK_CHARS)
         chunks = chunk_transcript(im, max_chars=max_chars)
-        return self._ingest_chunks(
+        result = self._ingest_chunks(
             [chunk["text"] for chunk in chunks],
             transcript_title(im),
             project=project or im.get("project_id"),
@@ -562,6 +592,14 @@ class GsvxClient:
                 im["meeting_id"],
             ),
         )
+        logger.info(
+            "graphiti.ingest transcript project=%s meeting=%s chunks=%d elapsed=%.2fs",
+            project or im.get("project_id"),
+            im.get("meeting_id"),
+            result.get("chunks_ingested", 0),
+            time.perf_counter() - started,
+        )
+        return result
 
     def ingest_document(self, path: Path | str, project: str | None = None,
                         title: str | None = None, meeting_id: str | None = None) -> dict:
@@ -579,14 +617,25 @@ class GsvxClient:
     def ingest_document_text(self, text: str, title: str, project: str | None = None,
                              meeting_id: str | None = None) -> dict:
         """이미 추출된 자료 평문 → gsvx 세션(들). API 릴레이(api/main.py)가 사용."""
+        _tag_langsmith_run(project_id=project, meeting_id=meeting_id)
+        started = time.perf_counter()
         max_chars = int(os.getenv("GRAPHITI_CHUNK_CHARS") or DEFAULT_GRAPHITI_CHUNK_CHARS)
         chunks = chunk_document(text, title, max_chars=max_chars)
-        return self._ingest_chunks(
+        result = self._ingest_chunks(
             [chunk["text"] for chunk in chunks],
             document_title(title, meeting_id),
             project=project,
             source_description=source_metadata("document", title, project, meeting_id),
         )
+        logger.info(
+            "graphiti.ingest document title=%s project=%s meeting=%s chunks=%d elapsed=%.2fs",
+            title,
+            project,
+            meeting_id,
+            result.get("chunks_ingested", 0),
+            time.perf_counter() - started,
+        )
+        return result
 
     def _ingest_chunks(
         self,
