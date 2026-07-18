@@ -23,6 +23,19 @@
 - `scripts/` — 로컬 인프라 실행 스크립트 (DB 기동 등).
 - `data/` — 샘플 회의 녹음·자료. Git에는 커밋하지 않는다.
 
+## 진행 중인 기능 브랜치 (2026-07-18)
+
+리뷰·머지 대기 중인 브랜치와 의존 관계. 상세 내용은 각 커밋/PR 참조.
+
+| 브랜치 | 내용 | 머지 순서 |
+| --- | --- | --- |
+| `test/stt-refine-batch-verification` | 2차 보정 배치 분할(P0-3) 검증 테스트 3종 | 독립 — 순서 무관 |
+| `feat/graphiti-ingest-dedup` | 그래프 중복 적재 방지(P1-1) — 적재 전 `graphEpisodeIds` 검사 후 409 | 독립 — 순서 무관 |
+| `feat/integration-answer-citations` | RAG 답변 인용 `[n]` + 출처 칩/드로어 + 그래프 새로고침 버튼(P0-1) | **스트리밍보다 먼저** |
+| `feat/ask-true-streaming` | AI 답변 진짜 스트리밍(P1-3) — `stream=True` + 수식 경계 flush | **인용 브랜치 머지 후** (그 위에 쌓인 브랜치) |
+
+스트리밍 동작 요약: 검색·expansion을 먼저 끝낸 뒤 LLM 토큰을 생성 즉시 NDJSON `delta`로 중계하고, 미완성 LaTeX 수식은 닫힐 때까지 버퍼링해 프론트 깜빡임을 막는다. 프론트 계약(`delta`/`complete`/`error`)은 불변.
+
 ## 시작하기
 
 각 모듈의 `README.md`에 해당 담당자의 Baseline 작업 범위가 있다. 첫 주 목표는 `schemas/` 3종 확정.

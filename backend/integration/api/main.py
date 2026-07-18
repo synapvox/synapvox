@@ -987,6 +987,36 @@ def _ndjson_event(event_type: str, **payload) -> str:
     return json.dumps({"type": event_type, **payload}, ensure_ascii=False) + "\n"
 
 
+def _has_open_math(text: str) -> bool:
+    """텍스트 끝에서 LaTeX 수식($…$, $$…$$, \\(…\\), \\[…\\])이 닫히지 않았는지 판정."""
+    in_block = in_inline = False
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\":
+            nxt = text[i + 1] if i + 1 < n else ""
+            if nxt == "[" and not in_inline:
+                in_block = True
+            elif nxt == "]" and not in_inline:
+                in_block = False
+            elif nxt == "(" and not in_block:
+                in_inline = True
+            elif nxt == ")" and not in_block:
+                in_inline = False
+            i += 2
+            continue
+        if ch == "$":
+            if i + 1 < n and text[i + 1] == "$":
+                if not in_inline:
+                    in_block = not in_block
+                i += 2
+                continue
+            if not in_block:
+                in_inline = not in_inline
+        i += 1
+    return in_block or in_inline
+
+
 def _ask_stream_events(
     project: str,
     q: str,
@@ -994,9 +1024,39 @@ def _ask_stream_events(
     meeting_id: str | None = None,
     history: list[dict] | None = None,
 ):
-    """Adapt Graphiti's complete answer response to the frontend NDJSON contract."""
+    """Graphiti 답변을 프론트 NDJSON 계약(delta/complete/error)으로 내보낸다.
+
+    ask_stream이 있으면 LLM 토큰을 생성 즉시 중계하되, 미완성 수식이 프론트에서
+    원문으로 깜빡이지 않도록 수식이 닫힌 경계까지만 delta로 내보낸다(열린 수식은
+    버퍼링). ask만 있는 클라이언트(테스트 스텁 등)는 기존 완성-답변 분할로 처리한다.
+    """
     try:
         client = _gsvx_client()
+        if hasattr(client, "ask_stream"):
+            events = (
+                client.ask_stream(project, q, k, meeting_id, history=history)
+                if history
+                else client.ask_stream(project, q, k, meeting_id)
+            )
+            emitted = ""
+            pending = ""
+            final: dict | None = None
+            for event in events:
+                if event.get("type") == "delta":
+                    pending += str(event.get("text") or "")
+                    total = emitted + pending
+                    # 끝의 '$'/'\'는 다음 조각과 합쳐야 구분자인지 알 수 있어 보류한다.
+                    if pending and not _has_open_math(total) and not total.endswith(("$", "\\")):
+                        yield _ndjson_event("delta", text=pending)
+                        emitted = total
+                        pending = ""
+                elif event.get("type") == "complete":
+                    final = event
+            if pending:
+                yield _ndjson_event("delta", text=pending)
+            result = {key: value for key, value in (final or {}).items() if key != "type"}
+            yield _ndjson_event("complete", **result)
+            return
         result = client.ask(project, q, k, meeting_id, history=history) if history else client.ask(project, q, k, meeting_id)
         answer = str(result.get("answer") or "")
         for start in range(0, len(answer), 48):
