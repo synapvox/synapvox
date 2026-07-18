@@ -254,8 +254,11 @@ def test_api_ingest_doc_stores_text_file(monkeypatch):
     monkeypatch.setattr(
         api_main,
         "_store_source_graph_episode_ids",
-        lambda user, source, episodes: captured.update(stored=(source, episodes)),
+        lambda user, source, episodes, content_hash=None: captured.update(
+            stored=(source, episodes), content_hash=content_hash),
     )
+    monkeypatch.setattr(
+        api_main, "_owned_duplicate_content_source", lambda *args, **kwargs: None)
 
     response = TestClient(app).post(
         "/api/ingest-doc",
@@ -282,6 +285,9 @@ def test_api_ingest_doc_stores_text_file(monkeypatch):
     }
     assert captured["text"] == "graph theory notes"
     assert captured["content_date"] is None
+    # 성공 적재 시 내용 해시가 함께 저장돼 이후 동일 내용 재적재를 차단할 수 있다
+    import hashlib as _hashlib
+    assert captured["content_hash"] == _hashlib.sha256(b"graph theory notes").hexdigest()
     assert captured["title"] == "notes"
     assert captured["project"] == "project-uuid"
     assert captured["meeting"] == "lecture-01"
@@ -305,7 +311,12 @@ def test_api_ingest_doc_passes_user_content_date(monkeypatch):
         "kind": "document", "original_name": "notes.txt", "source_payload": {},
     })
     monkeypatch.setattr(
-        api_main, "_store_source_graph_episode_ids", lambda user, source, episodes: None)
+        api_main,
+        "_store_source_graph_episode_ids",
+        lambda user, source, episodes, content_hash=None: None,
+    )
+    monkeypatch.setattr(
+        api_main, "_owned_duplicate_content_source", lambda *args, **kwargs: None)
 
     response = TestClient(app).post(
         "/api/ingest-doc",
@@ -335,6 +346,38 @@ def test_api_ingest_doc_rejects_malformed_content_date():
 
     assert response.status_code == 400
     assert "YYYY-MM-DD" in response.json()["detail"]
+
+
+def test_api_ingest_doc_skips_when_same_content_already_ingested(monkeypatch):
+    def _fail_client():
+        raise AssertionError("duplicate content must not reach Graphiti")
+
+    monkeypatch.setattr(api_main, "_gsvx_client", _fail_client)
+    monkeypatch.setattr(api_main, "_owned_source_record", lambda user, source: {
+        "id": source, "project_id": "project-uuid", "recording_id": None,
+        "kind": "document", "original_name": "notes-copy.txt", "source_payload": {},
+    })
+    monkeypatch.setattr(
+        api_main,
+        "_owned_duplicate_content_source",
+        lambda user, project, content_hash, exclude=None: {
+            "id": "material-original", "original_name": "notes.txt",
+        },
+    )
+
+    response = TestClient(app).post(
+        "/api/ingest-doc",
+        headers={
+            "X-Project-Id": "project-uuid",
+            "X-Source-Id": "material-copy-456",
+            "X-API-Key": "test-key",
+        },
+        files={"file": ("notes-copy.txt", b"graph theory notes", "text/plain")},
+    )
+
+    assert response.status_code == 409
+    assert "이미 등록된" in response.json()["detail"]
+    assert "notes.txt" in response.json()["detail"]  # 어떤 기존 자료와 겹치는지 안내
 
 
 def test_api_graph_and_ask_use_current_project(monkeypatch):

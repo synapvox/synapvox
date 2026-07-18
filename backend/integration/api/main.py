@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import sys
 import tempfile
@@ -424,22 +425,54 @@ def _owned_source_bundle_records(user_id: str, source: dict) -> list[dict]:
 
 
 def _store_source_graph_episode_ids(user_id: str, source_id: str,
-                                    episode_ids: list[str]) -> None:
-    """Persist Graphiti episode ownership so source deletion can be exact."""
+                                    episode_ids: list[str],
+                                    content_hash: str | None = None) -> None:
+    """Persist Graphiti episode ownership so source deletion can be exact.
+
+    content_hash(추출 텍스트 sha256)를 함께 저장하면 이후 동일 내용 재적재를
+    _owned_duplicate_content_source로 차단할 수 있다."""
     if not episode_ids:
         return
+    import psycopg2
+
+    payload: dict = {"graphEpisodeIds": episode_ids}
+    if content_hash:
+        payload["contentHash"] = content_hash
+    with psycopg2.connect(os.environ["SUPABASE_DB_URL"]) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """UPDATE public.project_sources
+                   SET source_payload = coalesce(source_payload, '{}'::jsonb) || %s::jsonb,
+                       updated_at = now()
+                   WHERE id = %s AND owner_id = %s""",
+                (json.dumps(payload), source_id, user_id),
+            )
+
+
+def _owned_duplicate_content_source(user_id: str, project_id: str, content_hash: str,
+                                    exclude_source_id: str | None = None) -> dict | None:
+    """같은 프로젝트에 동일 내용(contentHash)으로 이미 그래프 적재된 다른 소스를 찾는다.
+
+    같은 파일을 새 소스로 다시 올리는 경우(예: 녹음 참고자료로 재첨부)의 중복 적재를
+    막기 위한 내용 기반 검사 — 소스 id 기반 검사(_source_already_ingested)의 보완."""
     import psycopg2
 
     with psycopg2.connect(os.environ["SUPABASE_DB_URL"]) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
-                """UPDATE public.project_sources
-                   SET source_payload = coalesce(source_payload, '{}'::jsonb)
-                       || jsonb_build_object('graphEpisodeIds', %s::jsonb),
-                       updated_at = now()
-                   WHERE id = %s AND owner_id = %s""",
-                (json.dumps(episode_ids), source_id, user_id),
+                """SELECT id, original_name FROM public.project_sources
+                   WHERE owner_id = %s AND project_id = %s
+                     AND source_payload->>'contentHash' = %s
+                     AND jsonb_array_length(
+                           coalesce(source_payload->'graphEpisodeIds', '[]'::jsonb)) > 0
+                     AND id <> coalesce(%s, '')
+                   LIMIT 1""",
+                (user_id, project_id, content_hash, exclude_source_id),
             )
+            row = cursor.fetchone()
+    if row is None:
+        return None
+    return {"id": str(row[0]), "original_name": str(row[1] or "")}
 
 
 def _source_already_ingested(source: dict | None) -> bool:
@@ -803,6 +836,20 @@ async def ingest_doc_to_graph(
                 detail="텍스트를 추출하지 못했습니다 (지원: pdf/pptx/docx/md/txt).",
             )
 
+        # 내용 기반 중복 검사: 같은 파일을 새 소스로 다시 올려도(예: 녹음 참고자료 재첨부)
+        # 프로젝트에 동일 내용이 이미 적재돼 있으면 건너뛴다 — 소스 id 검사의 허점 보완.
+        content_hash = hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+        duplicate = await run_in_threadpool(
+            _owned_duplicate_content_source, user_id, x_project_id, content_hash, x_source_id)
+        if duplicate is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"이미 등록된 자료입니다(동일 내용: {duplicate['original_name'] or '기존 자료'})"
+                    " — 그래프 반영을 건너뜁니다."
+                ),
+            )
+
         title = Path(file.filename or "자료").stem or "자료"
         try:
             result = await run_in_threadpool(
@@ -819,6 +866,7 @@ async def ingest_doc_to_graph(
                     user_id,
                     x_source_id,
                     [str(value) for value in result.get("sessions", []) if value],
+                    content_hash,
                 )
             return {
                 "project": x_project_id,
