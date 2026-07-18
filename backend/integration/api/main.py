@@ -214,7 +214,9 @@ def _dev_transcript(source: str, project_id: str, meeting_id: str) -> dict:
 
 
 @traceable(name="Clova STT and refinement", run_type="chain")
-def _transcribe_with_clova(audio_path: str, source: str, project_id: str, meeting_id: str, material_text: str | None = None) -> dict:
+def _transcribe_with_clova(audio_path: str, source: str, project_id: str, meeting_id: str,
+                           material_text: str | None = None,
+                           content_date: str | None = None) -> dict:
     clova = _load_stt_module("stt_clova")
 
     clova_started = time.perf_counter()
@@ -232,7 +234,7 @@ def _transcribe_with_clova(audio_path: str, source: str, project_id: str, meetin
     data = wrap_segments(
         raw_result["segments"],
         source=source,
-        date=date.today().isoformat(),
+        date=content_date or date.today().isoformat(),
         project_id=project_id,
         meeting_id=meeting_id,
     )
@@ -287,10 +289,21 @@ async def transcribe_recording(
     materials: list[UploadFile] = File(default=[]),
     project_id: str = Form("local-project"),
     meeting_id: str = Form("local-meeting"),
+    content_date: str | None = Form(None),
     user: dict = Depends(require_user),
 ) -> dict:
     if not audio.content_type or not (audio.content_type.startswith("audio/") or audio.content_type.startswith("video/")):
         raise HTTPException(status_code=400, detail="audio or video file is required")
+    # content_date(YYYY-MM-DD): 녹음의 실제 날짜(파일 업로드 시 사용자 지정). 생략 시 오늘.
+    # 중간포맷 date로 들어가 그래프 시간축(reference_time)까지 흐른다.
+    if content_date:
+        try:
+            date.fromisoformat(content_date)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="content_date는 YYYY-MM-DD 형식이어야 합니다.",
+            ) from None
 
     source_name = audio.filename or f"recording-{uuid4().hex}.webm"
     suffix = _extension(audio.filename, audio.content_type)
@@ -341,6 +354,7 @@ async def transcribe_recording(
             project_id,
             meeting_id,
             material_text,
+            content_date,
         )
     except HTTPException:
         raise
@@ -722,11 +736,23 @@ async def ingest_doc_to_graph(
     x_project_id: str | None = Header(None, alias="X-Project-Id"),
     x_meeting_id: str | None = Header(None, alias="X-Meeting-Id"),
     x_source_id: str | None = Header(None, alias="X-Source-Id"),
+    x_content_date: str | None = Header(None, alias="X-Content-Date"),
     user: dict = Depends(require_user),
 ) -> dict:
-    """자료 텍스트를 현재 프로젝트에 적재한다. X-Meeting-Id가 있으면 해당 녹음본에 연결한다."""
+    """자료 텍스트를 현재 프로젝트에 적재한다. X-Meeting-Id가 있으면 해당 녹음본에 연결한다.
+
+    X-Content-Date(YYYY-MM-DD)는 사용자가 지정한 자료의 실제 날짜 — 그래프 시간축에
+    쓰인다. 생략 시 적재 시각(오늘)."""
     if not x_project_id:
         raise HTTPException(status_code=400, detail="X-Project-Id is required")
+    if x_content_date:
+        try:
+            date.fromisoformat(x_content_date)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="X-Content-Date는 YYYY-MM-DD 형식이어야 합니다.",
+            ) from None
     user_id = str(user.get("sub") or "")
     if x_source_id:
         source = await run_in_threadpool(_owned_source_record, user_id, x_source_id)
@@ -758,6 +784,7 @@ async def ingest_doc_to_graph(
                 title,
                 x_project_id,
                 x_meeting_id,
+                x_content_date,
             )
             if x_source_id:
                 await run_in_threadpool(

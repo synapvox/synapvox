@@ -106,15 +106,16 @@ def _tag_langsmith_run(**metadata) -> None:
 
 
 def source_metadata(kind: str, file: str, project: str | None,
-                    meeting_id: str | None = None) -> str:
+                    meeting_id: str | None = None,
+                    content_date: str | None = None) -> str:
     """에피소드 source_description에 넣는 추적 메타데이터(compact JSON).
 
     graphiti_host의 미팅 필터가 '"meeting_id":"<id>"' 부분 문자열 매칭으로 이 형식에
     의존하므로 separators(공백 없음)를 바꾸면 안 된다."""
-    return json.dumps(
-        {"kind": kind, "file": file, "project_id": project, "meeting_id": meeting_id},
-        ensure_ascii=False, separators=(",", ":"),
-    )
+    payload: dict = {"kind": kind, "file": file, "project_id": project, "meeting_id": meeting_id}
+    if content_date:
+        payload["date"] = content_date
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def split_for_ingest(text: str, limit: int = GSVX_TEXT_LIMIT,
@@ -212,14 +213,18 @@ class GsvxClient:
 
     @traceable(name="Graphiti episode ingest", run_type="chain")
     def ingest_texts(self, texts: list[str], title: str, project: str | None = None,
-                     name: str | None = None) -> dict:
-        """여러 청크를 한 요청으로 보내 Graphiti의 벌크 적재 경로를 사용한다."""
+                     name: str | None = None,
+                     reference_time: datetime | None = None) -> dict:
+        """여러 청크를 한 요청으로 보내 Graphiti의 벌크 적재 경로를 사용한다.
+
+        reference_time을 주면 에피소드의 시간축 기준으로 쓴다(자료의 실제 날짜 등).
+        생략 시 기존과 동일하게 적재 시각."""
         if not project:
             raise ValueError("Graphiti 적재에는 project(group_id)가 필요합니다.")
         texts = [text.strip() for text in texts if text.strip()]
         if not texts:
             raise ValueError("빈 텍스트는 그래프에 넣을 수 없습니다.")
-        now = datetime.now(timezone.utc)
+        now = reference_time or datetime.now(timezone.utc)
         body = {
             "group_id": project,
             "messages": [{
@@ -579,6 +584,15 @@ class GsvxClient:
         _tag_langsmith_run(
             project_id=project or im.get("project_id"), meeting_id=im.get("meeting_id"))
         started = time.perf_counter()
+        # 중간포맷의 date(YYYY-MM-DD)를 에피소드 시간축으로 사용 — 자료의 content_date와
+        # 동일한 규칙. 값이 없거나 형식이 어긋나면 기존과 동일하게 적재 시각.
+        content_date = str(im.get("date") or "") or None
+        reference_time = None
+        if content_date:
+            try:
+                reference_time = datetime.fromisoformat(content_date).replace(tzinfo=timezone.utc)
+            except ValueError:
+                content_date = None
         max_chars = int(os.getenv("GRAPHITI_CHUNK_CHARS") or DEFAULT_GRAPHITI_CHUNK_CHARS)
         chunks = chunk_transcript(im, max_chars=max_chars)
         result = self._ingest_chunks(
@@ -590,7 +604,9 @@ class GsvxClient:
                 transcript_title(im),
                 project or im.get("project_id"),
                 im["meeting_id"],
+                content_date=content_date,
             ),
+            reference_time=reference_time,
         )
         logger.info(
             "graphiti.ingest transcript project=%s meeting=%s chunks=%d elapsed=%.2fs",
@@ -615,17 +631,28 @@ class GsvxClient:
 
     @traceable(name="Course material to Graphiti", run_type="chain")
     def ingest_document_text(self, text: str, title: str, project: str | None = None,
-                             meeting_id: str | None = None) -> dict:
-        """이미 추출된 자료 평문 → gsvx 세션(들). API 릴레이(api/main.py)가 사용."""
+                             meeting_id: str | None = None,
+                             content_date: str | None = None) -> dict:
+        """이미 추출된 자료 평문 → gsvx 세션(들). API 릴레이(api/main.py)가 사용.
+
+        content_date(YYYY-MM-DD, 사용자가 지정한 자료의 실제 날짜)를 주면 에피소드
+        시간축(reference_time)으로 쓴다. 생략 시 기존과 동일하게 적재 시각."""
         _tag_langsmith_run(project_id=project, meeting_id=meeting_id)
         started = time.perf_counter()
+        reference_time = (
+            datetime.fromisoformat(content_date).replace(tzinfo=timezone.utc)
+            if content_date
+            else None
+        )
         max_chars = int(os.getenv("GRAPHITI_CHUNK_CHARS") or DEFAULT_GRAPHITI_CHUNK_CHARS)
         chunks = chunk_document(text, title, max_chars=max_chars)
         result = self._ingest_chunks(
             [chunk["text"] for chunk in chunks],
             document_title(title, meeting_id),
             project=project,
-            source_description=source_metadata("document", title, project, meeting_id),
+            source_description=source_metadata(
+                "document", title, project, meeting_id, content_date=content_date),
+            reference_time=reference_time,
         )
         logger.info(
             "graphiti.ingest document title=%s project=%s meeting=%s chunks=%d elapsed=%.2fs",
@@ -643,6 +670,7 @@ class GsvxClient:
         title: str,
         project: str | None = None,
         source_description: str | None = None,
+        reference_time: datetime | None = None,
     ) -> dict:
         if not chunks:
             raise ValueError("빈 텍스트는 그래프에 넣을 수 없습니다.")
@@ -651,6 +679,7 @@ class GsvxClient:
             title,
             project=project,
             name=source_description,
+            reference_time=reference_time,
         )
         stats = result.get("stats", {})
         return {

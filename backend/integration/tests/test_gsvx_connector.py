@@ -132,10 +132,13 @@ class _RecordingClient(GsvxClient):
         super().__init__(**kwargs)
         self.calls = []
 
-    def ingest_texts(self, texts, title, project=None, name=None):
+    def ingest_texts(self, texts, title, project=None, name=None, reference_time=None):
         for i, text in enumerate(texts):
             chunk_title = title if len(texts) == 1 else f"{title} ({i + 1}/{len(texts)})"
-            self.calls.append({"text": text, "title": chunk_title, "project": project, "name": name})
+            self.calls.append({
+                "text": text, "title": chunk_title, "project": project,
+                "name": name, "reference_time": reference_time,
+            })
         return {
             "session_key": title,
             "session_keys": [call["title"] for call in self.calls],
@@ -184,6 +187,8 @@ def test_transcript_is_ingested_as_one_episode_by_default():
 
 
 def test_ingest_transcript_source_description_carries_tracking_metadata():
+    from datetime import datetime, timezone
+
     client = _RecordingClient()
     client.ingest_transcript(_intermediate())
 
@@ -193,7 +198,10 @@ def test_ingest_transcript_source_description_carries_tracking_metadata():
         "file": "meeting.m4a",
         "project_id": "P01",
         "meeting_id": "M01",
+        "date": "2026-07-15",
     }
+    # 중간포맷 date가 에피소드 시간축(reference_time)으로 쓰인다
+    assert client.calls[0]["reference_time"] == datetime(2026, 7, 15, tzinfo=timezone.utc)
 
 
 def test_ingest_document_text_source_description_carries_tracking_metadata():
@@ -209,6 +217,25 @@ def test_ingest_document_text_source_description_carries_tracking_metadata():
     }
     # graphiti_host 미팅 필터가 의존하는 부분 문자열 형식(공백 없는 compact JSON)
     assert '"meeting_id":"M01"' in client.calls[0]["name"]
+
+
+def test_ingest_document_text_uses_user_content_date_as_reference_time():
+    from datetime import datetime, timezone
+
+    client = _RecordingClient()
+    client.ingest_document_text("자료 본문", "slides", project="P01", content_date="2026-03-02")
+
+    assert client.calls[0]["reference_time"] == datetime(2026, 3, 2, tzinfo=timezone.utc)
+    meta = json.loads(client.calls[0]["name"])
+    assert meta["date"] == "2026-03-02"
+
+
+def test_ingest_document_text_defaults_to_ingest_time_without_content_date():
+    client = _RecordingClient()
+    client.ingest_document_text("자료 본문", "slides", project="P01")
+
+    assert client.calls[0]["reference_time"] is None  # ingest_texts가 now()로 대체
+    assert "date" not in json.loads(client.calls[0]["name"])
 
 
 def test_ingest_document_text_rejects_empty():

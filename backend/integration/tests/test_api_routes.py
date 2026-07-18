@@ -175,8 +175,9 @@ def test_api_ingest_doc_stores_text_file(monkeypatch):
     captured = {}
 
     class _Graphiti:
-        def ingest_document_text(self, text, title, project, meeting):
-            captured.update(text=text, title=title, project=project, meeting=meeting)
+        def ingest_document_text(self, text, title, project, meeting, content_date=None):
+            captured.update(text=text, title=title, project=project, meeting=meeting,
+                            content_date=content_date)
             return {
                 "chunks_ingested": 1, "concepts_new": 1,
                 "concepts_total": 1, "relations_new": 0, "sessions": ["episode-doc"],
@@ -217,10 +218,60 @@ def test_api_ingest_doc_stores_text_file(monkeypatch):
         "sessions": ["episode-doc"],
     }
     assert captured["text"] == "graph theory notes"
+    assert captured["content_date"] is None
     assert captured["title"] == "notes"
     assert captured["project"] == "project-uuid"
     assert captured["meeting"] == "lecture-01"
     assert captured["stored"] == ("material-123", ["episode-doc"])
+
+
+def test_api_ingest_doc_passes_user_content_date(monkeypatch):
+    captured = {}
+
+    class _Graphiti:
+        def ingest_document_text(self, text, title, project, meeting, content_date=None):
+            captured["content_date"] = content_date
+            return {
+                "chunks_ingested": 1, "concepts_new": 1,
+                "concepts_total": 1, "relations_new": 0, "sessions": ["episode-doc"],
+            }
+
+    monkeypatch.setattr(api_main, "_gsvx_client", lambda: _Graphiti())
+    monkeypatch.setattr(api_main, "_owned_source_record", lambda user, source: {
+        "id": source, "project_id": "project-uuid", "recording_id": None,
+        "kind": "document", "original_name": "notes.txt", "source_payload": {},
+    })
+    monkeypatch.setattr(
+        api_main, "_store_source_graph_episode_ids", lambda user, source, episodes: None)
+
+    response = TestClient(app).post(
+        "/api/ingest-doc",
+        headers={
+            "X-Project-Id": "project-uuid",
+            "X-Source-Id": "material-123",
+            "X-Content-Date": "2026-03-02",
+            "X-API-Key": "test-key",
+        },
+        files={"file": ("notes.txt", b"graph theory notes", "text/plain")},
+    )
+
+    assert response.status_code == 200
+    assert captured["content_date"] == "2026-03-02"
+
+
+def test_api_ingest_doc_rejects_malformed_content_date():
+    response = TestClient(app).post(
+        "/api/ingest-doc",
+        headers={
+            "X-Project-Id": "project-uuid",
+            "X-Content-Date": "03/02/2026",
+            "X-API-Key": "test-key",
+        },
+        files={"file": ("notes.txt", b"graph theory notes", "text/plain")},
+    )
+
+    assert response.status_code == 400
+    assert "YYYY-MM-DD" in response.json()["detail"]
 
 
 def test_api_graph_and_ask_use_current_project(monkeypatch):

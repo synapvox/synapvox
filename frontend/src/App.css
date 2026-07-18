@@ -907,6 +907,35 @@ button {
   width: min(460px, 100%);
 }
 
+.source-date-field {
+  margin-top: 16px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+}
+
+.source-date-field > span {
+  font-size: 0.86rem;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.source-date-field input[type='date'] {
+  padding: 6px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: #fffaf2;
+  color: var(--ink);
+  font-size: 0.86rem;
+}
+
+.source-date-field small {
+  flex-basis: 100%;
+  font-size: 0.74rem;
+  color: var(--muted);
+}
+
 .source-dropzone {
   margin-top: 18px;
   min-height: 230px;
