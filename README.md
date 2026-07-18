@@ -26,3 +26,43 @@
 ## 시작하기
 
 각 모듈의 `README.md`에 해당 담당자의 Baseline 작업 범위가 있다. 첫 주 목표는 `schemas/` 3종 확정.
+
+## 배포
+
+프로덕션은 **frontend(Netlify)** + **backend·graphiti(Railway)** + **Supabase·Neo4j·OpenAI/CLOVA** 구성이다.
+서비스별 설정·환경변수·트러블슈팅은 [`DEPLOYMENT.md`](DEPLOYMENT.md) 참고.
+
+```mermaid
+flowchart TB
+    User["사용자 브라우저"]
+
+    subgraph Netlify["Netlify"]
+      FE["frontend<br/>Vite + React"]
+    end
+
+    subgraph Railway["Railway"]
+      BE["backend<br/>FastAPI :8080"]
+      GR["graphiti<br/>:8080 (내부망 전용)"]
+    end
+
+    Supabase[("Supabase<br/>Auth · Postgres · Storage")]
+    Neo4j[("Neo4j<br/>지식 그래프")]
+    LLM["OpenAI · CLOVA Speech"]
+
+    User -->|"앱 로드"| FE
+    User -->|"짧은 API /api/* (프록시)"| FE
+    FE -->|"서버사이드 프록시"| BE
+    User -->|"긴 API 직접호출 + CORS"| BE
+    User -->|"Auth SDK"| Supabase
+
+    BE -->|"JWT · DB · Storage"| Supabase
+    BE -->|"적재·검색 (HTTP, 내부망 IPv6)"| GR
+    BE -->|"그래프 조회 (직접)"| Neo4j
+    BE -->|"전사·보정"| LLM
+    GR -->|"지식 추출·저장"| Neo4j
+    GR -->|"추출·임베딩"| LLM
+```
+
+- **backend는 Neo4j에 직접도 붙는다**(그래프 조회) → graphiti와 **동일한 `NEO4J_*`** 필요.
+- **graphiti는 공개 도메인 없이 내부망 전용**(엔드포인트에 인증 없음).
+- **긴 요청(전사 등, ~150초)은 Netlify 프록시(~26초)를 우회**해 backend 직접 호출.
