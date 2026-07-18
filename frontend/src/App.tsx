@@ -37,6 +37,7 @@ type Project = {
   name: string;
   description: string;
   updatedAt: string;
+  date?: string;           // 생성일(절대 날짜) — 카드 상단 배지에 표시
   recordings: number;
   materials: number;
   status: string;
@@ -164,11 +165,18 @@ const formatProjectUpdatedAt = (value: string) => {
   return new Intl.DateTimeFormat('ko-KR', { month: 'numeric', day: 'numeric' }).format(new Date(timestamp));
 };
 
+const formatProjectDate = (value: string) => {
+  const timestamp = new Date(value).getTime();
+  if (!Number.isFinite(timestamp)) return '';
+  return new Intl.DateTimeFormat('ko-KR', { year: 'numeric', month: 'long', day: 'numeric' }).format(new Date(timestamp));
+};
+
 const hydrateStoredProject = (row: StoredProjectRow): Project => ({
   id: row.id,
   name: row.name,
   description: row.description,
   updatedAt: formatProjectUpdatedAt(row.updated_at),
+  date: formatProjectDate(row.created_at),
   recordings: row.recordings,
   materials: row.materials,
   status: row.status,
@@ -206,7 +214,6 @@ const createDefaultProjectName = (projects: Project[]) => {
   return `새 프로젝트 ${index}`;
 };
 
-const statusFilters = ['전체', '분석 중', '요약 완료', '자료 필요'];
 const homeSections = ['노트북', '즐겨찾기', '공유됨', '휴지통'];
 const adminNavItems = ['개요', '사용자', '작업 큐', '비용', '품질', '시스템'];
 const projectSortOptions = ['최근 수정순', '이름순', '녹음 많은 순'];
@@ -808,6 +815,7 @@ function App() {
         name: '테스트 녹음 프로젝트',
         description: '그래프 뷰와 전사 화면 확인용 임시 프로젝트',
         updatedAt: '방금',
+        date: formatProjectDate(new Date().toISOString()),
         recordings: 1,
         materials: 0,
         status: '분석 중',
@@ -2911,18 +2919,6 @@ function App() {
                 />
               </label>
 
-              <div className="filter-group" aria-label="project status filter">
-                {statusFilters.map((filter) => (
-                  <button
-                    className={filter === statusFilter ? 'selected' : ''}
-                    type="button"
-                    key={filter}
-                    onClick={() => setStatusFilter(filter)}
-                  >
-                    {filter}
-                  </button>
-                ))}
-              </div>
               {homeSection === '휴지통' && (
                 <button
                   className="empty-trash-button"
@@ -2951,7 +2947,7 @@ function App() {
                 <article className="home-project-card" key={project.id}>
                   <button className="project-card-main" type="button" onClick={() => openProject(project.index)}>
                     <div>
-                      <span className="project-state">{project.status}</span>
+                      <span className="project-state">{project.date || project.updatedAt}</span>
                       <h2>{project.name}</h2>
                       <p>{project.description}</p>
                     </div>
