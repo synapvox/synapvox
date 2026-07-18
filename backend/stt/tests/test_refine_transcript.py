@@ -51,11 +51,19 @@ def test_parse_llm_output_maps_id_to_corrected_text():
     assert corrections[1] == "네 알겠습니다"
 
 
-def test_parse_llm_output_rejects_id_mismatch():
-    raw = json.dumps({"segments": [{"id": 0, "text": "x"}]})
+def test_parse_llm_output_accepts_partial_and_ignores_unknown_ids():
+    # id 1은 누락, id 9는 expected에 없음 → 받은 0만 취하고 나머지는 무시(부분 수용)
+    raw = json.dumps({"segments": [{"id": 0, "text": "x"}, {"id": 9, "text": "무관"}]})
 
-    with pytest.raises(ValueError, match="mismatch"):
-        _parse_llm_output(raw, expected_ids={0, 1})
+    corrections = _parse_llm_output(raw, expected_ids={0, 1})
+
+    assert corrections == {0: "x"}
+
+
+def test_parse_llm_output_skips_blank_text():
+    raw = json.dumps({"segments": [{"id": 0, "text": "   "}, {"id": 1, "text": "정상"}]})
+
+    assert _parse_llm_output(raw, expected_ids={0, 1}) == {1: "정상"}
 
 
 def test_parse_llm_output_rejects_missing_segments_key():
@@ -149,9 +157,73 @@ def test_refine_transcript_splits_large_transcript_and_merges_in_order():
         client=client,
     )
 
-    assert [len(ids) for ids in client.batch_ids] == [60, 60, 5]
+    # 배치는 병렬 실행되어 호출 순서가 비결정적이므로 크기 구성만 검증(순서 무관).
+    # 최종 결과는 원본 세그먼트 순서로 재조립되므로 아래 순서 검증은 그대로 성립한다.
+    assert sorted((len(ids) for ids in client.batch_ids), reverse=True) == [60, 60, 5]
     assert [segment["id"] for segment in result["segments"]] == list(range(125))
     assert result["segments"][124]["text"] == "원문 124 교정"
+
+
+class _DropIdClient:
+    """호출별로 지정한 id를 빼고 반환하는 가짜 LLM — 부분 수용/누락 재요청 검증용."""
+
+    def __init__(self, drop_per_call):
+        self.drop_per_call = drop_per_call  # [set, set, ...] 각 호출에서 뺄 id
+        self.chat = type("Chat", (), {})()
+        self.chat.completions = self
+        self.batch_ids = []
+
+    def create(self, **request):
+        prompt = request["messages"][0]["content"]
+        transcript = prompt.split("# 전사문 세그먼트 (JSON)\n", 1)[1].split(
+            "\n\n# 출력 형식", 1
+        )[0]
+        segments = json.loads(transcript)
+        self.batch_ids.append([segment["id"] for segment in segments])
+        drop = self.drop_per_call[min(len(self.batch_ids) - 1, len(self.drop_per_call) - 1)]
+        return _FakeCompletionResponse(json.dumps({
+            "segments": [
+                {"id": s["id"], "text": f"{s['text']} 교정"}
+                for s in segments if s["id"] not in drop
+            ],
+        }, ensure_ascii=False))
+
+
+def test_refine_transcript_keeps_original_text_for_unrecovered_ids():
+    segments = [
+        {"id": i, "speaker": "A", "start": float(i), "end": float(i) + 1, "text": f"원문 {i}"}
+        for i in range(3)
+    ]
+    client = _DropIdClient(drop_per_call=[{1}])  # id 1은 끝까지 안 돌려줌
+
+    result = refine_transcript(
+        {"source": "x.wav", "segments": segments}, material_text="자료", client=client
+    )
+
+    texts = {s["id"]: s["text"] for s in result["segments"]}
+    assert texts[0] == "원문 0 교정"
+    assert texts[2] == "원문 2 교정"
+    assert texts[1] == "원문 1"  # 못 받은 id는 원문 유지 (배치 전체 재시도 안 함)
+    assert client.batch_ids[0] == [0, 1, 2]
+    assert client.batch_ids[-1] == [1]  # 누락분만 재요청
+
+
+def test_refine_transcript_accumulates_partial_across_retries():
+    segments = [
+        {"id": i, "speaker": "A", "start": float(i), "end": float(i) + 1, "text": f"원문 {i}"}
+        for i in range(2)
+    ]
+    # 첫 호출은 id 1 누락, 두 번째(누락분 재요청)에서 복구
+    client = _DropIdClient(drop_per_call=[{1}, set()])
+
+    result = refine_transcript(
+        {"source": "x.wav", "segments": segments}, material_text="자료", client=client
+    )
+
+    texts = {s["id"]: s["text"] for s in result["segments"]}
+    assert texts[0] == "원문 0 교정"
+    assert texts[1] == "원문 1 교정"  # 재요청에서 복구
+    assert client.batch_ids == [[0, 1], [1]]  # 초기 전체 + 누락분만
 
 
 class _FakeVectorStore:

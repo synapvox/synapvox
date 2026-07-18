@@ -1,6 +1,8 @@
 import argparse
+import contextvars
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from openai import OpenAI
@@ -12,11 +14,29 @@ from backend.observability import wrap_openai_client
 _MAX_RETRIES = 2
 _MAX_SEGMENTS_PER_REQUEST = 60
 _MAX_TRANSCRIPT_CHARS_PER_REQUEST = 12_000
+_DEFAULT_REFINEMENT_CONCURRENCY = 6
+# gpt-5 계열 기본 추론량. reasoning_effort="minimal"은 "모든 세그먼트 id를 정확히
+# 한 번씩 반환"을 자주 못 지켜(관측상 배치당 평균 2회 재시도) 호출을 낭비했다.
+# "low"로 올려 id 누락을 줄인다. STT_REFINEMENT_REASONING_EFFORT로 조정(빈 값이면 미지정).
+_DEFAULT_REFINEMENT_REASONING_EFFORT = "low"
 DEFAULT_REFINEMENT_MODEL = "gpt-5-mini"
 
 
 def refinement_model() -> str:
     return os.getenv("STT_REFINEMENT_MODEL") or DEFAULT_REFINEMENT_MODEL
+
+
+def refinement_concurrency() -> int:
+    """동시에 보낼 배치 수 상한. STT_REFINEMENT_CONCURRENCY로 조정(기본 6)."""
+    try:
+        return max(1, int(os.getenv("STT_REFINEMENT_CONCURRENCY") or _DEFAULT_REFINEMENT_CONCURRENCY))
+    except ValueError:
+        return _DEFAULT_REFINEMENT_CONCURRENCY
+
+
+def refinement_reasoning_effort() -> str:
+    """gpt-5 계열 reasoning_effort. 빈 문자열이면 파라미터 자체를 생략."""
+    return os.getenv("STT_REFINEMENT_REASONING_EFFORT", _DEFAULT_REFINEMENT_REASONING_EFFORT).strip()
 
 
 def _chunk_text(text: str, chunk_size: int = 300) -> list:
@@ -107,21 +127,27 @@ def build_refinement_prompt(segments: list, material_text: str = None, past_meet
 
 
 def _parse_llm_output(raw_content: str, expected_ids: set) -> dict:
+    """LLM 출력에서 사용 가능한 {id: 교정 텍스트}만 뽑는다(부분 수용).
+
+    JSON이 깨졌거나 'segments' 배열 자체가 없으면 재시도 대상(예외). 하지만 id가 일부
+    빠지거나 초과되는 건 오류로 보지 않는다 — expected_ids에 속하고 비어있지 않은 text만
+    취한다. 누락된 id는 호출부에서 원문을 유지한다. 엄격 검증으로 배치 전체를 재시도하며
+    호출을 낭비하던 기존 동작을 대체한다.
+    """
     data = json.loads(raw_content)
-    if "segments" not in data:
-        raise ValueError("missing 'segments' key in LLM output")
+    segments = data.get("segments") if isinstance(data, dict) else None
+    if not isinstance(segments, list):
+        raise ValueError("missing or invalid 'segments' array in LLM output")
 
-    got_ids = {s["id"] for s in data["segments"]}
-    if got_ids != expected_ids:
-        missing = sorted(expected_ids - got_ids)
-        unexpected = sorted(got_ids - expected_ids)
-        raise ValueError(
-            "segment id mismatch: "
-            f"missing={missing[:10]}{'...' if len(missing) > 10 else ''}, "
-            f"unexpected={unexpected[:10]}{'...' if len(unexpected) > 10 else ''}"
-        )
-
-    return {s["id"]: s["text"] for s in data["segments"]}
+    corrections: dict = {}
+    for item in segments:
+        if not isinstance(item, dict):
+            continue
+        seg_id = item.get("id")
+        text = item.get("text")
+        if seg_id in expected_ids and isinstance(text, str) and text.strip():
+            corrections[seg_id] = text
+    return corrections
 
 
 def _chunk_segments(
@@ -156,33 +182,47 @@ def _refine_segment_batch(
     material_text: str | None,
     past_meeting_texts: list | None,
 ) -> dict:
-    prompt = build_refinement_prompt(segments, material_text, past_meeting_texts)
-    expected_ids = {segment["id"] for segment in segments}
+    """배치를 교정해 {id: text}를 반환. 부분 수용 + 누락분만 재요청.
+
+    받은 교정은 누적하고, 아직 못 받은 id만 다음 시도에서 다시 요청한다(배치 전체를
+    통째로 재시도하지 않음). 재시도를 소진해도 남은 id는 반환에서 빠지며, 호출부가 원문을
+    유지한다. JSON/구조가 계속 깨져 아무것도 못 받은 경우에만 예외를 던진다.
+    """
+    by_id = {segment["id"]: segment for segment in segments}
+    expected_ids = set(by_id)
+    corrections: dict = {}
     last_error = None
+    effort = refinement_reasoning_effort()
 
     for attempt in range(_MAX_RETRIES + 1):
+        pending = [by_id[i] for i in by_id if i not in corrections]
+        if not pending:
+            break
+        prompt = build_refinement_prompt(pending, material_text, past_meeting_texts)
         retry_note = (
             ""
             if attempt == 0
-            else f"\n\n이전 응답 오류: {last_error}. 모든 id를 정확히 한 번씩 포함하세요."
+            else "\n\n일부 세그먼트가 누락됐습니다. 위 모든 id를 정확히 한 번씩 포함하세요."
         )
         request = {
             "model": model,
             "messages": [{"role": "user", "content": prompt + retry_note}],
             "response_format": {"type": "json_object"},
         }
-        if model.startswith("gpt-5"):
-            request["reasoning_effort"] = "minimal"
+        if model.startswith("gpt-5") and effort:
+            request["reasoning_effort"] = effort
         response = client.chat.completions.create(**request)
         content = response.choices[0].message.content
         try:
-            return _parse_llm_output(content, expected_ids)
+            corrections.update(_parse_llm_output(content, expected_ids))
         except (json.JSONDecodeError, ValueError) as exc:
             last_error = str(exc)
 
-    raise RuntimeError(
-        f"LLM refinement batch failed after {_MAX_RETRIES + 1} attempts: {last_error}"
-    )
+    if not corrections and last_error is not None:
+        raise RuntimeError(
+            f"LLM refinement batch failed after {_MAX_RETRIES + 1} attempts: {last_error}"
+        )
+    return corrections
 
 
 @traceable(name="Stage 2 transcript refinement", run_type="chain")
@@ -199,18 +239,31 @@ def refine_transcript(
     model = model or refinement_model()
     batches = _chunk_segments(data["segments"])
     corrections: dict = {}
-    for batch in batches:
-        corrections.update(
-            _refine_segment_batch(
-                client,
-                model,
-                batch,
-                material_text,
-                past_meeting_texts,
-            )
-        )
 
-    refined_segments = [{**seg, "text": corrections[seg["id"]]} for seg in data["segments"]]
+    if len(batches) <= 1:
+        for batch in batches:
+            corrections.update(
+                _refine_segment_batch(client, model, batch, material_text, past_meeting_texts)
+            )
+    else:
+        # 배치는 서로 독립(각자 자기 세그먼트 id만 교정)이라 병렬로 보낸다. 순차 합산이던
+        # 벽시계 시간이 배치 하나 수준으로 줄어든다. LangSmith 추적 트리가 스레드에서도
+        # 부모 run 아래에 붙도록 배치마다 현재 컨텍스트 사본에서 실행한다. 배치가 실패하면
+        # (재시도 소진 후 RuntimeError) executor.map 순회 중 그대로 전파된다.
+        def _run(batch: list) -> dict:
+            return contextvars.copy_context().run(
+                _refine_segment_batch, client, model, batch, material_text, past_meeting_texts
+            )
+
+        max_workers = min(len(batches), refinement_concurrency())
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for result in executor.map(_run, batches):
+                corrections.update(result)
+
+    # 교정을 못 받은 세그먼트는 원문(1차 전사)을 그대로 유지한다.
+    refined_segments = [
+        {**seg, "text": corrections.get(seg["id"], seg["text"])} for seg in data["segments"]
+    ]
     return {**data, "segments": refined_segments}
 
 
