@@ -183,6 +183,17 @@ async def _episode_ids_for_meeting(episode_ids: set[str], meeting_id: str) -> se
     return {record["uuid"] for record in result.records}
 
 
+async def _episode_titles(episode_ids: set[str]) -> dict[str, str]:
+    """에피소드 uuid → 제목. 제목에는 적재 규약상 meeting_id가 붙어 있어 출처 표기에 그대로 쓴다."""
+    if not episode_ids:
+        return {}
+    result = await _client().driver.execute_query(
+        "MATCH (e:Episodic) WHERE e.uuid IN $ids RETURN e.uuid AS uuid, e.name AS name",
+        ids=list(episode_ids),
+    )
+    return {record["uuid"]: str(record["name"] or "") for record in result.records}
+
+
 @app.post("/search")
 @traceable(name="Graphiti fact search", run_type="retriever")
 async def search(query: SearchQueryWithMeeting) -> dict:
@@ -195,7 +206,20 @@ async def search(query: SearchQueryWithMeeting) -> dict:
         episode_ids = {episode_id for edge in edges for episode_id in edge.episodes}
         matching = await _episode_ids_for_meeting(episode_ids, query.meeting_id)
         edges = [edge for edge in edges if matching.intersection(edge.episodes)]
-    return {"facts": [get_fact_result_from_edge(edge).model_dump(mode="json") for edge in edges]}
+    # fact가 어느 에피소드(강의/자료)에서 추출됐는지를 함께 내려보낸다 — 답변 인용 표기와
+    # 프론트 출처 연결에 사용. FactResult DTO에는 episodes가 없어 여기서 직접 붙인다.
+    titles = await _episode_titles(
+        {episode_id for edge in edges for episode_id in edge.episodes})
+    facts = []
+    for edge in edges:
+        fact = get_fact_result_from_edge(edge).model_dump(mode="json")
+        fact["sources"] = [
+            {"session_id": episode_id, "title": titles[episode_id]}
+            for episode_id in edge.episodes
+            if titles.get(episode_id)
+        ]
+        facts.append(fact)
+    return {"facts": facts}
 
 
 @app.delete("/group/{group_id}")

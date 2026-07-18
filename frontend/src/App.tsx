@@ -2138,6 +2138,7 @@ function App() {
 
     void (async () => {
       let assistantText = '';
+      let assistantCitations: { n: number; sessionId: string; title: string; nodeIds?: string[] }[] = [];
       try {
         const response = await fetch(`${API_BASE}/api/ask-stream`, {
           method: 'POST',
@@ -2157,6 +2158,11 @@ function App() {
             text?: string;
             answer?: string;
             message?: string;
+            hits?: {
+              session_id?: string;
+              node_ids?: string[];
+              sources?: { session_id: string; title: string }[];
+            }[];
             expansion?: { nodes?: { id: string }[] };
           };
           if (event.type === 'delta') {
@@ -2166,6 +2172,13 @@ function App() {
             }
           } else if (event.type === 'complete') {
             assistantText = event.answer ?? assistantText;
+            // 답변 [n] 인용 번호는 hits 배열 순서와 1:1 — 각 fact의 첫 출처 에피소드를 칩으로.
+            assistantCitations = (event.hits ?? []).flatMap((hit, hitIndex) => {
+              const source = hit.sources?.[0];
+              return source
+                ? [{ n: hitIndex + 1, sessionId: source.session_id, title: source.title, nodeIds: hit.node_ids ?? [] }]
+                : [];
+            });
             if (chatLoadRequestRef.current === requestId) {
               setChatGraphExpansion(new Set((event.expansion?.nodes ?? []).map((node) => node.id)));
             }
@@ -2194,7 +2207,11 @@ function App() {
       const completedMessages: StoredChatMessage[] = [
         ...chatMessages,
         userMessage,
-        { role: 'assistant', text: assistantText },
+        {
+          role: 'assistant',
+          text: assistantText,
+          ...(assistantCitations.length > 0 ? { citations: assistantCitations } : {}),
+        },
       ];
       if (chatLoadRequestRef.current === requestId) {
         setChatMessages(completedMessages);
@@ -3344,6 +3361,23 @@ function App() {
                       </Suspense>
                     ) : (
                       <p>{message.text || '답변 생성 중…'}</p>
+                    )}
+                    {message.citations !== undefined && message.citations.length > 0 && (
+                      <div className="chat-citations">
+                        {message.citations.map((citation) => (
+                          <button
+                            key={`${index}-${citation.n}`}
+                            type="button"
+                            className="chat-citation"
+                            title={`${citation.title} — 그래프에서 이 근거의 세션·개념 강조`}
+                            onClick={() => setChatGraphExpansion(
+                              new Set([citation.sessionId, ...(citation.nodeIds ?? [])]),
+                            )}
+                          >
+                            [{citation.n}] {citation.title}
+                          </button>
+                        ))}
+                      </div>
                     )}
                   </article>
                 ))}

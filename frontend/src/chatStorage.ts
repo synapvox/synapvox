@@ -3,6 +3,9 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 export type StoredChatMessage = {
   role: 'user' | 'assistant';
   text: string;
+  // 답변 속 [n] 인용 번호 → 근거 fact의 출처 에피소드(세션)와 fact 양끝 개념 노드.
+  // 칩 클릭 시 세션 + 개념 노드 + 그 사이 엣지를 그래프에서 강조한다.
+  citations?: { n: number; sessionId: string; title: string; nodeIds?: string[] }[];
 };
 
 export type StoredChatSession = {

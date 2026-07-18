@@ -384,6 +384,8 @@ class GsvxClient:
 
     def _expansion_for_facts(self, project: str, facts: list[dict]) -> dict:
         fact_ids = [str(f.get("uuid")) for f in facts if f.get("uuid")]
+        for fact in facts:
+            fact["node_ids"] = []
         if not fact_ids:
             return {"nodes": [], "edges": []}
         with self._neo4j_driver() as driver:
@@ -397,6 +399,7 @@ class GsvxClient:
                 ).data()
         nodes: dict[str, dict] = {}
         edges: list[dict] = []
+        fact_nodes: dict[str, list[str]] = {}
         for row in rows:
             nodes[row["src"]] = {
                 "id": row["src"], "type": "concept", "label": row["src_label"], "meta": {},
@@ -408,6 +411,11 @@ class GsvxClient:
                 "src": row["src"], "dst": row["dst"], "rel_type": "CONCEPT_RELATES_TO",
                 "concept_id": row["dst"], "concept_label": row["dst_label"], "weight": 1.0,
             })
+            fact_nodes.setdefault(str(row["fact_id"]), []).extend([row["src"], row["dst"]])
+        # 각 fact(hit)에 양끝 개념 노드 id를 붙인다 — 프론트 인용 칩이 세션 노드만이 아니라
+        # 해당 fact의 개념 노드·엣지까지 강조할 수 있게 한다.
+        for fact in facts:
+            fact["node_ids"] = fact_nodes.get(str(fact.get("uuid")), [])
         return {"nodes": list(nodes.values()), "edges": edges}
 
     @staticmethod
@@ -421,8 +429,10 @@ class GsvxClient:
             return "현재 과목 자료에서 질문과 관련된 근거를 찾지 못했습니다."
         from openai import OpenAI
 
+        # 근거에 번호와 출처를 붙여 증강 — 답변의 [n] 인용이 프론트에서 출처로 매핑된다.
         evidence = "\n".join(
-            f"- {fact.get('fact') or fact.get('name') or ''}" for fact in facts
+            f"[{i + 1}]{GsvxClient._source_label(fact)} {fact.get('fact') or fact.get('name') or ''}"
+            for i, fact in enumerate(facts)
         )
         prior_messages = [
             {"role": message["role"], "content": str(message.get("text") or "")}
@@ -439,7 +449,9 @@ class GsvxClient:
                     "content": (
                         "당신은 대학 강의 학습 도우미입니다. 제공된 Graphiti 근거만 사용해 "
                         "한국어로 정확하게 답하세요. Markdown을 사용하고 수식은 인라인 $...$ 또는 "
-                        "블록 $$...$$ LaTeX로 작성하세요. 근거가 부족하면 명확히 알리세요."
+                        "블록 $$...$$ LaTeX로 작성하세요. 근거가 부족하면 명확히 알리세요. "
+                        "답변의 각 주장 끝에는 그 주장이 기반한 근거 번호를 [1], [2] 형식으로 표기하세요. "
+                        "제공된 근거 번호 외의 번호를 만들어내지 마세요."
                     ),
                 },
                 *prior_messages,
@@ -447,6 +459,13 @@ class GsvxClient:
             ],
         )
         return response.choices[0].message.content or "답변을 생성하지 못했습니다."
+
+    @staticmethod
+    def _source_label(fact: dict) -> str:
+        """fact의 출처(에피소드 제목)를 근거 줄에 붙일 라벨로 만든다. 중복 제목은 한 번만."""
+        titles = [s.get("title") for s in fact.get("sources") or [] if s.get("title")]
+        unique = list(dict.fromkeys(titles))
+        return f" (출처: {', '.join(unique)})" if unique else ""
 
     @traceable(name="STT transcript to Graphiti", run_type="chain")
     def ingest_transcript(self, im: dict, project: str | None = None) -> dict:
