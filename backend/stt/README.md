@@ -20,8 +20,9 @@
 
 ## 구현 (v1.0 — feat/stt-pipeline-and-intermediate-format)
 
-기능정의서.pdf/PRD.pdf/ADR.pdf/TDD.pdf(2026-07-13, v1.0 MVP)를 정본으로 구현. **두 STT 경로 모두 존재하며
-동일한 중간 포맷으로 수렴**(`merge()`/`wrap_segments()`) — chunking/graphrag는 이 스키마 하나만 알면 됨.
+기능정의서.pdf/PRD.pdf/ADR.pdf/TDD.pdf(2026-07-13, v1.0 MVP)를 정본으로 구현. **관리형 API 경로(현재 둘)와
+로컬 검증 경로 모두 결국 동일한 중간 포맷으로 수렴**(`merge()`/`wrap_segments()`) — chunking/graphrag는 이
+스키마 하나만 알면 됨.
 
 ### 정식 경로 (ADR-005 정합 — 운영 대상)
 
@@ -31,8 +32,10 @@
 | `pdf_extractor.py` | PDF 텍스트(`pdfplumber`) + 임베딩 이미지 설명 추출 — 2026-07-14 신규(그전엔 PDF 추출기 자체가 없었음, 아래 참고) |
 | `image_description.py` | GPT-4o Vision으로 이미지(차트/표/스크린샷)를 한국어로 설명 — OCR 대체. PPTX/PDF 추출기가 공용으로 사용 |
 | `keyword_prompt.py` | 키워드 3요소 스코어링(자료 내 빈도 + 과거 빈도·최근성 + 일반 사전 대비 특이도) → STT 프롬프트 |
-| `stt_clova.py` | **ADR-005 정합 경로** — CLOVA Speech 관리형 API, 전사+화자분리 한 번의 호출로 완료 |
-| `stt_normalizer.py` | `wrap_segments()`(CLOVA 등 이미 화자분리된 소스 → 중간 포맷)/`validate()`. **`merge()`는 아래 로컬 검증 전용 도구**(같은 파일에 있지만 용도가 다름) |
+| `stt_clova.py` | ADR-005 정합 경로 ① — CLOVA Speech 관리형 API, 전사+화자분리 한 번의 호출로 완료 |
+| `stt_soniox.py` | ADR-005 정합 경로 ② (2026-07-16 신규) — Soniox 관리형 API, 전사+화자분리 한 번의 호출로 완료. 골든 데이터셋 9개 비교에서 CLOVA보다 WER 우세(아래 검증 결과) |
+| `stt.py` | **Soniox를 기본으로 호출, 실패 시 CLOVA로 자동 폴백**(2026-07-16 신규) — 두 엔진의 리턴 shape이 동일(`{"source","segments":[{"start","end","speaker","text"}]}`)하기 때문에 안전하게 스위칭 가능. 운영에서는 이 모듈을 통해 STT를 호출할 것(개별 `stt_clova`/`stt_soniox` 직접 호출은 엔진을 고정해야 할 특수 케이스에만) |
+| `stt_normalizer.py` | `wrap_segments()`(CLOVA/Soniox 등 이미 화자분리된 소스 → 중간 포맷)/`validate()`. **`merge()`는 아래 로컬 검증 전용 도구**(같은 파일에 있지만 용도가 다름) |
 | `refine_transcript.py` | Stage 2: OpenAI(`gpt-5-mini`, `STT_REFINEMENT_MODEL`로 변경 가능) 기반 RAG 정제. `retrieve_relevant_context()`는 청킹 후 `backend.graphrag.VectorStore`(pgvector, 2026-07-15부터 실제 통합 — 아래 알려진 제약 참고)에 저장/조회 |
 | `wer.py` | WER 계산(Levenshtein 기반 단어 단위) — Step 0 품질 검증용 |
 
@@ -57,12 +60,32 @@
 | CLOVA + `boostings` 도메인 키워드(2026-07-14) | 41.49% | 파라미터 자체는 `/recognizer/upload`에서 정상 동작 확인(에러 없음) — 다만 boost한 단어("추가경정예산안")를 CLOVA가 이미 boosting 없이도 맞히고 있어서 개선 효과는 못 봄(오히려 소폭 상승, 호출 간 노이즈 범위). "동작 확인"과 "효과 입증"은 별개 — 아래 알려진 제약 참고 |
 | `retrieve_relevant_context()` 리트리벌 정확성(2026-07-14) | — (WER 아님) | 관련/무관 문단을 섞은 합성 자료로 검증 — 관련 있는 문단은 남기고 무관한 문단은 정확히 걸러냄(top_k=1). WER 비교가 아니라 리트리벌 자체의 정확성 확인 목적 |
 
+### 골든 데이터셋 다중 회의 비교 — CLOVA vs Soniox (2026-07-16)
+
+위 표는 회의 1개(15분) 기준. `synapvox_Local`에 국회 영상회의록시스템(w3.assembly.go.kr)에서 수집한
+**9개 위원회 회의(총 약 7시간 57분, 화자 1~15인, 국회사무처 공식 회의록으로 정답 검증)**로 확장 비교한 결과
+— 데이터셋 자체(오디오/회의록)는 로컬 전용(「국회법」 제149조제2항, 상업적 사용 금지)이라 이 저장소에는
+포함하지 않고 결과만 옮김.
+
+**WER**: 9개 중 8개에서 Soniox 우세(평균 WER Soniox 23.5% vs CLOVA 26.9%). CLOVA가 유일하게 앞선 케이스는
+과학기술정보방송통신위원회(CLOVA 23.02% vs Soniox 25.18%) — 원인 미조사. → `stt.py`가 Soniox를 기본으로 삼은 근거.
+
+**화자분리 정확도**: WER과는 별개로 실제 발언자 수와 검출 화자 수를 비교(정답 확정된 8개 데이터셋 기준). 정확히
+일치: CLOVA 3/8, Soniox 1/8. 평균 절대오차: CLOVA 2.12명, Soniox 2.00명 — **WER은 Soniox가 우세하지만
+화자분리는 둘 다 신뢰하기 이른 수준**. 특히 **CLOVA는 8개 데이터셋 전부에서 검출 화자 수가 10명을 넘지
+않았음** — 실제 10명 이하 케이스(보건복지위 2부·농해수위·국방위)는 정확/근접했지만 12~15명 케이스(정무위·
+과방위·환노위 1·2부)는 예외 없이 정확히 10으로 잘림. 우연이라기엔 지나치게 일관적이라 **CLOVA Speech
+화자분리에 내부적으로 10명 상한이 있을 가능성**을 시사(NCP 공식 문서로 미확인 — 10인 이상 상임위처럼 화자가
+많은 실제 회의에 CLOVA를 쓸 경우 반드시 별도 검증 필요). Soniox는 그런 상한 없이 양방향 오차(정무위에서
++2 과다검출).
+
 ### 알려진 제약 (다음 사람이 이어받을 때 참고)
 
 - **PDF 추출기/이미지 설명은 2026-07-14 신규 — 그전까지 진짜 갭이었음** — 사용자 질문("이미지 있어도 제대로 처리되는거지?")으로 발견: PDF 자료 추출기가 아예 없었고(기능정의서는 PDF·PPTX 둘 다 요구), PPTX 추출기도 이미지 도형을 조용히 건너뛰고 있었음. `image_description.py`(GPT-4o Vision)로 해소 — 라이브 검증 결과 한글 텍스트가 든 이미지를 정확히 읽어냄 확인(단, 첫 시도는 테스트 이미지의 폰트가 한글 미지원이라 실패했었음 — 실제 기능 문제 아니었음). `describe_images=False`로 끄면 비용 없이 텍스트만 추출(구 동작).
 - **실제 회의자료(PPT/PDF) 기반 키워드 주입·정제는 미검증** — 위 결과는 전부 국회 회의록(자료 없음) 기준. `build_prompt(material_text=...)`/`refine_transcript(material_text=...)`가 실제로 도메인 용어 정확도를 끌어올리는지는 자료 있는 케이스로 별도 검증 필요(PRD §9 수용 기준의 일부가 여기 해당).
 - **`stt_clova.py`의 `boostings` 연동, 효과 미입증** — `transcribe_with_materials()`가 `keyword_prompt.build_prompt()` 결과를 CLOVA `boostings` 파라미터에 주입하도록 구현됨(NCP 문서는 `/recognizer/object-storage`에서만 이 필드를 명시하지만, 우리가 쓰는 `/recognizer/upload`도 라이브 호출로 정상 수락 확인). 다만 실제 WER 개선 효과는 아직 못 봤음 — CLOVA가 현재도 오인식하는 실제 도메인 용어가 있는 테스트 케이스가 있어야 제대로 검증 가능(위 "실제 회의자료 미검증" 항목과 같은 근본 원인).
-- **긴 오디오(1시간 이상) 미검증** — 위 수치는 15분 분량 기준. 같은 전체회의의 1부(1시간46분50초)는 아직 CLOVA로 실행 안 함.
+- **긴 오디오 검증 완료(2026-07-16)** — 위 15분 수치와 별개로, 골든 데이터셋 비교(위 섹션)에 1시간46분~2시간10분짜리 세션 3개(보건복지위 1부, 환노위 1·2부)가 포함되어 CLOVA/Soniox 둘 다 1시간 이상 오디오에서 정상 동작함을 실측 확인.
+- **CLOVA 화자분리 10명 상한 의심(2026-07-16, 미확인 가설)** — 위 골든 데이터셋 비교 참고. 화자 수가 많은 회의(상임위 다수가 10인 이상)에서 CLOVA 단독 사용 시 화자 수 검증 필요.
 - **`retrieve_relevant_context()`가 실제 통합 지점(`backend.graphrag.VectorStore`)을 쓰도록 전환됨 (2026-07-15)** — 예전엔 용하의 벡터 저장소가 준비 안 돼서 자체 청킹+코사인유사도로 임시 구현했었음(2026-07-14, 아래는 그 시점 검증 기록). PR #10(pgvector 전환, 팀 결정)이 병합되면서 `VectorStore.add_chunks()`(저장)/`query()`(조회)를 직접 호출하는 형태로 교체 완료 — `refine_transcript()`/`build_refinement_prompt()` 시그니처는 그대로지만 `retrieve_relevant_context()` 자체는 `project_id`/`meeting_id` 인자가 새로 필요해짐(청크를 프로젝트 스코프로 저장하기 위해). **`VectorStore`의 기본 embed_fn(OpenAI `text-embedding-3-small`)도 사용자가 임시로 지정한 것 — 팀 확정 사항 아니라 추후 바뀔 수 있음.** 실행에 `SUPABASE_DB_URL`+`OPENAI_API_KEY` 둘 다 필요. 실제 회의자료(PPT/PDF) 기반 검증은 여전히 미완(바로 아래 항목과 동일 갭).
 - **pyannote 직접 구현은 ADR-005 위반이지만 의도적 예외** — 비용 때문에 로컬 검증 단계에서만 유지, 운영 전환 시 CLOVA(또는 동급 관리형 API)로 전환 예정.
 - 로컬 스트리밍(마이크 실시간 캡처)은 미구현 — 현재 아키텍처는 녹음 완료 파일 입력을 전제(TDD 6단계 파이프라인 참고), Baseline의 "스트리밍 전사"는 배치 파일을 세그먼트 단위로 순차 출력하는 것을 가리킴. 실시간 캡처가 필요하면 스코프 재확인 필요.

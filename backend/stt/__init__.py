@@ -3,7 +3,7 @@
 integration 계층(D) 및 chunking(B)이 소비하는 공개 API:
 
     from backend.stt import extract_pptx, extract_pdf, resolve_prompt, merge, wrap_segments, validate
-    from backend.stt.stt_clova import transcribe as clova_transcribe
+    from backend.stt.stt import transcribe as managed_transcribe
     from backend.stt.stt_whisper import transcribe_with_materials
     from backend.stt.diarize_pyannote import diarize
     from backend.stt.refine_transcript import refine_transcript
@@ -12,8 +12,10 @@ integration 계층(D) 및 chunking(B)이 소비하는 공개 API:
                                              # GPT-4o Vision으로 설명해 텍스트에 인라인 포함(비용 발생,
                                              # describe_images=False로 끌 수 있음)
 
-    # 경로 A — 관리형 API (ADR-005 정합, 운영 권장): 전사+화자분리 한 번에
-    raw = clova_transcribe("meeting.m4a")
+    # 경로 A — 관리형 API (ADR-005 정합, 운영 권장): 전사+화자분리 한 번에.
+    # stt.transcribe()는 Soniox를 기본으로 호출하고 실패 시 CLOVA로 자동 폴백한다(둘 다 리턴 shape
+    # 동일). 엔진을 고정해야 하면 backend.stt.stt_clova / backend.stt.stt_soniox를 직접 호출.
+    raw = managed_transcribe("meeting.m4a")
     intermediate = wrap_segments(raw["segments"], source=raw["source"],
                                   date="2026-07-13", project_id="P01", meeting_id="M07")
 
@@ -28,9 +30,10 @@ integration 계층(D) 및 chunking(B)이 소비하는 공개 API:
     # Stage 2 — RAG 기반 정제 (OpenAI, pgvector 생기기 전까지는 컨텍스트 전량 투입)
     refined = refine_transcript(intermediate, material_text=material_text)
 
-두 STT 경로(CLOVA / Whisper+pyannote) 모두 최종적으로 이 모듈의 `merge()`/`wrap_segments()`를
+세 STT 경로(CLOVA / Soniox / Whisper+pyannote) 모두 최종적으로 이 모듈의 `merge()`/`wrap_segments()`를
 거쳐 동일한 중간 포맷 JSON(`schemas/intermediate_format.schema.json`)으로 수렴한다 — chunking/graphrag는
-이 스키마 하나만 알면 되고, STT 내부에서 어떤 엔진을 쓰는지는 몰라도 된다.
+이 스키마 하나만 알면 되고, STT 내부에서 어떤 엔진을 쓰는지는 몰라도 된다. CLOVA와 Soniox는 리턴 shape이
+동일해 `stt.py`에서 안전하게 스위칭된다(골든 데이터셋 9개 비교 결과는 README.md 참고).
 """
 
 # NOTE: stt_whisper.py(faster-whisper) / diarize_pyannote.py(pyannote.audio) /
