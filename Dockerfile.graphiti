@@ -37,5 +37,7 @@ RUN pip install --no-cache-dir -r /app/backend/requirements.txt
 COPY backend /app/backend
 
 # Railway가 주입하는 $PORT에 바인딩(미설정 시 8020).
+# Railway 내부망(*.railway.internal)은 IPv6라 backend가 내부로 호출하려면
+# IPv6에도 바인딩해야 한다. `::`는 듀얼스택이라 IPv4 연결도 함께 받는다.
 ENV PORT=8020
-CMD ["sh", "-c", "uvicorn backend.integration.graphiti_host:app --host 0.0.0.0 --port ${PORT}"]
+CMD ["sh", "-c", "uvicorn backend.integration.graphiti_host:app --host :: --port ${PORT}"]
