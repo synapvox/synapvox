@@ -142,6 +142,10 @@ def test_api_ingest_stt_uses_active_project(monkeypatch):
     monkeypatch.setattr(api_main, "_gsvx_client", lambda: _Graphiti())
     monkeypatch.setattr(api_main, "_owned_transcript_exists", lambda user, project, meeting: True)
     monkeypatch.setattr(api_main, "_owned_recording_source_id", lambda user, project, meeting: "recording-1")
+    monkeypatch.setattr(api_main, "_owned_source_record", lambda user, source: {
+        "id": source, "project_id": "project-uuid", "recording_id": source,
+        "kind": "recording", "original_name": "lecture.wav", "source_payload": {},
+    })
     monkeypatch.setattr(
         api_main,
         "_store_source_graph_episode_ids",
@@ -169,6 +173,65 @@ def test_api_ingest_stt_uses_active_project(monkeypatch):
     assert captured["project"] == "project-uuid"
     assert captured["source"] == "recording-1"
     assert captured["episodes"] == ["episode-1"]
+
+
+def test_api_ingest_stt_skips_when_recording_already_ingested(monkeypatch):
+    def _fail_client():
+        raise AssertionError("duplicate ingest must not reach Graphiti")
+
+    monkeypatch.setattr(api_main, "_gsvx_client", _fail_client)
+    monkeypatch.setattr(api_main, "_owned_transcript_exists", lambda user, project, meeting: True)
+    monkeypatch.setattr(api_main, "_owned_recording_source_id", lambda user, project, meeting: "recording-1")
+    monkeypatch.setattr(api_main, "_owned_source_record", lambda user, source: {
+        "id": source, "project_id": "project-uuid", "recording_id": source,
+        "kind": "recording", "original_name": "lecture.wav",
+        "source_payload": {"graphEpisodeIds": ["episode-1"]},
+    })
+    transcript = {
+        "source": "lecture.wav",
+        "meeting_id": "lecture-01",
+        "project_id": "display-name",
+        "date": "2026-07-15",
+        "mode": "lecture",
+        "segments": [
+            {"id": 0, "speaker": "A", "start": 0.0, "end": 1.0, "text": "그래프 이론"},
+        ],
+    }
+
+    response = TestClient(app).post(
+        "/api/ingest-stt",
+        headers={"X-Project-Id": "project-uuid", "X-API-Key": "test-key"},
+        json=transcript,
+    )
+
+    assert response.status_code == 409
+    assert "이미 등록된" in response.json()["detail"]
+
+
+def test_api_ingest_doc_skips_when_source_already_ingested(monkeypatch):
+    def _fail_client():
+        raise AssertionError("duplicate ingest must not reach Graphiti")
+
+    monkeypatch.setattr(api_main, "_gsvx_client", _fail_client)
+    monkeypatch.setattr(api_main, "_owned_source_record", lambda user, source: {
+        "id": source, "project_id": "project-uuid", "recording_id": None,
+        "kind": "document", "original_name": "notes.txt",
+        "source_payload": {"graphEpisodeIds": ["episode-doc"]},
+    })
+
+    response = TestClient(app).post(
+        "/api/ingest-doc",
+        headers={
+            "X-Project-Id": "project-uuid",
+            "X-Meeting-Id": "lecture-01",
+            "X-Source-Id": "material-123",
+            "X-API-Key": "test-key",
+        },
+        files={"file": ("notes.txt", b"graph theory notes", "text/plain")},
+    )
+
+    assert response.status_code == 409
+    assert "이미 등록된" in response.json()["detail"]
 
 
 def test_api_ingest_doc_stores_text_file(monkeypatch):

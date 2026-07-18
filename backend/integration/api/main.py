@@ -442,6 +442,21 @@ def _store_source_graph_episode_ids(user_id: str, source_id: str,
             )
 
 
+def _source_already_ingested(source: dict | None) -> bool:
+    """source_payload.graphEpisodeIds가 남아 있으면 이미 그래프에 반영된 소스다."""
+    if not source:
+        return False
+    payload = source.get("source_payload")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            return False
+    if not isinstance(payload, dict):
+        return False
+    return bool(payload.get("graphEpisodeIds"))
+
+
 def _owned_recording_source_id(user_id: str, project_id: str,
                                meeting_id: str) -> str | None:
     import psycopg2
@@ -712,11 +727,18 @@ async def ingest_stt_to_graph(
             status_code=409,
             detail="transcript must be saved before graph ingest",
         )
+    source_id = await run_in_threadpool(
+        _owned_recording_source_id, user_id, project_id, meeting_id)
+    if source_id:
+        source = await run_in_threadpool(_owned_source_record, user_id, source_id)
+        if _source_already_ingested(source):
+            raise HTTPException(
+                status_code=409,
+                detail="이미 등록된 전사입니다 — 그래프에 반영되어 있어 건너뜁니다.",
+            )
     try:
         result = await run_in_threadpool(
             _gsvx_client().ingest_transcript, transcript, project_id)
-        source_id = await run_in_threadpool(
-            _owned_recording_source_id, user_id, project_id, meeting_id)
         if source_id:
             await run_in_threadpool(
                 _store_source_graph_episode_ids,
@@ -758,6 +780,11 @@ async def ingest_doc_to_graph(
         source = await run_in_threadpool(_owned_source_record, user_id, x_source_id)
         if source is None or source["project_id"] != x_project_id:
             raise HTTPException(status_code=404, detail="source not found")
+        if _source_already_ingested(source):
+            raise HTTPException(
+                status_code=409,
+                detail="이미 등록된 자료입니다 — 그래프에 반영되어 있어 건너뜁니다.",
+            )
 
     suffix = Path(file.filename or "").suffix or ".bin"
     temp_path = None
