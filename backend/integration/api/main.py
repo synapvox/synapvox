@@ -1032,6 +1032,7 @@ def _ask_stream_events(
     """
     try:
         client = _gsvx_client()
+        yield _ndjson_event("status", stage="searching")
         if hasattr(client, "ask_stream"):
             events = (
                 client.ask_stream(project, q, k, meeting_id, history=history)
@@ -1042,7 +1043,9 @@ def _ask_stream_events(
             pending = ""
             final: dict | None = None
             for event in events:
-                if event.get("type") == "delta":
+                if event.get("type") == "status":
+                    yield _ndjson_event("status", stage=str(event.get("stage") or ""))
+                elif event.get("type") == "delta":
                     pending += str(event.get("text") or "")
                     total = emitted + pending
                     # 끝의 '$'/'\'는 다음 조각과 합쳐야 구분자인지 알 수 있어 보류한다.

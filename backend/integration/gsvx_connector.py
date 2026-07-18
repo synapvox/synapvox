@@ -288,6 +288,7 @@ class GsvxClient:
         마지막에 ask()와 동일한 페이로드의 {'type': 'complete', ...}를 낸다.
         검색·expansion은 스트리밍 전에 끝내므로 complete의 hits/expansion은 ask()와 같다."""
         facts, expansion = self._retrieve(project, question, k, meeting_id)
+        yield {"type": "status", "stage": "answering"}  # 검색 종료 → 생성 시작 신호
         parts: list[str] = []
         for piece in self._stream_answer_from_facts(question, facts, history=history):
             parts.append(piece)

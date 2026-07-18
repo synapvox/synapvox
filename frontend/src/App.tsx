@@ -409,6 +409,8 @@ function App() {
   const [workspaceLoadedProjectId, setWorkspaceLoadedProjectId] = useState<string | null>(null);
   const [graphReloadKey, setGraphReloadKey] = useState(0);
   const [chatGraphExpansion, setChatGraphExpansion] = useState<Set<string> | null>(null);
+  // 스트리밍 진행 단계 — 첫 delta가 오기 전 placeholder 문구(근거 검색 중/답변 생성 중)에 사용.
+  const [chatStreamStage, setChatStreamStage] = useState<'searching' | 'answering' | null>(null);
   // 펼쳐진 인용 칩의 키(`${세션id}-${메시지index}-${n}`) — 채팅 세션이 바뀌면 키가 안 맞아 자연히 닫힌다.
   const [openChatCitationKey, setOpenChatCitationKey] = useState<string | null>(null);
   // 키에 대응하는 인용 데이터 — 그래프 모듈의 출처 드로어(노드 상세와 같은 자리)에 띄운다.
@@ -2149,6 +2151,7 @@ function App() {
     setChatMessages(pendingMessages);
     setChatInput('');
     setIsChatResponding(true);
+    setChatStreamStage('searching');
 
     void (async () => {
       let assistantText = '';
@@ -2168,7 +2171,8 @@ function App() {
         const consumeLine = (line: string) => {
           if (!line.trim()) return;
           const event = JSON.parse(line) as {
-            type: 'delta' | 'complete' | 'error';
+            type: 'delta' | 'complete' | 'error' | 'status';
+            stage?: string;
             text?: string;
             answer?: string;
             message?: string;
@@ -2202,6 +2206,10 @@ function App() {
             });
             if (chatLoadRequestRef.current === requestId) {
               setChatGraphExpansion(new Set((event.expansion?.nodes ?? []).map((node) => node.id)));
+            }
+          } else if (event.type === 'status') {
+            if (chatLoadRequestRef.current === requestId) {
+              setChatStreamStage(event.stage === 'answering' ? 'answering' : 'searching');
             }
           } else if (event.type === 'error') {
             streamError = event.message ?? 'AI 답변을 생성하지 못했습니다.';
@@ -2237,6 +2245,7 @@ function App() {
       if (chatLoadRequestRef.current === requestId) {
         setChatMessages(completedMessages);
         setIsChatResponding(false);
+        setChatStreamStage(null);
       }
       try {
         const savedSession = await saveProjectChat(
@@ -3389,7 +3398,7 @@ function App() {
                         <AssistantMessage text={message.text} />
                       </Suspense>
                     ) : (
-                      <p>{message.text || '답변 생성 중…'}</p>
+                      <p>{message.text || (chatStreamStage === 'searching' ? '근거 검색 중…' : '답변 생성 중…')}</p>
                     )}
                     {message.citations !== undefined && message.citations.length > 0 && (
                       <div className="chat-citations">

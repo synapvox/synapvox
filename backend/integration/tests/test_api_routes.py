@@ -285,6 +285,7 @@ def test_has_open_math_detects_unclosed_delimiters():
 def test_api_ask_stream_relays_tokens_and_buffers_open_math(monkeypatch):
     class _Graphiti:
         def ask_stream(self, project, question, k, meeting_id=None, history=None):
+            yield {"type": "status", "stage": "answering"}
             yield {"type": "delta", "text": "손실은 "}
             yield {"type": "delta", "text": "$$L"}
             yield {"type": "delta", "text": " = 1$$"}
@@ -306,6 +307,9 @@ def test_api_ask_stream_relays_tokens_and_buffers_open_math(monkeypatch):
     deltas = [event["text"] for event in events if event["type"] == "delta"]
 
     assert response.status_code == 200
+    # 검색 시작(searching) → 검색 종료·생성 시작(answering) 상태가 delta보다 먼저 온다.
+    assert [event["stage"] for event in events if event["type"] == "status"] == ["searching", "answering"]
+    assert events[0]["type"] == "status"
     # 열린 $$ 블록은 닫힐 때까지 버퍼링 — 어떤 delta도 미완성 수식으로 끝나지 않는다.
     for index in range(len(deltas)):
         assert not api_main._has_open_math("".join(deltas[:index + 1]))
