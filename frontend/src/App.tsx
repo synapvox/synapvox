@@ -117,6 +117,11 @@ const ACTIVE_PROJECT_STORAGE_KEY = 'synapvox-active-project';
 const SUPABASE_ADMIN_EMAIL = 'root@synapvox.local';
 const scopedStorageKey = (baseKey: string, userId: string | null) => `${baseKey}:${userId ?? 'guest'}`;
 
+// 오래 걸리는 요청(전사·그래프 적재·채팅 스트리밍)은 Netlify 프록시(~26초 타임아웃)를
+// 우회해 backend로 직접 보낸다. VITE_API_BASE_URL 미설정(로컬 개발) 시 빈 문자열 →
+// same-origin(/api → vite proxy)으로 동작. 짧은 요청은 그대로 /api 프록시를 쓴다.
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? '';
+
 const authUserFromSession = (session: Session | null): AuthUser | null => {
   if (session === null) return null;
   const metadataName = session.user.user_metadata.name;
@@ -1409,7 +1414,7 @@ function App() {
       markMeta('그래프 분석 중…');
       const form = new FormData();
       form.append('file', file, file.name);
-      const response = await fetch('/api/ingest-doc', {
+      const response = await fetch(`${API_BASE}/api/ingest-doc`, {
         method: 'POST',
         headers: {
           ...(await apiHeaders(projectId, meetingId)),
@@ -1773,7 +1778,7 @@ function App() {
 
       await new Promise((resolve) => window.setTimeout(resolve, 250));
       setTranscriptionStep(2);
-      const response = await fetch('/api/stt/transcribe', {
+      const response = await fetch(`${API_BASE}/api/stt/transcribe`, {
         method: 'POST',
         headers: await apiHeaders(activeProjectId),
         body,
@@ -1863,7 +1868,7 @@ function App() {
       // 전사 자체보다 오래 걸리므로 뒤에서 수행하고 소스 카드 상태로 결과를 알린다.
       void (async () => {
         try {
-          const ingestResponse = await fetch('/api/ingest-stt', {
+          const ingestResponse = await fetch(`${API_BASE}/api/ingest-stt`, {
             method: 'POST',
             headers: {
               ...(await apiHeaders(activeProjectId)),
@@ -2126,7 +2131,7 @@ function App() {
     void (async () => {
       let assistantText = '';
       try {
-        const response = await fetch('/api/ask-stream', {
+        const response = await fetch(`${API_BASE}/api/ask-stream`, {
           method: 'POST',
           headers: { ...(await apiHeaders(projectId)), 'Content-Type': 'application/json' },
           body: JSON.stringify({ project: projectId, q: query, k: 6, history }),
