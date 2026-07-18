@@ -251,12 +251,7 @@ class GsvxClient:
         사실로만 결과를 좁힌다 — group_id는 그대로 프로젝트 단위라 세션 간 엔티티 중복
         제거(dedup)는 안 깨진다(dedup은 group_id 스코프라서, 미팅별 group_id로 쪼개면
         같은 인물/개념이 회의마다 중복 생성됨 — 그래서 사후 필터링 방식을 씀)."""
-        body = {"group_ids": [project], "query": question, "max_facts": k}
-        if meeting_id:
-            body["meeting_id"] = meeting_id
-        search = self._request("POST", "/search", body=body)
-        facts = search.get("facts") if isinstance(search.get("facts"), list) else []
-        expansion = self._expansion_for_facts(project, facts)
+        facts, expansion = self._retrieve(project, question, k, meeting_id)
         answer = (
             self._answer_from_facts(question, facts, history=history)
             if history
@@ -267,6 +262,38 @@ class GsvxClient:
             "hits": facts,
             "expansion": expansion,
         }
+
+    def ask_stream(
+        self,
+        project: str,
+        question: str,
+        k: int = 6,
+        meeting_id: str | None = None,
+        history: list[dict] | None = None,
+    ):
+        """ask()의 스트리밍 버전 — {'type': 'delta', 'text'} 이벤트를 생성되는 대로 내고,
+        마지막에 ask()와 동일한 페이로드의 {'type': 'complete', ...}를 낸다.
+        검색·expansion은 스트리밍 전에 끝내므로 complete의 hits/expansion은 ask()와 같다."""
+        facts, expansion = self._retrieve(project, question, k, meeting_id)
+        parts: list[str] = []
+        for piece in self._stream_answer_from_facts(question, facts, history=history):
+            parts.append(piece)
+            yield {"type": "delta", "text": piece}
+        yield {
+            "type": "complete",
+            "answer": "".join(parts) or "답변을 생성하지 못했습니다.",
+            "hits": facts,
+            "expansion": expansion,
+        }
+
+    def _retrieve(self, project: str, question: str, k: int,
+                  meeting_id: str | None) -> tuple[list[dict], dict]:
+        body = {"group_ids": [project], "query": question, "max_facts": k}
+        if meeting_id:
+            body["meeting_id"] = meeting_id
+        search = self._request("POST", "/search", body=body)
+        facts = search.get("facts") if isinstance(search.get("facts"), list) else []
+        return facts, self._expansion_for_facts(project, facts)
 
     def concept(self, project: str, concept_id: str) -> dict:
         with self._neo4j_driver() as driver:
@@ -419,16 +446,12 @@ class GsvxClient:
         return {"nodes": list(nodes.values()), "edges": edges}
 
     @staticmethod
-    @traceable(name="AI answer from Graphiti facts", run_type="chain")
-    def _answer_from_facts(
+    def _answer_messages(
         question: str,
         facts: list[dict],
         history: list[dict] | None = None,
-    ) -> str:
-        if not facts:
-            return "현재 과목 자료에서 질문과 관련된 근거를 찾지 못했습니다."
-        from openai import OpenAI
-
+    ) -> list[dict]:
+        """답변 LLM에 보낼 messages 조립 — 동기(_answer_from_facts)·스트리밍 경로 공용."""
         # 근거에 번호와 출처를 붙여 증강 — 답변의 [n] 인용이 프론트에서 출처로 매핑된다.
         evidence = "\n".join(
             f"[{i + 1}]{GsvxClient._source_label(fact)} {fact.get('fact') or fact.get('name') or ''}"
@@ -439,26 +462,63 @@ class GsvxClient:
             for message in (history or [])[-20:]
             if message.get("role") in {"user", "assistant"} and str(message.get("text") or "").strip()
         ]
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "당신은 대학 강의 학습 도우미입니다. 제공된 Graphiti 근거만 사용해 "
+                    "한국어로 정확하게 답하세요. Markdown을 사용하고 수식은 인라인 $...$ 또는 "
+                    "블록 $$...$$ LaTeX로 작성하세요. 근거가 부족하면 명확히 알리세요. "
+                    "답변의 각 주장 끝에는 그 주장이 기반한 근거 번호를 [1], [2] 형식으로 표기하세요. "
+                    "제공된 근거 번호 외의 번호를 만들어내지 마세요."
+                ),
+            },
+            *prior_messages,
+            {"role": "user", "content": f"질문: {question}\n\nGraphiti 근거:\n{evidence}"},
+        ]
+
+    @staticmethod
+    @traceable(name="AI answer from Graphiti facts", run_type="chain")
+    def _answer_from_facts(
+        question: str,
+        facts: list[dict],
+        history: list[dict] | None = None,
+    ) -> str:
+        if not facts:
+            return "현재 과목 자료에서 질문과 관련된 근거를 찾지 못했습니다."
+        from openai import OpenAI
+
         client = wrap_openai_client(OpenAI(api_key=os.getenv("OPENAI_API_KEY")))
         response = client.chat.completions.create(
             model=os.getenv("GRAPHITI_ANSWER_MODEL") or DEFAULT_ANSWER_MODEL,
             temperature=0.2,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "당신은 대학 강의 학습 도우미입니다. 제공된 Graphiti 근거만 사용해 "
-                        "한국어로 정확하게 답하세요. Markdown을 사용하고 수식은 인라인 $...$ 또는 "
-                        "블록 $$...$$ LaTeX로 작성하세요. 근거가 부족하면 명확히 알리세요. "
-                        "답변의 각 주장 끝에는 그 주장이 기반한 근거 번호를 [1], [2] 형식으로 표기하세요. "
-                        "제공된 근거 번호 외의 번호를 만들어내지 마세요."
-                    ),
-                },
-                *prior_messages,
-                {"role": "user", "content": f"질문: {question}\n\nGraphiti 근거:\n{evidence}"},
-            ],
+            messages=GsvxClient._answer_messages(question, facts, history),
         )
         return response.choices[0].message.content or "답변을 생성하지 못했습니다."
+
+    @staticmethod
+    def _stream_answer_from_facts(
+        question: str,
+        facts: list[dict],
+        history: list[dict] | None = None,
+    ):
+        """_answer_from_facts의 스트리밍 버전 — 답변 텍스트 조각을 생성되는 대로 낸다."""
+        if not facts:
+            yield "현재 과목 자료에서 질문과 관련된 근거를 찾지 못했습니다."
+            return
+        from openai import OpenAI
+
+        client = wrap_openai_client(OpenAI(api_key=os.getenv("OPENAI_API_KEY")))
+        stream = client.chat.completions.create(
+            model=os.getenv("GRAPHITI_ANSWER_MODEL") or DEFAULT_ANSWER_MODEL,
+            temperature=0.2,
+            messages=GsvxClient._answer_messages(question, facts, history),
+            stream=True,
+        )
+        for chunk in stream:
+            piece = chunk.choices[0].delta.content if chunk.choices else None
+            if piece:
+                yield piece
 
     @staticmethod
     def _source_label(fact: dict) -> str:

@@ -272,6 +272,49 @@ def test_api_ask_stream_emits_deltas_then_focus_graph(monkeypatch):
     assert events[-1]["expansion"]["nodes"][0]["id"] == "t1"
 
 
+def test_has_open_math_detects_unclosed_delimiters():
+    assert api_main._has_open_math("합은 $$L = 1")
+    assert not api_main._has_open_math("합은 $$L = 1$$ 이다")
+    assert api_main._has_open_math("학습률 $\\eta")
+    assert not api_main._has_open_math("학습률 $\\eta$ 는 보폭")
+    assert api_main._has_open_math("블록 \\[ x")
+    assert not api_main._has_open_math("블록 \\[ x \\] 끝")
+    assert not api_main._has_open_math("수식 없는 문장")
+
+
+def test_api_ask_stream_relays_tokens_and_buffers_open_math(monkeypatch):
+    class _Graphiti:
+        def ask_stream(self, project, question, k, meeting_id=None, history=None):
+            yield {"type": "delta", "text": "손실은 "}
+            yield {"type": "delta", "text": "$$L"}
+            yield {"type": "delta", "text": " = 1$$"}
+            yield {"type": "delta", "text": " 이다 [1]"}
+            yield {
+                "type": "complete",
+                "answer": "손실은 $$L = 1$$ 이다 [1]",
+                "hits": [{"uuid": "f1"}],
+                "expansion": {"nodes": [], "edges": []},
+            }
+
+    monkeypatch.setattr(api_main, "_gsvx_client", lambda: _Graphiti())
+
+    response = TestClient(app).get(
+        "/api/ask-stream",
+        params={"project": "project-uuid", "q": "손실이 뭐야", "k": 4},
+    )
+    events = [json.loads(line) for line in response.text.splitlines() if line]
+    deltas = [event["text"] for event in events if event["type"] == "delta"]
+
+    assert response.status_code == 200
+    # 열린 $$ 블록은 닫힐 때까지 버퍼링 — 어떤 delta도 미완성 수식으로 끝나지 않는다.
+    for index in range(len(deltas)):
+        assert not api_main._has_open_math("".join(deltas[:index + 1]))
+    assert "".join(deltas) == "손실은 $$L = 1$$ 이다 [1]"
+    assert events[-1]["type"] == "complete"
+    assert events[-1]["answer"] == "손실은 $$L = 1$$ 이다 [1]"
+    assert events[-1]["hits"] == [{"uuid": "f1"}]
+
+
 def test_api_ask_stream_post_uses_graphiti_question(monkeypatch):
     captured = {}
 
