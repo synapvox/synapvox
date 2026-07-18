@@ -63,9 +63,18 @@ validate = _normalizer.validate
 wrap_segments = _normalizer.wrap_segments
 app = FastAPI(title="SynapVox Integration API")
 
+# 배포된 프론트(예: Netlify)가 오래 걸리는 요청을 Netlify 프록시(~26초 타임아웃)로
+# 보내지 않고 backend를 직접 호출할 때 CORS가 필요하다. 허용 출처는
+# SYNAPVOX_ALLOWED_ORIGINS(쉼표 구분)로 추가한다. 로컬 개발 출처는 기본 포함.
+_default_allowed_origins = ["http://127.0.0.1:5173", "http://localhost:5173"]
+_extra_allowed_origins = [
+    origin.strip()
+    for origin in os.getenv("SYNAPVOX_ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
+    allow_origins=_default_allowed_origins + _extra_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
