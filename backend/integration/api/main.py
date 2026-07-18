@@ -218,7 +218,9 @@ def _dev_transcript(source: str, project_id: str, meeting_id: str) -> dict:
 def _transcribe_with_clova(audio_path: str, source: str, project_id: str, meeting_id: str,
                            material_text: str | None = None,
                            content_date: str | None = None) -> dict:
-    clova = _load_stt_module("stt_clova")
+    # stt.py 디스패처 사용: Soniox 기본, 실패(키 미설정 포함) 시 CLOVA 폴백.
+    # PR #39가 디스패처를 추가했지만 API 연결은 빠져 있어 Soniox가 사용되지 않던 것을 잇는다.
+    clova = _load_stt_module("stt")
 
     clova_started = time.perf_counter()
     if material_text and hasattr(clova, "transcribe_with_materials"):
