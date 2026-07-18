@@ -1,0 +1,29 @@
+# Netlify 배포 설정 (base directory = frontend 기준)
+#
+# 핵심은 /api 프록시: 브라우저는 같은 출처(Netlify 도메인)로 /api를 호출하고,
+# Netlify가 서버 사이드에서 Railway backend로 전달한다. 브라우저에서 나가는
+# cross-origin 요청이 없으므로 backend CORS 설정을 건드릴 필요가 없다.
+# frontend 코드는 이미 /api 로만 호출하므로(App.tsx, graphmodule/api/client.ts)
+# 추가 코드 변경도 없다.
+
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+[build.environment]
+  # Vite 8 + React 19 빌드에 필요한 Node 버전 고정(Railway 빌드도 22였음)
+  NODE_VERSION = "22"
+
+# /api/* → Railway backend 로 프록시 (status 200 = 리라이트, 주소창은 그대로 유지).
+# force=true 로 아래 SPA fallback 보다 우선 적용. backend URL이 바뀌면 여기만 수정.
+[[redirects]]
+  from = "/api/*"
+  to = "https://synapvoxbackend-production.up.railway.app/api/:splat"
+  status = 200
+  force = true
+
+# SPA fallback: 그 외 모든 경로는 index.html 로.
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
