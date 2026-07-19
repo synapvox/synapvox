@@ -133,6 +133,9 @@ type Status = 'loading' | 'error' | 'ready'
 
 export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function GraphView(props, ref) {
   const { project, projectName, reloadKey, onGraphMeta, onSelectNode, onSessions, highlightId, timelineMode } = props
+  // drawNode(deps=[])가 live 값을 읽도록 ref로 보관 — 시간순 모드에서 세션에 날짜 라벨 표시
+  const timelineModeRef = useRef(timelineMode)
+  timelineModeRef.current = timelineMode
 
   const wrapRef = useRef<HTMLDivElement | null>(null)
   const fgRef = useRef<FGRef | undefined>(undefined)
@@ -499,6 +502,12 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
         ctx.shadowBlur = 3
         ctx.fillStyle = LABEL_INK
         ctx.fillText(label, x, y + r + 3 / globalScale)
+        // 시간순 모드: 세션 아래에 날짜(valid_at)를 함께 표기 → 시간 순서 확인 가능
+        if (isSession && timelineModeRef.current && node.date) {
+          ctx.font = `600 ${9.5 / globalScale}px ${LABEL_FONT}`
+          ctx.fillStyle = '#2b5797'
+          ctx.fillText(node.date, x, y + r + 3 / globalScale + fontSize + 2 / globalScale)
+        }
         ctx.restore()
       }
     },
@@ -580,7 +589,9 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
   const handleNodeClick = useCallback(
     (node: NodeObject<FNode>) => {
       selectedIdRef.current = node.id // keep its label shown (session labels need this)
-      onSelectNode?.(node as FNode)
+      // 시간순 모드의 개념 사본 id는 'uuid::세션id' — 상세 조회는 원본 uuid로 넘긴다
+      const rawId = node.id.includes('::') ? node.id.slice(0, node.id.indexOf('::')) : node.id
+      onSelectNode?.(rawId === node.id ? (node as FNode) : { ...(node as FNode), id: rawId })
     },
     [onSelectNode],
   )
