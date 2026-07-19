@@ -365,6 +365,22 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
     const fg = fgRef.current
     if (!displayData) return
     const sessions = displayData.nodes.filter((n) => n.type === 'session')
+
+    // 링크 당기는 힘을 모드별로 조정: 시간순 모드에선 세션→개념(언급)은 강하게,
+    // 개념↔개념은 약하게 → 사본이 자기 세션에 바짝 붙고, 다른 개념에 끌려 가운데로
+    // 가지 않는다(a—b—b—c에서 a쪽 b는 a에 붙음). 기본 모드는 원래 값으로 복원.
+    const linkForce = fg?.d3Force('link') as unknown as {
+      strength?: (fn: (l: { source: FNode | string; target: FNode | string; relClass?: string; dashed?: boolean }) => number) => unknown
+    } | undefined
+    linkForce?.strength?.((l) => {
+      if (l.dashed) return 0
+      const st = typeof l.source === 'object' ? l.source.type : undefined
+      const tt = typeof l.target === 'object' ? l.target.type : undefined
+      if (st === 'main' || tt === 'main') return 0.18
+      if (l.relClass === 'mentions') return timelineMode ? 0.5 : 0.07
+      return timelineMode ? 0.04 : 0.22
+    })
+
     if (!timelineMode) {
       for (const s of sessions) { s.fx = undefined; s.fy = undefined }
       fg?.d3ReheatSimulation()
