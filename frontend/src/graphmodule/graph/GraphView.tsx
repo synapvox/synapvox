@@ -10,7 +10,7 @@
 // force-graph's default autoPauseRedraw pauses the idle redraw loop and revives
 // it on pointer interaction, so "calm at rest" never means "dead frozen frame".
 
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react'
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react'
 import ForceGraph2D, {
   type ForceGraphMethods,
   type NodeObject,
@@ -19,6 +19,7 @@ import ForceGraph2D, {
 import { getGraph, ApiError } from '../api/client'
 import { mapGraph } from './mapGraph'
 import { buildForceData, type FNode, type FLink } from './buildForceData'
+import { splitSharedForTimeline } from './timelineSplit'
 import { loadPositions, savePositions } from './positionCache'
 import { nodeRadius, nodeCoreColor, linkColor } from './render'
 import { labelOpacity } from './lod'
@@ -348,13 +349,20 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
     return () => cancelAnimationFrame(raf)
   }, [data])
 
+  // ── 시간순 모드 렌더 데이터: 공유 개념을 세션별 사본으로 분리(가운데 몰림 방지) ──
+  // 시각화 전용 — 원본 data는 그대로 두고 ForceGraph에 넘길 노드/링크만 변환한다.
+  const displayData = useMemo(
+    () => (timelineMode && data ? splitSharedForTimeline(data) : data),
+    [timelineMode, data],
+  )
+
   // ── 시간순 레이아웃: 세션을 날짜(valid_at)순으로 x축에 고정 (과거=왼쪽, 최신=오른쪽) ──
   // timelineMode가 켜지면 날짜가 있는 세션 노드의 fx를 날짜 비율로 핀 고정하고, 꺼지면
-  // 핀을 풀어 기존 force 배치로 되돌린다. 개념 노드는 링크에 끌려 각 세션 x 주변에 모인다.
+  // 핀을 풀어 기존 force 배치로 되돌린다. 개념 사본은 링크에 끌려 각 세션 x 주변에 모인다.
   useEffect(() => {
     const fg = fgRef.current
-    if (!data) return
-    const sessions = data.nodes.filter((n) => n.type === 'session')
+    if (!displayData) return
+    const sessions = displayData.nodes.filter((n) => n.type === 'session')
     if (!timelineMode) {
       for (const s of sessions) s.fx = undefined
       fg?.d3ReheatSimulation()
@@ -374,7 +382,7 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
       s.fx = (frac - 0.5) * spread
     }
     fg?.d3ReheatSimulation()
-  }, [timelineMode, data])
+  }, [timelineMode, displayData])
 
   // ── Draw helpers ──────────────────────────────────────────────────────────
   const drawNode = useCallback(
@@ -606,7 +614,7 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
       {showGraph && data && (
         <ForceGraph2D<FNode, FLink>
           ref={fgRef}
-          graphData={data}
+          graphData={displayData ?? data}
           width={dims.w}
           height={dims.h}
           backgroundColor={CANVAS_BG}

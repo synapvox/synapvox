@@ -18,6 +18,7 @@ export type FNode = {
   x?: number
   y?: number
   fx?: number // d3-force 수평 핀 (시간순 모드에서 세션을 날짜별 x에 고정)
+  fy?: number // d3-force 수직 핀
 }
 
 export type FRelClass = RelClass
