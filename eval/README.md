@@ -1,6 +1,6 @@
 # RAG 평가 하네스
 
-설계: 저장소 밖 `rag-evaluation-plan.md` §3 · 게이트 기준: `qa-plan.md` §3
+설계: `eval/rag-evaluation-plan.md`(리뷰 5 확정판) §3 · 게이트 기준: 저장소 밖 `qa-plan.md` §3
 
 ## 사용
 
