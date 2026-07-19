@@ -38,8 +38,8 @@ eval/
 
 ## 골드셋
 
-`dataset/goldset.jsonl` — **Chapter 4 대본(범주형 데이터·로지스틱 회귀) 기준 48문항**:
-definition 10 · relation 10 · multi_hop 10 · causal 6 · temporal 6 · global 3 · abstain 3.
+`dataset/goldset.jsonl` — **Chapter 4 대본(범주형 데이터·로지스틱 회귀) 기준 49문항**:
+definition 10 · relation 10 · multi_hop 10(전원 세션 간) · causal 7 · temporal 6 · global 3 · abstain 3.
 멀티홉 질문은 각 gold 세션의 개념 앵커를 대본 용어로 1개 이상 포함하되(검색 가능성),
 연결 논리 자체는 질문에 넣지 않는다(오염 방지) — 사람 검수(2026-07-19)에서 확립한 원칙.
 평가 대상은 **평가 전용 프로젝트 `p-eval-ch4`** (2026-07-19 적재 완료, 세션 5개).
