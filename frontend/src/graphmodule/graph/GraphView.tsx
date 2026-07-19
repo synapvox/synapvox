@@ -125,12 +125,13 @@ export type GraphViewProps = {
   onSessions?: (sessions: FNode[]) => void // primary project's session nodes → sidebar list
   highlightId?: string | null // external highlight (e.g. sidebar hover) → same focus/dim as hover
   askExpansionIds?: Set<string> | null // P2 seam: temp RAG expansion subgraph highlight
+  timelineMode?: boolean // true면 세션을 날짜순(왼쪽=과거, 오른쪽=최신)으로 x축에 고정 배치
 }
 
 type Status = 'loading' | 'error' | 'ready'
 
 export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function GraphView(props, ref) {
-  const { project, projectName, reloadKey, onGraphMeta, onSelectNode, onSessions, highlightId } = props
+  const { project, projectName, reloadKey, onGraphMeta, onSelectNode, onSessions, highlightId, timelineMode } = props
 
   const wrapRef = useRef<HTMLDivElement | null>(null)
   const fgRef = useRef<FGRef | undefined>(undefined)
@@ -346,6 +347,34 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
     apply()
     return () => cancelAnimationFrame(raf)
   }, [data])
+
+  // ── 시간순 레이아웃: 세션을 날짜(valid_at)순으로 x축에 고정 (과거=왼쪽, 최신=오른쪽) ──
+  // timelineMode가 켜지면 날짜가 있는 세션 노드의 fx를 날짜 비율로 핀 고정하고, 꺼지면
+  // 핀을 풀어 기존 force 배치로 되돌린다. 개념 노드는 링크에 끌려 각 세션 x 주변에 모인다.
+  useEffect(() => {
+    const fg = fgRef.current
+    if (!data) return
+    const sessions = data.nodes.filter((n) => n.type === 'session')
+    if (!timelineMode) {
+      for (const s of sessions) s.fx = undefined
+      fg?.d3ReheatSimulation()
+      return
+    }
+    const dated = sessions
+      .map((s) => ({ s, t: s.date ? Date.parse(s.date) : NaN }))
+      .filter((d) => !Number.isNaN(d.t))
+    if (dated.length === 0) return
+    const times = dated.map((d) => d.t)
+    const min = Math.min(...times)
+    const max = Math.max(...times)
+    // 세션 수에 비례해 좌우로 펼친다(원점 중심). 날짜가 같으면 가운데.
+    const spread = Math.max(dated.length * 130, 260)
+    for (const { s, t } of dated) {
+      const frac = max > min ? (t - min) / (max - min) : 0.5
+      s.fx = (frac - 0.5) * spread
+    }
+    fg?.d3ReheatSimulation()
+  }, [timelineMode, data])
 
   // ── Draw helpers ──────────────────────────────────────────────────────────
   const drawNode = useCallback(

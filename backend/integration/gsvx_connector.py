@@ -260,7 +260,8 @@ class GsvxClient:
                               CASE WHEN n:Episodic THEN 'session' ELSE 'concept' END AS type,
                               coalesce(n.name, n.uuid) AS label,
                               {summary: n.summary, source: n.source_description,
-                               created_at: toString(n.created_at)} AS meta""",
+                               created_at: toString(n.created_at),
+                               valid_at: toString(n.valid_at)} AS meta""",
                     project=project,
                 ).data()
                 edges = session.run(
