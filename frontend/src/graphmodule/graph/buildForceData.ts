@@ -14,8 +14,11 @@ export type FNode = {
   degree: number
   neighbors: Set<string>
   project?: string // which project this node came from (set when galaxy-merging)
+  date?: string // 세션 유효 시점(valid_at) — 시간순 레이아웃에서 x 위치 결정에 사용
   x?: number
   y?: number
+  fx?: number // d3-force 수평 핀 (시간순 모드에서 세션을 날짜별 x에 고정)
+  fy?: number // d3-force 수직 핀
 }
 
 export type FRelClass = RelClass
@@ -24,6 +27,7 @@ export type FLink = {
   source: string
   target: string
   relClass: FRelClass
+  dashed?: boolean // 시간순 모드의 사본-사본 연결(같은 개념 표시) — 점선 렌더 + force 0
 }
 
 export function buildForceData(mapped: {
@@ -38,6 +42,7 @@ export function buildForceData(mapped: {
     label: n.label,
     seq: n.seq,
     bridge: n.bridge,
+    date: n.date,
     degree: 0,
     neighbors: new Set<string>(),
   }))

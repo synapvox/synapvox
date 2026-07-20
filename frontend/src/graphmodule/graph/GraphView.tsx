@@ -10,7 +10,7 @@
 // force-graph's default autoPauseRedraw pauses the idle redraw loop and revives
 // it on pointer interaction, so "calm at rest" never means "dead frozen frame".
 
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react'
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react'
 import ForceGraph2D, {
   type ForceGraphMethods,
   type NodeObject,
@@ -19,6 +19,7 @@ import ForceGraph2D, {
 import { getGraph, ApiError } from '../api/client'
 import { mapGraph } from './mapGraph'
 import { buildForceData, type FNode, type FLink } from './buildForceData'
+import { splitSharedForTimeline } from './timelineSplit'
 import { loadPositions, savePositions } from './positionCache'
 import { nodeRadius, nodeCoreColor, linkColor } from './render'
 import { labelOpacity } from './lod'
@@ -125,12 +126,16 @@ export type GraphViewProps = {
   onSessions?: (sessions: FNode[]) => void // primary project's session nodes → sidebar list
   highlightId?: string | null // external highlight (e.g. sidebar hover) → same focus/dim as hover
   askExpansionIds?: Set<string> | null // P2 seam: temp RAG expansion subgraph highlight
+  timelineMode?: boolean // true면 세션을 날짜순(왼쪽=과거, 오른쪽=최신)으로 x축에 고정 배치
 }
 
 type Status = 'loading' | 'error' | 'ready'
 
 export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function GraphView(props, ref) {
-  const { project, projectName, reloadKey, onGraphMeta, onSelectNode, onSessions, highlightId } = props
+  const { project, projectName, reloadKey, onGraphMeta, onSelectNode, onSessions, highlightId, timelineMode } = props
+  // drawNode(deps=[])가 live 값을 읽도록 ref로 보관 — 시간순 모드에서 세션에 날짜 라벨 표시
+  const timelineModeRef = useRef(timelineMode)
+  timelineModeRef.current = timelineMode
 
   const wrapRef = useRef<HTMLDivElement | null>(null)
   const fgRef = useRef<FGRef | undefined>(undefined)
@@ -320,6 +325,8 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
         return 33
       })
       link?.strength?.((l) => {
+        // 사본-사본 점선 링크는 시각 전용 — 힘 0이라야 사본이 각 세션으로 흩어진 채 유지된다
+        if ((l as { dashed?: boolean }).dashed) return 0
         const s = typeof l.source === 'object' ? l.source.type : undefined
         const t = typeof l.target === 'object' ? l.target.type : undefined
         if (s === 'main' || t === 'main') return 0.18
@@ -346,6 +353,59 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
     apply()
     return () => cancelAnimationFrame(raf)
   }, [data])
+
+  // ── 시간순 모드 렌더 데이터: 공유 개념을 세션별 사본으로 분리(가운데 몰림 방지) ──
+  // 시각화 전용 — 원본 data는 그대로 두고 ForceGraph에 넘길 노드/링크만 변환한다.
+  const displayData = useMemo(
+    () => (timelineMode && data ? splitSharedForTimeline(data) : data),
+    [timelineMode, data],
+  )
+
+  // ── 시간순 레이아웃: 세션을 날짜(valid_at)순으로 x축에 고정 (과거=왼쪽, 최신=오른쪽) ──
+  // timelineMode가 켜지면 날짜가 있는 세션 노드의 fx를 날짜 비율로 핀 고정하고, 꺼지면
+  // 핀을 풀어 기존 force 배치로 되돌린다. 개념 사본은 링크에 끌려 각 세션 x 주변에 모인다.
+  useEffect(() => {
+    const fg = fgRef.current
+    if (!displayData) return
+    const sessions = displayData.nodes.filter((n) => n.type === 'session')
+
+    // 링크 당기는 힘을 모드별로 조정: 시간순 모드에선 세션→개념(언급)은 강하게,
+    // 개념↔개념은 약하게 → 사본이 자기 세션에 바짝 붙고, 다른 개념에 끌려 가운데로
+    // 가지 않는다(a—b—b—c에서 a쪽 b는 a에 붙음). 기본 모드는 원래 값으로 복원.
+    const linkForce = fg?.d3Force('link') as unknown as {
+      strength?: (fn: (l: { source: FNode | string; target: FNode | string; relClass?: string; dashed?: boolean }) => number) => unknown
+    } | undefined
+    linkForce?.strength?.((l) => {
+      if (l.dashed) return 0
+      const st = typeof l.source === 'object' ? l.source.type : undefined
+      const tt = typeof l.target === 'object' ? l.target.type : undefined
+      if (st === 'main' || tt === 'main') return 0.18
+      if (l.relClass === 'mentions') return timelineMode ? 0.5 : 0.07
+      return timelineMode ? 0.04 : 0.22
+    })
+
+    if (!timelineMode) {
+      for (const s of sessions) { s.fx = undefined; s.fy = undefined }
+      fg?.d3ReheatSimulation()
+      return
+    }
+    const dated = sessions
+      .map((s) => ({ s, t: s.date ? Date.parse(s.date) : NaN }))
+      .filter((d) => !Number.isNaN(d.t))
+    if (dated.length === 0) return
+    const times = dated.map((d) => d.t)
+    const min = Math.min(...times)
+    const max = Math.max(...times)
+    // 세션 수에 비례해 좌우로 펼친다(원점 중심). 날짜가 같으면 가운데.
+    // 사각형 세션은 fy=0으로 고정해 가로축 한 줄에 시간순 나열(개념 사본은 위아래로 매달림).
+    const spread = Math.max(dated.length * 130, 260)
+    for (const { s, t } of dated) {
+      const frac = max > min ? (t - min) / (max - min) : 0.5
+      s.fx = (frac - 0.5) * spread
+      s.fy = 0
+    }
+    fg?.d3ReheatSimulation()
+  }, [timelineMode, displayData])
 
   // ── Draw helpers ──────────────────────────────────────────────────────────
   const drawNode = useCallback(
@@ -442,6 +502,12 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
         ctx.shadowBlur = 3
         ctx.fillStyle = LABEL_INK
         ctx.fillText(label, x, y + r + 3 / globalScale)
+        // 시간순 모드: 세션 아래에 날짜(valid_at)를 함께 표기 → 시간 순서 확인 가능
+        if (isSession && timelineModeRef.current && node.date) {
+          ctx.font = `600 ${9.5 / globalScale}px ${LABEL_FONT}`
+          ctx.fillStyle = '#2b5797'
+          ctx.fillText(node.date, x, y + r + 3 / globalScale + fontSize + 2 / globalScale)
+        }
         ctx.restore()
       }
     },
@@ -523,7 +589,9 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
   const handleNodeClick = useCallback(
     (node: NodeObject<FNode>) => {
       selectedIdRef.current = node.id // keep its label shown (session labels need this)
-      onSelectNode?.(node as FNode)
+      // 시간순 모드의 개념 사본 id는 'uuid::세션id' — 상세 조회는 원본 uuid로 넘긴다
+      const rawId = node.id.includes('::') ? node.id.slice(0, node.id.indexOf('::')) : node.id
+      onSelectNode?.(rawId === node.id ? (node as FNode) : { ...(node as FNode), id: rawId })
     },
     [onSelectNode],
   )
@@ -577,7 +645,7 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
       {showGraph && data && (
         <ForceGraph2D<FNode, FLink>
           ref={fgRef}
-          graphData={data}
+          graphData={displayData ?? data}
           width={dims.w}
           height={dims.h}
           backgroundColor={CANVAS_BG}
@@ -590,12 +658,15 @@ export const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function Gr
           nodePointerAreaPaint={paintPointer}
           linkColor={linkColorAccessor}
           linkWidth={(l: LinkObject<FNode, FLink>) =>
-            l.relClass === 'next' || l.relClass === 'continues'
+            l.dashed
+              ? 0.5
+              : l.relClass === 'next' || l.relClass === 'continues'
                 ? 0.9
                 : l.relClass === 'mentions'
                   ? 0.28
                   : 0.6
           }
+          linkLineDash={(l: LinkObject<FNode, FLink>) => (l.dashed ? [2, 4] : null)}
           onNodeHover={handleNodeHover}
           onNodeClick={handleNodeClick}
           onEngineStop={handleEngineStop}

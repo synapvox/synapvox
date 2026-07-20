@@ -38,6 +38,7 @@ export default function GraphModule({
 }) {
   const [meta, setMeta] = useState({ nodes: 0, edges: 0, settled: false })
   const [refreshing, setRefreshing] = useState(false)
+  const [timelineMode, setTimelineMode] = useState(false) // 시간순 그래프 배치 토글
   const refreshTimerRef = useRef<number | null>(null)
   const [detailAskExpansion, setDetailAskExpansion] = useState<Set<string> | null>(null)
   const [panel, setPanel] = useState<'detail' | 'answer' | null>(null)
@@ -121,6 +122,21 @@ export default function GraphModule({
             <polyline points="21 3 21 9 15 9" />
           </svg>
         </button>
+        <button
+          type="button"
+          className="svx-gm__refresh"
+          onClick={() => setTimelineMode((v) => !v)}
+          title={timelineMode ? '기본 배치로 보기' : '시간순으로 보기 (과거 → 최신)'}
+          aria-label="시간순 보기 전환"
+          aria-pressed={timelineMode}
+          style={timelineMode ? { color: '#2b5797' } : undefined}
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+            strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="9" />
+            <polyline points="12 7 12 12 16 14" />
+          </svg>
+        </button>
         <span className="svx-gm__count">
           개념 {meta.nodes}개 · 연결 {meta.edges}개
         </span>
@@ -135,6 +151,7 @@ export default function GraphModule({
             onGraphMeta={onMeta}
             onSelectNode={onSelectNode}
             askExpansionIds={askExpansionIds ?? detailAskExpansion}
+            timelineMode={timelineMode}
           />
         </div>
         {drawer ? <aside className="svx-gm__drawer">{drawer}</aside> : null}

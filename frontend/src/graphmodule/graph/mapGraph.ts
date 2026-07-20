@@ -13,6 +13,7 @@ export type GraphNode = {
   r: number
   seq?: number
   bridge: boolean
+  date?: string // 세션의 유효 시점(valid_at, YYYY-MM-DD) — 시간순 배치에 사용
 }
 
 export type GraphLink = {
@@ -78,7 +79,9 @@ export function mapGraph(raw: GraphData): { nodes: GraphNode[]; links: GraphLink
     const r = type === 'concept' ? Math.min(7 + deg * 0.7, 16) : 10
     const seqRaw = n.meta?.seq
     const seq = typeof seqRaw === 'number' ? seqRaw : undefined
-    return { id: n.id, type, label: n.label ?? n.id, r, seq, bridge }
+    const validAt = n.meta?.valid_at
+    const date = typeof validAt === 'string' ? validAt.slice(0, 10) : undefined
+    return { id: n.id, type, label: n.label ?? n.id, r, seq, bridge, date }
   })
 
   return { nodes, links }
