@@ -1808,13 +1808,12 @@ function App() {
       });
       body.append('project_id', activeProjectId);
       body.append('meeting_id', meetingId);
-      // 파일 업로드는 사용자가 지정한 녹음 날짜, 직접 녹음은 오늘(제출 시점).
-      body.append(
-        'content_date',
-        recordInputMode === 'upload' && recordingContentDate
-          ? recordingContentDate
-          : new Date().toISOString().slice(0, 10),
-      );
+      // 음성·첨부 자료를 한 날짜로 통일 — 직접 녹음/파일 업로드 모드 무관하게 사용자가
+      // 지정한 '녹음 날짜'를 쓰고, 미지정 시에만 오늘. 첨부 자료도 이 날짜를 물려받는다.
+      const recordingDate = recordingContentDate
+        ? recordingContentDate
+        : new Date().toISOString().slice(0, 10);
+      body.append('content_date', recordingDate);
 
       await new Promise((resolve) => window.setTimeout(resolve, 250));
       setTranscriptionStep(2);
@@ -1922,7 +1921,9 @@ function App() {
           }
           await Promise.all(recordingMaterialFiles.map((file, index) => (
             isGraphIngestibleDocument(file)
-              ? uploadMaterialToGraph(file, persistedRecordingMaterials[index]?.id ?? '', activeProjectId, meetingId)
+              // 녹음의 날짜를 자료에도 넘겨 그래프 시간축(reference_time)을 맞춘다.
+              // 미전달 시 적재 시각으로 박혀 temporal(시간) 추론이 왜곡된다.
+              ? uploadMaterialToGraph(file, persistedRecordingMaterials[index]?.id ?? '', activeProjectId, meetingId, recordingDate)
               : Promise.resolve(false)
           )));
           setSourceItems((items) => items.map((source) => (
@@ -3746,17 +3747,18 @@ function App() {
                   </button>
                 </div>
 
+                <label className="source-date-field">
+                  <span>녹음 날짜</span>
+                  <input
+                    type="date"
+                    value={recordingContentDate}
+                    onChange={(event) => setRecordingContentDate(event.target.value)}
+                  />
+                  <small>녹음·강의가 이뤄진 실제 날짜 — 음성과 첨부 자료 모두 이 날짜를 그래프 시간축으로 씁니다 (기본: 오늘)</small>
+                </label>
+
                 {recordInputMode === 'upload' ? (
                   <>
-                  <label className="source-date-field">
-                    <span>녹음 날짜</span>
-                    <input
-                      type="date"
-                      value={recordingContentDate}
-                      onChange={(event) => setRecordingContentDate(event.target.value)}
-                    />
-                    <small>녹음이 이뤄진 실제 날짜 — 그래프 시간축에 사용됩니다 (기본: 오늘)</small>
-                  </label>
                   <div
                     className="record-file-dropzone"
                     role="button"
