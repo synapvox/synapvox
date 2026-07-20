@@ -308,6 +308,15 @@ cd frontend && npm run build
 | Graph / RAG | Graphiti·Neo4j 모델링, 검색, 인용 기반 답변 |
 | Backend / Infrastructure | FastAPI 통합, Supabase, 관측, Netlify/Railway 배포 |
 
+#### Contributors
+
+| 이름 | 역할 | 담당 영역 |
+| --- | --- | --- |
+| 현우 | STT 담당 | 2-pass STT 파이프라인, 중간 포맷 JSON 스키마 |
+| 도윤 | Chunking 담당 | 청킹, LLM 기반 Topic/Decision/ActionItem 추출 |
+| 용하 | GraphRAG 담당 | Vector/Graph DB, Graphiti 적재, 하이브리드 검색 |
+| 도원 | PM / Integration / Frontend 담당 | 통합 API, E2E 파이프라인, 그래프 시각화 UI |
+
 ---
 
 ### 7. 해커톤 참여 후기
