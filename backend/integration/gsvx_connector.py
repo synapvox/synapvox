@@ -500,7 +500,8 @@ class GsvxClient:
         """답변 LLM에 보낼 messages 조립 — 동기(_answer_from_facts)·스트리밍 경로 공용."""
         # 근거에 번호와 출처를 붙여 증강 — 답변의 [n] 인용이 프론트에서 출처로 매핑된다.
         evidence = "\n".join(
-            f"[{i + 1}]{GsvxClient._source_label(fact)} {fact.get('fact') or fact.get('name') or ''}"
+            f"[{i + 1}]{GsvxClient._source_label(fact)}{GsvxClient._time_label(fact)} "
+            f"{fact.get('fact') or fact.get('name') or ''}"
             for i, fact in enumerate(facts)
         )
         prior_messages = [
@@ -515,6 +516,9 @@ class GsvxClient:
                     "당신은 대학 강의 학습 도우미입니다. 제공된 Graphiti 근거만 사용해 "
                     "한국어로 정확하게 답하세요. Markdown을 사용하고 수식은 인라인 $...$ 또는 "
                     "블록 $$...$$ LaTeX로 작성하세요. 근거가 부족하면 명확히 알리세요. "
+                    "각 근거에는 [YYYY-MM-DD] 형식의 유효 시점이 붙어 있습니다. '지금·현재·요즘'을 "
+                    "묻는 질문에는 가장 최신 시점의 근거를, '원래·처음·이전'을 묻는 질문에는 더 이른 "
+                    "시점의 근거를 기준으로 답하세요. '이후 갱신됨'으로 표시된 근거는 과거 정보입니다. "
                     "답변의 각 주장 끝에는 그 주장이 기반한 근거 번호를 [1], [2] 형식으로 표기하세요. "
                     "제공된 근거 번호 외의 번호를 만들어내지 마세요."
                 ),
@@ -572,6 +576,17 @@ class GsvxClient:
         titles = [s.get("title") for s in fact.get("sources") or [] if s.get("title")]
         unique = list(dict.fromkeys(titles))
         return f" (출처: {', '.join(unique)})" if unique else ""
+
+    @staticmethod
+    def _time_label(fact: dict) -> str:
+        """fact의 유효 시점(valid_at)을 근거 줄에 붙인다. /search가 이미 내려주지만 기존
+        답변 프롬프트가 생략해, 시점이 바뀌는 질문('지금'/'원래')에서 LLM이 어느 근거가
+        최신인지 판단할 근거가 없었다. 갱신(invalid_at)된 근거는 과거 정보로 표시한다."""
+        valid = str(fact.get("valid_at") or "")[:10]
+        if not valid:
+            return ""
+        stale = " · 이후 갱신됨" if fact.get("invalid_at") else ""
+        return f" [{valid}{stale}]"
 
     @traceable(name="STT transcript to Graphiti", run_type="chain")
     def ingest_transcript(self, im: dict, project: str | None = None) -> dict:
