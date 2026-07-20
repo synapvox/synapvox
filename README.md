@@ -310,12 +310,12 @@ cd frontend && npm run build
 
 #### Contributors
 
-| 이름 | 역할 | 담당 영역 |
-| --- | --- | --- |
-| 현우 | STT 담당 | 2-pass STT 파이프라인, 중간 포맷 JSON 스키마 |
-| 도윤 | Chunking 담당 | 청킹, LLM 기반 Topic/Decision/ActionItem 추출 |
-| 용하 | GraphRAG 담당 | Vector/Graph DB, Graphiti 적재, 하이브리드 검색 |
-| 도원 | PM / Integration / Frontend 담당 | 통합 API, E2E 파이프라인, 그래프 시각화 UI |
+| 이름 | GitHub | 역할 | 담당 영역 |
+| --- | --- | --- | --- |
+| 현우 | [blackest21](https://github.com/blackest21) | STT 담당 | 2-pass STT 파이프라인, 중간 포맷 JSON 스키마 |
+| 도윤 | [chip575](https://github.com/chip575) | Chunking 담당 | 청킹, LLM 기반 Topic/Decision/ActionItem 추출 |
+| 용하 | [click6067-ship-it](https://github.com/click6067-ship-it) | GraphRAG 담당 | Vector/Graph DB, Graphiti 적재, 하이브리드 검색 |
+| 도원 | [D0won](https://github.com/D0won) | PM / Integration / Frontend 담당 | 통합 API, E2E 파이프라인, 그래프 시각화 UI |
 
 ---
 
